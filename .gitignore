@@ -1,0 +1,36 @@
+echo "# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+*.pyd
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Env
+.env
+.venv
+venv/
+
+# Docker
+*.dockerignore
+docker-compose.override.yml
+*.log
+
+# Misc
+.DS_Store
+*.swp" > .gitignore
