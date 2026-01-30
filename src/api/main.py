@@ -1,6 +1,14 @@
 import logging
+import sys
+from pathlib import Path
+
 from fastapi import FastAPI
-from src.api.v1.endpoints import admin 
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.api.v1.endpoints import admin
 from src.core.logger import setup_logging
 
 setup_logging()

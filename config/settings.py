@@ -1,26 +1,30 @@
+from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Get the project root directory (parent of config/)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+ENV_FILE = PROJECT_ROOT / ".env"
+
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_ignore_empty=True, extra="ignore")
+    model_config = SettingsConfigDict(env_file=str(ENV_FILE), env_ignore_empty=True, extra="ignore")
 
-    # Database URLs
-    NEO4J_URI: str = "bolt://localhost:7687"
-    NEO4J_USER: str = "neo4j"
+    NEO4J_URI: str 
+    NEO4J_USER: str
     NEO4J_PASSWORD: str
-    QDRANT_URL: str = "http://localhost:6333"
-    POSTGRES_DSN: str = "postgresql://user:password@localhost:5432/code_intel"
+    NEO4J_DATABASE: str = "neo4j"
+    QDRANT_URL: str 
+    QDRANT_API_KEY: str 
+    SUPABASE_URL: str
+    SUPABASE_KEY: str
 
-    # LLM
-    LITELLM_MODEL: str = "gpt-4o-mini"
-    OPENAI_API_KEY: str
+    GEMINI_API_KEY: str = ""
+    LITELLM_MODEL: str = "gemini-3-pro"
 
-    # Git
-    GIT_REPO_VERTX: str = "https://github.com/your-org/vertx-backend-repo.git"
+    GIT_REPO_VERTX: str = "https://github.com/vert-x3/vertx-examples.git"
     GIT_REPO_REACT: str = "https://github.com/your-org/react-frontend-repo.git"
-    GIT_TOKEN: str  # For private repos
+    GIT_TOKEN: str  
 
-    # Security
-    SECRET_KEY: str = "your-random-secret-key"  # Generate with secrets.token_hex(32)
+    SECRET_KEY: str 
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
 
 settings = Settings()
