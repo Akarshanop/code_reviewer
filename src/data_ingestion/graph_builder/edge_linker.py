@@ -1,142 +1,438 @@
-# edge_linker.py - IMPROVED VERSION
+"""
+Enterprise Edge Linker for Neo4j Knowledge Graph
+Creates relationships between code artifacts: API calls to routes, EventBus flows, DTO usages
+"""
 import logging
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from urllib.parse import urlparse
 import re
+from datetime import datetime
 
-logger = logging.getLogger(__name__)
+from src.database.neo4j_client import neo4j_client
+from src.core.logger import get_logger
+
+logger = get_logger(__name__)
+
 
 class EdgeLinker:
+    """
+    Creates and manages relationships between nodes in the code knowledge graph.
+    Handles cross-language linking (React → Vert.x) and EventBus flow mapping.
+    """
     
     def __init__(self):
-        pass  # Neo4j driver will be passed as parameter in async methods
-        
-    async def link_all_edges(self):
-        """Link all types of edges between services"""
-        await self._link_api_calls_to_routes()
-        await self._link_eventbus_producers_consumers()
-        await self._link_dto_usages()
-        await self._link_component_hierarchies()
-        
-        logger.info("All edges linked successfully")
+        self.stats = {
+            "edges_created": 0,
+            "edges_updated": 0,
+            "errors": 0
+        }
     
-    async def _link_api_calls_to_routes(self):
-        """Link React API calls to Vert.x routes"""
-        query = """
-        // Find React components with API calls
-        MATCH (comp:ReactComponent)-[:HAS_API_CALL]->(api:ApiCall)
+    async def link_all_edges(self, session=None) -> Dict[str, Any]:
+        """
+        Link all types of edges between code artifacts.
         
-        // Find Vert.x routes with matching paths
+        Args:
+            session: Optional Neo4j session. If not provided, creates new session.
+            
+        Returns:
+            Statistics about created relationships
+        """
+        stats = {
+            "relationships_created": 0,
+            "by_type": {},
+            "errors": []
+        }
+        
+        # Use provided session or create new one
+        use_external_session = session is not None
+        
+        try:
+            if not use_external_session:
+                async with neo4j_client.session() as session:
+                    stats = await self._link_all_edges_internal(session, stats)
+            else:
+                stats = await self._link_all_edges_internal(session, stats)
+            
+            logger.info(
+                "All edges linked successfully",
+                total_relationships=stats["relationships_created"],
+                by_type=stats["by_type"]
+            )
+            
+        except Exception as e:
+            logger.error("Edge linking failed", error=str(e))
+            stats["errors"].append(str(e))
+        
+        return stats
+    
+    async def _link_all_edges_internal(self, session, stats: Dict[str, Any]) -> Dict[str, Any]:
+        """Internal method to link all edges with provided session"""
+        
+        # 1. Link API calls to Vert.x routes
+        api_result = await self._link_api_calls_to_routes(session)
+        stats["relationships_created"] += api_result.get("created", 0)
+        stats["by_type"]["CALLS_ROUTE"] = api_result.get("created", 0)
+        
+        # 2. Link EventBus producers to consumers
+        eventbus_result = await self._link_eventbus_producers_consumers(session)
+        stats["relationships_created"] += eventbus_result.get("created", 0)
+        stats["by_type"]["PUBLISHES_TO"] = eventbus_result.get("created", 0)
+        
+        # 3. Link DTO usages
+        dto_result = await self._link_dto_usages(session)
+        stats["relationships_created"] += dto_result.get("created", 0)
+        stats["by_type"]["USES_DTO"] = dto_result.get("created", 0)
+        
+        # 4. Link component hierarchies
+        component_result = await self._link_component_hierarchies(session)
+        stats["relationships_created"] += component_result.get("created", 0)
+        stats["by_type"]["RENDERS"] = component_result.get("created", 0)
+        
+        # 5. Link services to their dependencies
+        service_result = await self._link_service_dependencies(session)
+        stats["relationships_created"] += service_result.get("created", 0)
+        stats["by_type"]["DEPENDS_ON"] = service_result.get("created", 0)
+        
+        return stats
+    
+    async def _link_api_calls_to_routes(self, session) -> Dict[str, Any]:
+        """Link React API calls to Vert.x routes with path normalization"""
+        
+        query = """
+        // Find all API calls and routes
+        MATCH (api:ApiCall)
+        WHERE api.url IS NOT NULL AND api.url <> ''
         MATCH (route:VertxRoute)
-        WHERE route.path = api.url 
-           OR route.path = replace(api.url, '/api/v1/', '/api/')
-           OR route.path = replace(api.url, '/api/', '/')
-           OR api.url CONTAINS route.path
+        WHERE route.path IS NOT NULL AND route.path <> ''
+        
+        // Normalize and match paths
+        WITH api, route,
+             // Remove common prefixes for matching
+             replace(replace(replace(api.url, '/api/v1', ''), '/api/v2', ''), '/api', '') AS normalized_api_url,
+             replace(replace(replace(route.path, '/api/v1', ''), '/api/v2', ''), '/api', '') AS normalized_route_path
+        
+        // Match routes - exact match or pattern match
+        WHERE normalized_api_url = normalized_route_path
+           OR normalized_route_path CONTAINS normalized_api_url
+           OR normalized_api_url CONTAINS normalized_route_path
+           OR (api.method = route.method AND (
+               route.path = api.url 
+               OR replace(api.url, '/api/', '/') = route.path
+               OR api.url ENDS WITH route.path
+           ))
         
         // Create relationship with metadata
-        MERGE (api)-[r:CALLS_ROUTE {
-            method_match: route.method = api.method OR api.method IS NULL,
-            path_similarity: apoc.text.jaroWinklerDistance(api.url, route.path)
-        }]->(route)
+        MERGE (api)-[r:CALLS_ROUTE]->(route)
+        SET r.method_match = (api.method = route.method OR api.method IS NULL),
+            r.created_at = datetime(),
+            r.last_updated = datetime()
         
         RETURN count(r) as relationships_created
         """
         
-        result = await self.neo4j_client.execute_query(query)
-        logger.info(f"Linked {result[0]['relationships_created']} API calls to routes")
+        try:
+            result = await session.run(query)
+            record = await result.single()
+            created = record["relationships_created"] if record else 0
+            
+            logger.debug(f"Linked {created} API calls to routes")
+            return {"created": created}
+            
+        except Exception as e:
+            logger.error("Failed to link API calls to routes", error=str(e))
+            return {"created": 0, "error": str(e)}
     
-    async def _link_eventbus_producers_consumers(self):
-        """Link EventBus producers to consumers"""
+    async def _link_eventbus_producers_consumers(self, session) -> Dict[str, Any]:
+        """Link EventBus producers to consumers by address"""
+        
         query = """
-        // Find all EventBus producers and consumers
-        MATCH (producer:VertxMethod {type: 'eventbus_publish'})
-        MATCH (consumer:VertxMethod {type: 'eventbus_consume'})
-        WHERE producer.address = consumer.address
+        // Find all EventBus publishers
+        MATCH (producer:EventBusNode)
+        WHERE producer.type IN ['publish', 'send', 'request', 'producer']
+        
+        // Find consumers with matching address
+        MATCH (consumer:EventBusNode)
+        WHERE consumer.type IN ['consume', 'consumer', 'handler']
+          AND consumer.address = producer.address
+          AND consumer <> producer
         
         // Create bidirectional relationships
         MERGE (producer)-[r1:PUBLISHES_TO]->(consumer)
+        SET r1.address = producer.address,
+            r1.created_at = datetime()
+        
         MERGE (consumer)-[r2:CONSUMES_FROM]->(producer)
+        SET r2.address = consumer.address,
+            r2.created_at = datetime()
         
-        RETURN count(r1) + count(r2) as relationships_created
+        RETURN count(DISTINCT r1) + count(DISTINCT r2) as relationships_created
         """
         
-        result = await self.neo4j_client.execute_query(query)
-        logger.info(f"Linked {result[0]['relationships_created']} EventBus relationships")
+        try:
+            result = await session.run(query)
+            record = await result.single()
+            created = record["relationships_created"] if record else 0
+            
+            logger.debug(f"Linked {created} EventBus relationships")
+            return {"created": created}
+            
+        except Exception as e:
+            logger.error("Failed to link EventBus producers/consumers", error=str(e))
+            return {"created": 0, "error": str(e)}
     
-    async def _link_dto_usages(self):
-        """Link DTO usages across layers"""
+    async def _link_dto_usages(self, session) -> Dict[str, Any]:
+        """Link DTO usages across backend and frontend"""
+        
         query = """
-        // Find DTO classes
+        // Find DTOs
         MATCH (dto:DTO)
+        WHERE dto.name IS NOT NULL
         
-        // Find Vert.x methods that use DTOs as parameters or return types
-        MATCH (method:VertxMethod)
-        WHERE method.signature CONTAINS dto.name 
-           OR method.return_type = dto.name
+        // Find routes that might use DTOs (in file or handler)
+        OPTIONAL MATCH (route:VertxRoute)
+        WHERE route.file CONTAINS dto.name 
+           OR route.handler_method CONTAINS dto.name
         
-        MERGE (method)-[r:USES_DTO]->(dto)
+        FOREACH (_ IN CASE WHEN route IS NOT NULL THEN [1] ELSE [] END |
+            MERGE (route)-[r:USES_DTO]->(dto)
+            SET r.created_at = datetime()
+        )
         
+        // Find React components that might use DTOs (in props)
         WITH dto
+        OPTIONAL MATCH (comp:ReactComponent)
+        WHERE ANY(prop IN comp.props WHERE prop CONTAINS dto.name)
         
-        // Find React components that might use DTO fields
-        MATCH (comp:ReactComponent)
-        WHERE ANY(prop IN comp.props WHERE prop.type CONTAINS dto.name)
+        FOREACH (_ IN CASE WHEN comp IS NOT NULL THEN [1] ELSE [] END |
+            MERGE (comp)-[r:USES_DTO_FIELDS]->(dto)
+            SET r.created_at = datetime()
+        )
         
-        MERGE (comp)-[r2:USES_DTO_FIELDS]->(dto)
+        // Find services that reference DTOs
+        WITH dto
+        OPTIONAL MATCH (service:Service)
+        WHERE service.file CONTAINS dto.name
         
-        RETURN count(r) + count(r2) as relationships_created
+        FOREACH (_ IN CASE WHEN service IS NOT NULL THEN [1] ELSE [] END |
+            MERGE (service)-[r:USES_DTO]->(dto)
+            SET r.created_at = datetime()
+        )
+        
+        RETURN count(dto) as dtos_processed
         """
         
-        result = await self.neo4j_client.execute_query(query)
-        logger.info(f"Linked {result[0]['relationships_created']} DTO relationships")
+        # Also run a count query
+        count_query = """
+        MATCH ()-[r:USES_DTO|USES_DTO_FIELDS]->()
+        RETURN count(r) as relationships_created
+        """
+        
+        try:
+            await session.run(query)
+            count_result = await session.run(count_query)
+            record = await count_result.single()
+            created = record["relationships_created"] if record else 0
+            
+            logger.debug(f"Linked {created} DTO usage relationships")
+            return {"created": created}
+            
+        except Exception as e:
+            logger.error("Failed to link DTO usages", error=str(e))
+            return {"created": 0, "error": str(e)}
     
-    async def _link_component_hierarchies(self):
+    async def _link_component_hierarchies(self, session) -> Dict[str, Any]:
         """Link React component parent-child relationships"""
+        
         query = """
-        // Find components that render other components
-        MATCH (parent:ReactComponent), (child:ReactComponent)
-        WHERE parent.name <> child.name 
-          AND parent.jsx_content CONTAINS child.name
+        // Find components and their potential children
+        MATCH (parent:ReactComponent)
+        MATCH (child:ReactComponent)
+        WHERE parent.name <> child.name
+          AND parent.file IS NOT NULL
+        
+        // Read the parent's file to check for child usage
+        // (This is a simplified check - in production you'd parse JSX)
+        WITH parent, child
+        WHERE parent.file CONTAINS child.name
+           OR (parent.file ENDS WITH '.tsx' AND 
+               EXISTS { 
+                   MATCH (f:File {path: parent.file})
+                   WHERE f.path CONTAINS child.name 
+               })
         
         MERGE (parent)-[r:RENDERS]->(child)
-        SET r.occurrences = size(split(parent.jsx_content, child.name)) - 1
+        SET r.created_at = datetime()
         
         RETURN count(r) as relationships_created
         """
         
-        result = await self.neo4j_client.execute_query(query)
-        logger.info(f"Linked {result[0]['relationships_created']} component hierarchies")
+        try:
+            result = await session.run(query)
+            record = await result.single()
+            created = record["relationships_created"] if record else 0
+            
+            logger.debug(f"Linked {created} component hierarchy relationships")
+            return {"created": created}
+            
+        except Exception as e:
+            logger.error("Failed to link component hierarchies", error=str(e))
+            return {"created": 0, "error": str(e)}
+    
+    async def _link_service_dependencies(self, session) -> Dict[str, Any]:
+        """Link services to their dependencies (other services, DTOs, etc.)"""
+        
+        query = """
+        // Find services in the same repository
+        MATCH (service1:Service)
+        MATCH (service2:Service)
+        WHERE service1 <> service2
+          AND service1.repository_hash = service2.repository_hash
+          AND service1.file CONTAINS service2.name
+        
+        MERGE (service1)-[r:DEPENDS_ON]->(service2)
+        SET r.created_at = datetime()
+        
+        RETURN count(r) as relationships_created
+        """
+        
+        try:
+            result = await session.run(query)
+            record = await result.single()
+            created = record["relationships_created"] if record else 0
+            
+            logger.debug(f"Linked {created} service dependency relationships")
+            return {"created": created}
+            
+        except Exception as e:
+            logger.error("Failed to link service dependencies", error=str(e))
+            return {"created": 0, "error": str(e)}
     
     async def find_cross_service_dependencies(self, service_name: str) -> List[Dict[str, Any]]:
         """Find all dependencies for a given service"""
-        query = """
-        MATCH (service:VertxService {name: $service_name})
-        OPTIONAL MATCH (service)-[:CONTAINS_METHOD]->(method:VertxMethod)
-        OPTIONAL MATCH (method)-[:CALLS_ROUTE|:PUBLISHES_TO|:USES_DTO]->(dependency)
-        OPTIONAL MATCH (dependency)<-[:CALLS_ROUTE|:CONSUMES_FROM|:USES_DTO_FIELDS]-(frontend:ReactComponent)
         
-        RETURN service, method, dependency, frontend
+        query = """
+        MATCH (service:Service {name: $service_name})
+        OPTIONAL MATCH (service)-[:DEPENDS_ON]->(dependency:Service)
+        OPTIONAL MATCH (service)-[:USES_DTO]->(dto:DTO)
+        OPTIONAL MATCH (service)<-[:CALLS_ROUTE]-(caller:ApiCall)
+        OPTIONAL MATCH (caller)<-[:MAKES_API_CALL]-(component:ReactComponent)
+        
+        RETURN 
+            service,
+            collect(DISTINCT dependency) as service_dependencies,
+            collect(DISTINCT dto) as dto_dependencies,
+            collect(DISTINCT component) as frontend_callers
         """
         
-        results = await self.neo4j_client.execute_query(query, {"service_name": service_name})
-        
-        # Process results into a structured format
-        dependencies = []
-        for record in results:
-            if record.get("dependency"):
-                dep = {
-                    "type": list(record["dependency"].labels)[0],
-                    "name": record["dependency"]["name"],
-                    "relationship": self._get_relationship_type(record)
-                }
-                if dep not in dependencies:
-                    dependencies.append(dep)
-        
-        return dependencies
+        try:
+            async with neo4j_client.session() as session:
+                result = await session.run(query, {"service_name": service_name})
+                records = await result.data()
+                
+                dependencies = []
+                for record in records:
+                    if record.get("service_dependencies"):
+                        for dep in record["service_dependencies"]:
+                            if dep:
+                                dependencies.append({
+                                    "type": "Service",
+                                    "name": dep.get("name"),
+                                    "relationship": "DEPENDS_ON"
+                                })
+                    
+                    if record.get("dto_dependencies"):
+                        for dto in record["dto_dependencies"]:
+                            if dto:
+                                dependencies.append({
+                                    "type": "DTO",
+                                    "name": dto.get("name"),
+                                    "relationship": "USES_DTO"
+                                })
+                    
+                    if record.get("frontend_callers"):
+                        for comp in record["frontend_callers"]:
+                            if comp:
+                                dependencies.append({
+                                    "type": "ReactComponent",
+                                    "name": comp.get("name"),
+                                    "relationship": "CALLED_BY"
+                                })
+                
+                return dependencies
+                
+        except Exception as e:
+            logger.error(f"Failed to find dependencies for service: {service_name}", error=str(e))
+            return []
     
-    def _get_relationship_type(self, record) -> str:
-        """Determine relationship type from record"""
-        relationships = record.get("_relationships", [])
-        if relationships:
-            return type(relationships[0]).__name__
-        return "unknown"
+    async def get_api_flow(self, api_url: str) -> Dict[str, Any]:
+        """Get the complete flow for an API endpoint"""
+        
+        query = """
+        MATCH (api:ApiCall {url: $api_url})
+        OPTIONAL MATCH (component:ReactComponent)-[:MAKES_API_CALL]->(api)
+        OPTIONAL MATCH (api)-[:CALLS_ROUTE]->(route:VertxRoute)
+        OPTIONAL MATCH (route)-[:USES_DTO]->(dto:DTO)
+        OPTIONAL MATCH (route)<-[:PUBLISHES_TO]-(eventbus:EventBusNode)
+        
+        RETURN api, component, route, dto, eventbus
+        """
+        
+        try:
+            async with neo4j_client.session() as session:
+                result = await session.run(query, {"api_url": api_url})
+                records = await result.data()
+                
+                flow = {
+                    "api_call": None,
+                    "frontend_component": None,
+                    "backend_route": None,
+                    "dtos_used": [],
+                    "eventbus_flows": []
+                }
+                
+                for record in records:
+                    if record.get("api"):
+                        flow["api_call"] = dict(record["api"])
+                    if record.get("component"):
+                        flow["frontend_component"] = dict(record["component"])
+                    if record.get("route"):
+                        flow["backend_route"] = dict(record["route"])
+                    if record.get("dto"):
+                        flow["dtos_used"].append(dict(record["dto"]))
+                    if record.get("eventbus"):
+                        flow["eventbus_flows"].append(dict(record["eventbus"]))
+                
+                return flow
+                
+        except Exception as e:
+            logger.error(f"Failed to get API flow for: {api_url}", error=str(e))
+            return {}
+    
+    async def get_linking_statistics(self) -> Dict[str, Any]:
+        """Get statistics about all relationships in the graph"""
+        
+        query = """
+        MATCH ()-[r]->()
+        RETURN type(r) as relationship_type, count(r) as count
+        ORDER BY count DESC
+        """
+        
+        try:
+            async with neo4j_client.session() as session:
+                result = await session.run(query)
+                records = await result.data()
+                
+                total = sum(record["count"] for record in records)
+                
+                return {
+                    "total_relationships": total,
+                    "by_type": {
+                        record["relationship_type"]: record["count"]
+                        for record in records
+                    },
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+                
+        except Exception as e:
+            logger.error("Failed to get linking statistics", error=str(e))
+            return {"total_relationships": 0, "by_type": {}}

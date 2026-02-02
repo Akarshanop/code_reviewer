@@ -1,5 +1,8 @@
 # module_scanner.py - ENTERPRISE VERSION
-import logging
+"""
+Enterprise Module Scanner Tool
+Performs comprehensive analysis of code modules including dependency, quality, and security analysis
+"""
 import asyncio
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass
@@ -7,10 +10,11 @@ from enum import Enum
 
 from src.services.search_service import SearchService
 from src.services.graph_service import GraphService
-from src.database.neo4j_client import Neo4jClient
+from src.database.neo4j_client import neo4j_client
 from src.core.logger import get_logger
 
 logger = get_logger(__name__)
+
 
 class IssueSeverity(Enum):
     CRITICAL = "critical"
@@ -18,6 +22,7 @@ class IssueSeverity(Enum):
     MEDIUM = "medium"
     LOW = "low"
     INFO = "info"
+
 
 @dataclass
 class CodeIssue:
@@ -28,6 +33,7 @@ class CodeIssue:
     suggestion: str
     impact: str
     confidence: float  # 0.0 to 1.0
+
 
 @dataclass
 class ModuleAnalysis:
@@ -42,43 +48,56 @@ class ModuleAnalysis:
     recommendations: List[str]
     health_score: float  # 0-100
 
+
 class ModuleScanner:
     """Enterprise-grade module analysis tool for Vert.x/React codebases"""
     
     def __init__(self):
         self.search_service = SearchService()
         self.graph_service = GraphService()
-        self.neo4j_client = Neo4jClient()
     
-    async def scan_module(self, module_name: str, repository: str = None, 
-                         deep_scan: bool = False) -> Dict[str, Any]:
+    async def scan_module(
+        self,
+        module_name: str,
+        module_path: Optional[str] = None,
+        repository: Optional[str] = None,
+        scan_depth: int = 2,
+        include_dependencies: bool = True
+    ) -> Dict[str, Any]:
         """
-        Perform comprehensive module analysis
+        Perform comprehensive module analysis.
         
         Args:
-            module_name: Module to scan (e.g., 'payment', 'user-management')
-            repository: Specific repository to scan (optional)
-            deep_scan: Perform deeper analysis including code metrics
+            module_name: Name of the module to scan
+            module_path: Optional path to the module
+            repository: Specific repository to scan
+            scan_depth: Depth of dependency analysis (1-5)
+            include_dependencies: Whether to include dependency analysis
         
         Returns:
-            Complete module analysis
+            Complete module analysis results
         """
         try:
-            logger.info(f"Starting module scan: {module_name}, repo={repository}, deep={deep_scan}")
+            logger.info(
+                f"Starting module scan: {module_name}",
+                module_path=module_path,
+                repository=repository,
+                scan_depth=scan_depth
+            )
             
             # Step 1: Retrieve module context
             context = await self._retrieve_module_context(module_name, repository)
             
             # Step 2: Analyze dependencies
-            dependencies = await self._analyze_dependencies(module_name, repository)
+            dependencies = {}
+            if include_dependencies:
+                dependencies = await self._analyze_dependencies(module_name, repository, scan_depth)
             
             # Step 3: Identify issues
             issues = await self._identify_issues(context, dependencies)
             
-            # Step 4: Calculate metrics (if deep scan)
-            metrics = {}
-            if deep_scan:
-                metrics = await self._calculate_metrics(module_name, repository)
+            # Step 4: Calculate metrics
+            metrics = await self._calculate_metrics(module_name, repository)
             
             # Step 5: Generate health score
             health_score = self._calculate_health_score(issues, metrics)
@@ -102,92 +121,129 @@ class ModuleScanner:
             return self._format_analysis(analysis)
             
         except Exception as e:
-            logger.error(f"Module scan failed for {module_name}: {e}")
+            logger.error(f"Module scan failed for {module_name}: {e}", exc_info=True)
             return {
                 "error": str(e),
                 "module": module_name,
-                "status": "failed"
+                "status": "failed",
+                "quality_score": 0,
+                "complexity_score": 0,
+                "test_coverage": "unknown",
+                "loc": 0,
+                "dependencies": [],
+                "issues": [],
+                "suggestions": [],
+                "files_analyzed": 0
             }
     
     async def _retrieve_module_context(self, module_name: str, repository: Optional[str]) -> Dict:
         """Retrieve comprehensive context for the module"""
         # Use multiple search strategies
-        contexts = {}
+        contexts = {
+            'file_count': 0,
+            'semantic': [],
+            'graph': {},
+            'eventbus': [],
+            'api_routes': []
+        }
         
-        # 1. Semantic search for module files
-        contexts['semantic'] = await self.search_service.hybrid_search(
-            query=f"{module_name} module component service",
-            top_k=30,
-            filter_repos=[repository] if repository else None
-        )
-        
-        # 2. Graph search for module structure
-        contexts['graph'] = await self.graph_service.find_module_structure(
-            module_name=module_name,
-            repo_filter=repository
-        )
-        
-        # 3. Search for EventBus addresses related to module
-        contexts['eventbus'] = await self._find_eventbus_flows(module_name)
-        
-        # 4. Find API routes in module
-        contexts['api_routes'] = await self._find_api_routes(module_name, repository)
+        try:
+            # 1. Semantic search for module files
+            search_results = await self.search_service.search_codebase(
+                query=f"{module_name} module component service",
+                top_k=30,
+                filters={"repository": repository} if repository else {}
+            )
+            contexts['semantic'] = search_results.get("results", {}).get("combined", [])
+            contexts['file_count'] = len(contexts['semantic'])
+            
+            # 2. Graph search for module structure
+            contexts['graph'] = await self.graph_service.find_module_structure(
+                module_name=module_name,
+                repo_filter=repository
+            )
+            
+            # 3. Search for EventBus addresses related to module
+            contexts['eventbus'] = await self._find_eventbus_flows(module_name)
+            
+            # 4. Find API routes in module
+            contexts['api_routes'] = await self._find_api_routes(module_name, repository)
+            
+        except Exception as e:
+            logger.warning(f"Error retrieving module context: {e}")
         
         return contexts
     
     async def _find_eventbus_flows(self, module_name: str) -> List[Dict]:
         """Find EventBus producers and consumers in module"""
-        query = """
-        MATCH (m:Module {name: $module_name})
-        OPTIONAL MATCH (m)-[:CONTAINS]->(producer:VertxMethod {type: 'eventbus_publish'})
-        OPTIONAL MATCH (m)-[:CONTAINS]->(consumer:VertxMethod {type: 'eventbus_consume'})
-        RETURN producer, consumer
-        """
-        
-        results = await self.neo4j_client.execute_query(query, {"module_name": module_name})
-        
-        flows = []
-        for record in results:
-            if record.get("producer"):
-                flows.append({
-                    "type": "producer",
-                    "address": record["producer"].get("address"),
-                    "method": record["producer"].get("name"),
-                    "file": record["producer"].get("file")
-                })
-            if record.get("consumer"):
-                flows.append({
-                    "type": "consumer",
-                    "address": record["consumer"].get("address"),
-                    "method": record["consumer"].get("name"),
-                    "file": record["consumer"].get("file")
-                })
-        
-        return flows
+        try:
+            query = """
+            MATCH (m:Module {name: $module_name})
+            OPTIONAL MATCH (m)-[:CONTAINS]->(producer:VertxMethod {type: 'eventbus_publish'})
+            OPTIONAL MATCH (m)-[:CONTAINS]->(consumer:VertxMethod {type: 'eventbus_consume'})
+            RETURN producer, consumer
+            """
+            
+            async with neo4j_client.get_session() as session:
+                result = await session.run(query, {"module_name": module_name})
+                records = await result.data()
+            
+            flows = []
+            for record in records:
+                if record.get("producer"):
+                    flows.append({
+                        "type": "producer",
+                        "address": record["producer"].get("address"),
+                        "method": record["producer"].get("name"),
+                        "file": record["producer"].get("file")
+                    })
+                if record.get("consumer"):
+                    flows.append({
+                        "type": "consumer",
+                        "address": record["consumer"].get("address"),
+                        "method": record["consumer"].get("name"),
+                        "file": record["consumer"].get("file")
+                    })
+            
+            return flows
+        except Exception as e:
+            logger.warning(f"Failed to find EventBus flows: {e}")
+            return []
     
     async def _find_api_routes(self, module_name: str, repository: Optional[str]) -> List[Dict]:
         """Find API routes in module"""
-        query = """
-        MATCH (m:Module {name: $module_name})
-        OPTIONAL MATCH (m)-[:CONTAINS]->(route:VertxRoute)
-        RETURN route
-        """
-        
-        results = await self.neo4j_client.execute_query(query, {"module_name": module_name})
-        
-        routes = []
-        for record in results:
-            if record.get("route"):
-                routes.append({
-                    "path": record["route"].get("path"),
-                    "method": record["route"].get("method"),
-                    "file": record["route"].get("file"),
-                    "repository": repository
-                })
-        
-        return routes
+        try:
+            query = """
+            MATCH (m:Module {name: $module_name})
+            OPTIONAL MATCH (m)-[:CONTAINS]->(route:VertxRoute)
+            RETURN route
+            """
+            
+            async with neo4j_client.get_session() as session:
+                result = await session.run(query, {"module_name": module_name})
+                records = await result.data()
+            
+            routes = []
+            for record in records:
+                if record.get("route"):
+                    routes.append({
+                        "path": record["route"].get("path"),
+                        "method": record["route"].get("method"),
+                        "file": record["route"].get("file"),
+                        "repository": repository
+                    })
+            
+            return routes
+        except Exception as e:
+            logger.warning(f"Failed to find API routes: {e}")
+            return []
     
-    async def _analyze_dependencies(self, module_name: str, repository: Optional[str]) -> Dict[str, List[str]]:
+    async def _analyze_dependencies(
+        self,
+        module_name: str,
+        repository: Optional[str],
+        scan_depth: int = 2
+    ) -> Dict[str, List[str]]:
         """Analyze module dependencies"""
         dependencies = {
             "internal": [],  # Within same repository
@@ -197,31 +253,39 @@ class ModuleScanner:
             "eventbus": []  # EventBus addresses
         }
         
-        # Find cross-module dependencies
-        query = """
-        MATCH (m:Module {name: $module_name})
-        OPTIONAL MATCH (m)-[:DEPENDS_ON]->(dep:Module)
-        RETURN dep.name as dependency
-        """
-        
-        results = await self.neo4j_client.execute_query(query, {"module_name": module_name})
-        
-        for record in results:
-            if record.get("dependency"):
-                dependencies["internal"].append(record["dependency"])
-        
-        # Find external API dependencies
-        query = """
-        MATCH (m:Module {name: $module_name})
-        OPTIONAL MATCH (m)-[:CALLS_API]->(api:ExternalAPI)
-        RETURN api.url as api_endpoint
-        """
-        
-        results = await self.neo4j_client.execute_query(query, {"module_name": module_name})
-        
-        for record in results:
-            if record.get("api_endpoint"):
-                dependencies["external"].append(record["api_endpoint"])
+        try:
+            # Find cross-module dependencies
+            query = """
+            MATCH (m:Module {name: $module_name})
+            OPTIONAL MATCH (m)-[:DEPENDS_ON*1..""" + str(scan_depth) + """]->(dep:Module)
+            RETURN DISTINCT dep.name as dependency
+            """
+            
+            async with neo4j_client.get_session() as session:
+                result = await session.run(query, {"module_name": module_name})
+                records = await result.data()
+            
+            for record in records:
+                if record.get("dependency"):
+                    dependencies["internal"].append(record["dependency"])
+            
+            # Find external API dependencies
+            query = """
+            MATCH (m:Module {name: $module_name})
+            OPTIONAL MATCH (m)-[:CALLS_API]->(api:ExternalAPI)
+            RETURN api.url as api_endpoint
+            """
+            
+            async with neo4j_client.get_session() as session:
+                result = await session.run(query, {"module_name": module_name})
+                records = await result.data()
+            
+            for record in records:
+                if record.get("api_endpoint"):
+                    dependencies["external"].append(record["api_endpoint"])
+                    
+        except Exception as e:
+            logger.warning(f"Failed to analyze dependencies: {e}")
         
         return dependencies
     

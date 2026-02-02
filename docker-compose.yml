@@ -1,48 +1,128 @@
 version: '3.8'
+
 services:
+  # =============================================================================
+  # API Server
+  # =============================================================================
   api:
-    build: .
-    command: poetry run uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: code-intel-api
+    command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
     volumes:
       - .:/app
+      - ./data/repos:/app/data/repos  # Repository storage
     ports:
       - "8000:8000"
     depends_on:
-      - neo4j
-      - qdrant
-      - postgres
+      neo4j:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
     env_file:
       - .env
-
-  neo4j:
-    image: neo4j:5.15
-    ports:
-      - "7474:7474"
-      - "7687:7687"
     environment:
-      NEO4J_AUTH: neo4j/your-password-here
+      - PYTHONPATH=/app
+    networks:
+      - code-intel-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/admin/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # =============================================================================
+  # Neo4j Graph Database
+  # =============================================================================
+  neo4j:
+    image: neo4j:5.19-community
+    container_name: code-intel-neo4j
+    ports:
+      - "7474:7474"  # HTTP
+      - "7687:7687"  # Bolt
+    environment:
+      - NEO4J_AUTH=neo4j/your-neo4j-password
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_dbms_security_procedures_allowlist=apoc.*
+      - NEO4J_dbms_memory_heap_initial__size=512m
+      - NEO4J_dbms_memory_heap_max__size=2g
+      - NEO4J_dbms_memory_pagecache_size=512m
     volumes:
       - neo4j-data:/data
+      - neo4j-logs:/logs
+      - neo4j-plugins:/plugins
+    networks:
+      - code-intel-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
+  # =============================================================================
+  # Qdrant Vector Database
+  # =============================================================================
   qdrant:
-    image: qdrant/qdrant:v1.7.4
+    image: qdrant/qdrant:v1.10.1
+    container_name: code-intel-qdrant
     ports:
-      - "6333:6333"
+      - "6333:6333"  # HTTP
+      - "6334:6334"  # gRPC
+    environment:
+      - QDRANT__SERVICE__GRPC_PORT=6334
+      - QDRANT__SERVICE__HTTP_PORT=6333
     volumes:
       - qdrant-data:/qdrant/storage
+    networks:
+      - code-intel-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:6333/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
 
+  # =============================================================================
+  # PostgreSQL (for local development without Supabase)
+  # =============================================================================
   postgres:
-    image: postgres:16
+    image: postgres:16-alpine
+    container_name: code-intel-postgres
     ports:
       - "5432:5432"
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: password
-      POSTGRES_DB: code_intel
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=code_intel
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      - ./supabase/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    networks:
+      - code-intel-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    profiles:
+      - with-postgres  # Only run when explicitly requested
 
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  code-intel-network:
+    driver: bridge
+
+# =============================================================================
+# Volumes
+# =============================================================================
 volumes:
   neo4j-data:
+  neo4j-logs:
+  neo4j-plugins:
   qdrant-data:
   postgres-data:
