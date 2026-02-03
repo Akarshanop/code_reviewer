@@ -149,7 +149,9 @@ class Settings(BaseSettings):
     QDRANT_URL: str = Field(default="http://localhost:6333")
     QDRANT_API_KEY: Optional[str] = Field(default=None)
     QDRANT_COLLECTION_NAME: str = Field(default="code_embeddings")
-    QDRANT_VECTOR_SIZE: int = Field(default=1024)  # BGE-M3 outputs 1024-dim vectors
+    # Vertex AI `text-embedding-004` outputs 768-dim vectors.
+    # Keep this aligned with the embedding model (otherwise Qdrant upserts will fail).
+    QDRANT_VECTOR_SIZE: int = Field(default=768)
     QDRANT_DISTANCE_METRIC: str = Field(default="Cosine")  # Cosine, Euclid, Dot
     QDRANT_ON_DISK: bool = Field(default=True)
     

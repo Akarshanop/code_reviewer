@@ -1,4 +1,3 @@
-# java_parser.py - IMPROVED VERSION
 import logging
 import re
 from pathlib import Path
@@ -32,7 +31,6 @@ class JavaParser:
     """Enhanced Java parser specifically for Vert.x patterns"""
     
     def __init__(self):
-        # Use tree-sitter-languages stable API (<1.10)
         from tree_sitter_languages import get_language, get_parser
         self.language = get_language('java')
         self.parser = get_parser('java')
@@ -124,14 +122,12 @@ class JavaParser:
         
         method_name = code[method_name_node.start_byte:method_name_node.end_byte]
         
-        # Look for annotations on this method
         annotations = []
         for child in node.children:
             if child.type == 'annotation':
                 annotation_text = code[child.start_byte:child.end_byte]
                 annotations.append(annotation_text)
                 
-                # Check if it's a route annotation
                 for pattern, extractor in self.route_patterns.items():
                     if pattern in annotation_text:
                         route_info = extractor(child, code)
@@ -143,7 +139,6 @@ class JavaParser:
                                 'annotations': annotations
                             }
                 
-                # Check if it's an EventBus annotation
                 if '@Consume' in annotation_text or '@Publish' in annotation_text:
                     address_match = re.search(r'["\']([^"\']+)["\']', annotation_text)
                     if address_match:

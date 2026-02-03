@@ -55,6 +55,21 @@ class DataIngestionService:
         self.search_service = SearchService()
         self.vector_service = VectorService()
         
+        # Initialize individual parsers from coordinator for direct access
+        self.java_parser = self.parser_coordinator.get_parser("java")
+        self.react_parser = self.parser_coordinator.get_parser("react")
+        self.generic_parser = self.parser_coordinator.get_parser("generic")
+        self.python_parser = self.parser_coordinator.get_parser("python")
+        
+        # File extension patterns for routing
+        self.file_patterns = {
+            "java": {".java", ".kt", ".kts"},
+            "typescript": {".ts", ".tsx"},
+            "javascript": {".js", ".jsx", ".mjs", ".cjs"},
+            "config": {".json", ".yaml", ".yml", ".xml", ".toml", ".properties"},
+            "python": {".py", ".pyx", ".pyi"},
+        }
+        
         # Repository tracking
         self.repositories = {}
         self.ingestion_stats = defaultdict(lambda: {
@@ -527,7 +542,11 @@ class DataIngestionService:
                 # Process Java files
                 for java_file in parsed_data["java"]:
                     nodes_created = await self.node_factory.create_nodes(
-                        session, java_file["data"], java_file["file"]
+                        session,
+                        java_file["data"],
+                        java_file["file"],
+                        repository=repo_url,
+                        repository_hash=repo_hash,
                     )
                     statistics["nodes_created"] += nodes_created.get("created", 0)
                     
@@ -545,7 +564,11 @@ class DataIngestionService:
                 # Process TypeScript/React files
                 for ts_file in parsed_data["typescript"]:
                     nodes_created = await self.node_factory.create_nodes(
-                        session, ts_file["data"], ts_file["file"]
+                        session,
+                        ts_file["data"],
+                        ts_file["file"],
+                        repository=repo_url,
+                        repository_hash=repo_hash,
                     )
                     statistics["nodes_created"] += nodes_created.get("created", 0)
                     
@@ -558,6 +581,28 @@ class DataIngestionService:
                     await session.run(link_query, {
                         "repo_hash": repo_hash,
                         "file_path": ts_file["file"]
+                    })
+
+                # Process JavaScript files (Express.js / Node.js / JSX)
+                for js_file in parsed_data.get("javascript", []):
+                    nodes_created = await self.node_factory.create_nodes(
+                        session,
+                        js_file["data"],
+                        js_file["file"],
+                        repository=repo_url,
+                        repository_hash=repo_hash,
+                    )
+                    statistics["nodes_created"] += nodes_created.get("created", 0)
+
+                    # Link file to repository
+                    link_query = """
+                    MATCH (r:Repository {hash: $repo_hash})
+                    MATCH (f:File {path: $file_path})
+                    MERGE (f)-[:BELONGS_TO]->(r)
+                    """
+                    await session.run(link_query, {
+                        "repo_hash": repo_hash,
+                        "file_path": js_file["file"],
                     })
                 
                 # Link edges between nodes
@@ -937,7 +982,32 @@ class DataIngestionService:
                             "name": component.get("name", ""),
                             "repository": repo_name,
                             "file": ts_file.get("file", ""),
+                            "language": "typescript",
                             "data": component
+                        })
+
+                for js_file in repo_parsed.get("javascript", []):
+                    file_data = js_file.get("data", {})
+
+                    for route in file_data.get("routes", []):
+                        # Express routes (stored as VertxRoute nodes in graph)
+                        all_nodes.append({
+                            "type": "route",
+                            "name": route.get("path", ""),
+                            "repository": repo_name,
+                            "file": js_file.get("file", ""),
+                            "language": "javascript",
+                            "data": route,
+                        })
+
+                    for api in file_data.get("api_calls", []):
+                        all_nodes.append({
+                            "type": "api_call",
+                            "name": api.get("url", ""),
+                            "repository": repo_name,
+                            "file": js_file.get("file", ""),
+                            "language": "javascript",
+                            "data": api,
                         })
                 
             except Exception as e:
@@ -976,7 +1046,8 @@ class DataIngestionService:
                 "name": node.get("name", ""),
                 "repository": node.get("repository", ""),
                 "file": node.get("file", ""),
-                "language": "java" if node.get("type") in ["route", "eventbus", "dto", "entity"] else "typescript",
+                "language": node.get("language")
+                or ("java" if node.get("type") in ["route", "eventbus", "dto", "entity"] else "typescript"),
                 "metadata": node.get("data", {}),
                 "description": self._generate_node_description(node)
             }
