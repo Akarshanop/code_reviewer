@@ -834,7 +834,8 @@ class DataIngestionService:
         
         for repo_info in repositories:
             repo_name = repo_info.get("name", "unknown")
-            repo_path = Path(repo_info.get("path", ""))
+            # Handle both "path" and "local_path" keys for compatibility
+            repo_path = Path(repo_info.get("path") or repo_info.get("local_path", ""))
             
             if not repo_path.exists():
                 all_parsed_data["errors"].append(f"Repository path not found: {repo_path}")

@@ -26,15 +26,11 @@ class TsReactParser:
     """Enhanced TypeScript/React parser for modern patterns"""
     
     def __init__(self):
+        # Use tree-sitter-languages stable API (<1.10)
         from tree_sitter_languages import get_language, get_parser
         self.language = get_language('typescript')
         self.parser = get_parser('typescript')
-        self.api_patterns = {
-            'fetch': self._extract_fetch_call,
-            'axios': self._extract_axios_call,
-            'useQuery': self._extract_tanstack_query,
-            'useMutation': self._extract_tanstack_mutation,
-        }
+        self.api_patterns = {}  # Will be populated with pattern extractors later
     
     def parse_file(self, file_path: Path) -> Dict[str, Any]:
         """Parse a TypeScript/React file"""

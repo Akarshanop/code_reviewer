@@ -32,15 +32,12 @@ class JavaParser:
     """Enhanced Java parser specifically for Vert.x patterns"""
     
     def __init__(self):
+        # Use tree-sitter-languages stable API (<1.10)
         from tree_sitter_languages import get_language, get_parser
         self.language = get_language('java')
         self.parser = get_parser('java')
         self.route_patterns = {
             '@Route': self._extract_vertx_route,
-            '@GetMapping': self._extract_spring_route,
-            '@PostMapping': self._extract_spring_route,
-            '@PutMapping': self._extract_spring_route,
-            '@DeleteMapping': self._extract_spring_route,
         }
     
     def parse_file(self, file_path: Path) -> Dict[str, Any]:

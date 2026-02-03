@@ -35,3 +35,4 @@ docker-compose.override.yml
 .DS_Store
 *.swp" > .gitignore
 
+service.json

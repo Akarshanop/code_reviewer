@@ -43,7 +43,7 @@ class IngestionRequest(BaseModel):
 class IngestionStatus(BaseModel):
     """Status of ingestion job"""
     job_id: str
-    status: str  # pending, cloning, parsing, building_graph, embedding, completed, failed
+    status: str 
     progress: float
     current_step: str
     repositories: List[str]
@@ -372,7 +372,7 @@ async def _run_ingestion_pipeline(
         job["updated_at"] = datetime.utcnow()
         
         parse_results = await ingestion_service.parse_repositories(
-            repositories=clone_results.get("successful", []),
+            repositories=clone_results.get("repositories", []),
             file_types=parse_only
         )
         

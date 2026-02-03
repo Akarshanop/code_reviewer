@@ -170,15 +170,12 @@ class GitService:
                     return repo_path, result
                     
                 except InvalidGitRepositoryError:
-                    # Not a valid repo, remove and clone fresh
                     logger.warning(f"Invalid repository at {repo_path}, removing...")
                     shutil.rmtree(repo_path, ignore_errors=True)
             
-            # Remove existing directory if forcing fresh clone
             if repo_path.exists() and force_fresh:
                 shutil.rmtree(repo_path, ignore_errors=True)
             
-            # Clone repository
             logger.info(
                 f"Cloning repository: {repo_config.name}",
                 url=repo_config.url,
@@ -190,7 +187,6 @@ class GitService:
                 "progress": CloneProgress(repo_config.name)
             }
             
-            # Use shallow clone for faster initial sync
             if self.clone_depth > 0:
                 clone_kwargs["depth"] = self.clone_depth
             
@@ -233,7 +229,6 @@ class GitService:
         """Asynchronously clone or update a repository"""
         loop = asyncio.get_event_loop()
         
-        # Run blocking git operation in thread pool
         result = await loop.run_in_executor(
             self._executor,
             self._clone_repository_sync,
@@ -241,7 +236,6 @@ class GitService:
             force_fresh
         )
         
-        # Update internal state
         async with self._lock:
             state = RepositoryState(
                 url=repo_config.url,

@@ -161,9 +161,16 @@ class Settings(BaseSettings):
     SUPABASE_SERVICE_KEY: Optional[str] = Field(default=None)  # For admin operations
     
     # ======================
+    # Google Cloud Configuration
+    # ======================
+    GOOGLE_CLOUD_PROJECT_ID: Optional[str] = Field(default=None)
+    GOOGLE_CLOUD_REGION: str = Field(default="us-central1")
+    GOOGLE_CLOUD_SERVICE_ACCOUNT_FILE: Optional[str] = Field(default="./service.json")
+    
+    # ======================
     # LLM Configuration
     # ======================
-    LLM_PROVIDER: str = Field(default="openai")  # openai, azure, anthropic, gemini
+    LLM_PROVIDER: str = Field(default="gemini")  # openai, azure, anthropic, gemini
     OPENAI_API_KEY: Optional[str] = Field(default=None)
     AZURE_OPENAI_API_KEY: Optional[str] = Field(default=None)
     AZURE_OPENAI_ENDPOINT: Optional[str] = Field(default=None)
@@ -173,11 +180,11 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: Optional[str] = Field(default=None)
     
     # Model Selection per Agent Type
-    ARCHITECT_MODEL: str = Field(default="gpt-4-turbo-preview")
-    DEVELOPER_MODEL: str = Field(default="gpt-4-turbo-preview")
-    QA_MODEL: str = Field(default="gpt-4-turbo-preview")
-    EMBEDDING_MODEL: str = Field(default="BAAI/bge-m3")  # HuggingFace model
-    HF_TOKEN: Optional[str] = Field(default=None)  # HuggingFace API token
+    ARCHITECT_MODEL: str = Field(default="gemini-2.5-flash")
+    DEVELOPER_MODEL: str = Field(default="gemini-2.5-flash")
+    QA_MODEL: str = Field(default="gemini-2.5-flash")
+    EMBEDDING_MODEL: str = Field(default="text-embedding-004")  # Google Vertex AI embedding model
+    HF_TOKEN: Optional[str] = Field(default=None)  # HuggingFace API token (deprecated)
     
     # LLM Parameters
     LLM_TEMPERATURE: float = Field(default=0.1)

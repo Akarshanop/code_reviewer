@@ -96,7 +96,8 @@ async def health_check():
     try:
         supabase_healthy = await supabase_client.health_check()
         services["supabase"] = {
-            "status": "healthy" if supabase_healthy else "unhealthy"
+            "status": "healthy" if supabase_healthy else "unhealthy",
+            "url": settings.SUPABASE_URL
         }
         if not supabase_healthy:
             overall_status = "degraded"
@@ -121,7 +122,6 @@ async def readiness_check():
     Returns 200 if the service is ready to accept traffic.
     """
     try:
-        # Quick check of all dependencies
         checks = await asyncio.gather(
             neo4j_client.health_check(),
             qdrant_client.health_check(),

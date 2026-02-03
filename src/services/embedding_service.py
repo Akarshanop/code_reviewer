@@ -1,14 +1,17 @@
 """
-Embedding Service using HuggingFace Inference API
-Cloud-based - no local model download required
+Embedding Service using Google Vertex AI Text Embedding API
+Cloud-based - uses Google Cloud service account for authentication
 """
+from __future__ import annotations
+
 import logging
 from typing import List, Dict, Any, Optional
 import numpy as np
 from tenacity import retry, stop_after_attempt, wait_exponential
 import asyncio
 import hashlib
-import httpx
+import json
+import os
 
 from config.settings import settings
 from src.core.logger import get_logger
@@ -16,123 +19,143 @@ from src.core.exceptions import InternalServerException
 
 logger = get_logger(__name__)
 
+try:
+    import google.auth
+    from google.auth.transport.requests import Request
+    from google.oauth2.service_account import Credentials
+    from google.cloud import aiplatform
+    from google.cloud.aiplatform.gapic.services.prediction_service import PredictionServiceAsyncClient
+    from google.api_core.gapic_v1 import client_info as client_info_lib
+except ImportError:
+    logger.warning("Google Cloud libraries not installed. Run: pip install google-cloud-aiplatform")
+    Credentials = Any
+    PredictionServiceAsyncClient = Any
+
+
 class EmbeddingService:
-    """Service for generating embeddings using HuggingFace Inference API (Cloud)"""
+    """Service for generating embeddings using Google Vertex AI Text Embedding API"""
     
     def __init__(self):
-        self.model_name = settings.EMBEDDING_MODEL
-        self.vector_size = settings.QDRANT_VECTOR_SIZE
-        self.hf_token = settings.HF_TOKEN
+        self.model_name = settings.EMBEDDING_MODEL  # text-embedding-004
+        self.vector_size = settings.QDRANT_VECTOR_SIZE  # Will be updated to correct size
+        self.project_id = settings.GOOGLE_CLOUD_PROJECT_ID
+        self.region = settings.GOOGLE_CLOUD_REGION
+        self.service_account_file = settings.GOOGLE_CLOUD_SERVICE_ACCOUNT_FILE
         self._initialized = False
-        self._api_url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{self.model_name}"
-        self._client: Optional[httpx.AsyncClient] = None
+        self._credentials: Optional[Credentials] = None
+        self._client: Optional[PredictionServiceAsyncClient] = None
         
+        # Load service account credentials
+        if not self.project_id:
+            self._load_project_from_service_account()
+    
+    def _load_project_from_service_account(self):
+        """Load project ID from service account JSON file"""
+        try:
+            if os.path.exists(self.service_account_file):
+                with open(self.service_account_file, 'r') as f:
+                    sa_data = json.load(f)
+                    self.project_id = sa_data.get("project_id")
+                    logger.info(f"Loaded project ID from service account: {self.project_id}")
+            else:
+                logger.warning(f"Service account file not found: {self.service_account_file}")
+        except Exception as e:
+            logger.error(f"Failed to load service account: {e}")
+    
     async def initialize(self):
-        """Initialize HTTP client for HuggingFace Inference API"""
+        """Initialize Google Vertex AI client"""
         if not self._initialized:
             try:
-                if not self.hf_token:
-                    raise ValueError("HF_TOKEN is required for HuggingFace Inference API")
+                if not self.project_id:
+                    raise ValueError("GOOGLE_CLOUD_PROJECT_ID is required or service account file must exist")
                 
-                logger.info(f"Initializing HuggingFace Inference API for model: {self.model_name}")
+                logger.info(f"Initializing Google Vertex AI embeddings for model: {self.model_name}")
+                logger.info(f"Project: {self.project_id}, Region: {self.region}")
                 
-                # Create async HTTP client
-                self._client = httpx.AsyncClient(
-                    timeout=httpx.Timeout(120.0, connect=10.0),
-                    headers={
-                        "Authorization": f"Bearer {self.hf_token}",
-                        "Content-Type": "application/json"
-                    }
-                )
-                
-                # Test the API with a simple request
-                test_embedding = await self.generate_embeddings(["test"])
-                actual_size = len(test_embedding[0])
-                
-                if self.vector_size != actual_size:
-                    logger.warning(
-                        f"Vector size mismatch: config={self.vector_size}, actual={actual_size}. "
-                        f"Using actual size: {actual_size}"
+                # Initialize Vertex AI with service account credentials
+                if os.path.exists(self.service_account_file):
+                    aiplatform.init(
+                        project=self.project_id,
+                        location=self.region,
+                        credentials=self._get_credentials()
                     )
-                    self.vector_size = actual_size
+                else:
+                    # Use default credentials (Application Default Credentials)
+                    aiplatform.init(
+                        project=self.project_id,
+                        location=self.region
+                    )
+                
+                logger.info("Google Vertex AI initialized successfully")
+                
+                # Test with a simple embedding request
+                test_embedding = await self.generate_embeddings(["test"])
+                if test_embedding:
+                    actual_size = len(test_embedding[0])
+                    if self.vector_size != actual_size:
+                        logger.info(
+                            f"Updating vector size from config {self.vector_size} to actual {actual_size}"
+                        )
+                        self.vector_size = actual_size
                 
                 self._initialized = True
                 logger.info(
-                    "HuggingFace Inference API initialized",
+                    "Google Vertex AI Embedding Service initialized",
                     model=self.model_name,
                     vector_size=self.vector_size,
-                    api_url=self._api_url
+                    project_id=self.project_id,
+                    region=self.region
                 )
                 
             except Exception as e:
                 logger.error("Failed to initialize embedding service", error=str(e))
                 raise
     
+    def _get_credentials(self) -> Credentials:
+        """Get credentials from service account file"""
+        if not self._credentials:
+            try:
+                self._credentials = Credentials.from_service_account_file(
+                    self.service_account_file,
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"]
+                )
+            except Exception as e:
+                logger.error(f"Failed to load credentials: {e}")
+                raise
+        return self._credentials
+    
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=2, min=4, max=30)
     )
-    async def _call_hf_api(self, texts: List[str]) -> List[List[float]]:
-        """Call HuggingFace Inference API to get embeddings"""
-        if not self._client:
+    async def _call_vertex_api(self, texts: List[str]) -> List[List[float]]:
+        """Call Google Vertex AI Text Embedding API to get embeddings"""
+        if not self._initialized:
             await self.initialize()
         
         try:
-            response = await self._client.post(
-                self._api_url,
-                json={
-                    "inputs": texts,
-                    "options": {
-                        "wait_for_model": True  # Wait if model is loading
-                    }
-                }
+            from google.cloud import aiplatform
+            
+            # Use the TextEmbeddingModel for synchronous calls (async wrapper)
+            model = aiplatform.TextEmbeddingModel.from_pretrained(self.model_name)
+            
+            # Generate embeddings
+            embeddings = model.get_embeddings(texts)
+            
+            # Extract vectors from Embedding objects
+            embedding_vectors = [emb.values for emb in embeddings]
+            
+            logger.debug(
+                "Embeddings generated via Vertex AI",
+                text_count=len(texts),
+                embedding_dim=len(embedding_vectors[0]) if embedding_vectors else 0
             )
             
-            if response.status_code == 503:
-                # Model is loading, retry
-                error_data = response.json()
-                estimated_time = error_data.get("estimated_time", 60)
-                logger.info(f"Model loading on HuggingFace, waiting {estimated_time}s...")
-                await asyncio.sleep(min(estimated_time, 60))
-                raise ConnectionError("Model loading, will retry")
+            return embedding_vectors
             
-            response.raise_for_status()
-            result = response.json()
-            
-            # Handle different response formats from HuggingFace
-            if isinstance(result, list):
-                if len(result) > 0:
-                    if isinstance(result[0], list):
-                        if isinstance(result[0][0], list):
-                            # Nested: [[[floats]]] - use mean pooling
-                            embeddings = [self._pool_embeddings(emb) for emb in result]
-                        else:
-                            # Direct: [[floats]]
-                            embeddings = result
-                    else:
-                        embeddings = [result]
-                else:
-                    embeddings = []
-            else:
-                raise ValueError(f"Unexpected response format: {type(result)}")
-            
-            return embeddings
-            
-        except httpx.HTTPStatusError as e:
-            error_text = e.response.text[:200] if e.response else "Unknown error"
-            logger.error(f"HuggingFace API error {e.response.status_code}: {error_text}")
-            raise
         except Exception as e:
-            logger.error(f"Failed to call HuggingFace API: {e}")
+            logger.error(f"Failed to call Vertex AI API: {e}")
             raise
-    
-    def _pool_embeddings(self, token_embeddings: List[List[float]]) -> List[float]:
-        """Pool token embeddings using mean pooling"""
-        if not token_embeddings:
-            return []
-        arr = np.array(token_embeddings)
-        pooled = np.mean(arr, axis=0)
-        return pooled.tolist()
     
     def _normalize_embedding(self, embedding: List[float]) -> List[float]:
         """L2 normalize an embedding"""
@@ -147,28 +170,28 @@ class EmbeddingService:
         wait=wait_exponential(multiplier=1, min=1, max=5)
     )
     async def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """Generate embeddings for a list of texts using HuggingFace Inference API"""
+        """Generate embeddings for a list of texts using Google Vertex AI"""
         if not texts:
             return []
         
-        if not self._initialized and self._client is None:
+        if not self._initialized:
             await self.initialize()
         
         try:
-            # Process in batches to avoid API limits
-            batch_size = 32  # HF API handles up to 32 texts per request
+            # Process in batches (Vertex AI supports up to 100 texts per request)
+            batch_size = 50
             all_embeddings = []
             
             for i in range(0, len(texts), batch_size):
                 batch = texts[i:i + batch_size]
-                batch_embeddings = await self._call_hf_api(batch)
+                batch_embeddings = await self._call_vertex_api(batch)
                 
-                # Normalize embeddings
+                # Normalize embeddings for consistent similarity calculations
                 normalized = [self._normalize_embedding(emb) for emb in batch_embeddings]
                 all_embeddings.extend(normalized)
             
             logger.debug(
-                "Embeddings generated via HuggingFace Inference API",
+                "Embeddings generated via Google Vertex AI",
                 text_count=len(texts),
                 embedding_dim=len(all_embeddings[0]) if all_embeddings else 0
             )
@@ -287,10 +310,11 @@ class EmbeddingService:
             "model_name": self.model_name,
             "vector_size": self.vector_size,
             "initialized": self._initialized,
-            "api_type": "huggingface_inference_api",
-            "api_url": self._api_url,
+            "api_type": "google_vertex_ai",
+            "project_id": self.project_id,
+            "region": self.region,
             "normalized": True,
-            "source": "Cloud (HuggingFace Servers)"
+            "source": "Google Cloud Vertex AI"
         }
     
     def clear_cache(self):
@@ -299,11 +323,8 @@ class EmbeddingService:
     
     async def close(self):
         """Clean up resources"""
-        if self._client:
-            await self._client.aclose()
-            self._client = None
-            self._initialized = False
-            logger.info("Embedding service closed")
+        self._initialized = False
+        logger.info("Embedding service closed")
     
     async def __aenter__(self):
         await self.initialize()
@@ -311,6 +332,7 @@ class EmbeddingService:
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
+
 
 # Singleton instance
 embedding_service = EmbeddingService()

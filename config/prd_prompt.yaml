@@ -8,7 +8,7 @@ prd_architect_system: |
   
   # CONTEXT
   Codebase: {repository_count} repositories (Vert.x backend + React frontend)
-  Team Size: 50+ engineers
+  Team Size: 200+ engineers
   Scale Requirements: Enterprise production workload
   
   # ANALYSIS TEMPLATE

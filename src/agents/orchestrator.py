@@ -34,7 +34,7 @@ class AgentConfig:
     """Configuration for agent execution"""
     max_tokens: int = 4096
     temperature: float = 0.1
-    model: str = "gpt-4-turbo-preview"
+    model: str = "gemini-2.5-flash"
     timeout_seconds: int = 300
     max_iterations: int = 10
 
@@ -137,7 +137,6 @@ class AgentOrchestrator:
                     "errors": []
                 }
                 
-                # Execute workflow with timeout
                 try:
                     result = await asyncio.wait_for(
                         prd_workflow.ainvoke(initial_state),

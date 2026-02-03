@@ -344,11 +344,16 @@ class QdrantClient:
     async def health_check(self) -> bool:
         """Check if Qdrant is healthy"""
         try:
-            if not self._initialized or not self.client:
+            if not self._initialized:
+                logger.warning("Qdrant client not initialized")
+                return False
+            if not self.client:
+                logger.warning("Qdrant client is None")
                 return False
             await self.client.get_collections()
             return True
-        except Exception:
+        except Exception as e:
+            logger.error(f"Qdrant health check failed: {e}")
             return False
     
     async def close(self):
