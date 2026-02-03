@@ -1,6 +1,6 @@
 # 🧠 Enterprise Code Intelligence Platform
 
-A **production-ready GraphRAG system** for enterprise codebase understanding, PRD analysis, and AI-powered developer assistance. Built to support 10+ repositories with Vert.x backend and React frontend architectures.
+A **production-ready GraphRAG system** for enterprise codebase understanding, PRD analysis, and AI-powered developer assistance. Built to ingest and understand multi-repo systems (Java/Vert.x, React/TS, and modern JavaScript/Node/Express codebases).
 
 ## 🎯 Key Features
 
@@ -21,6 +21,11 @@ A **production-ready GraphRAG system** for enterprise codebase understanding, PR
 - Cross-repository semantic search
 - API flow tracing and impact analysis
 - PR risk assessment and security scanning
+
+### 4. Multi-Language Ingestion (Tree-sitter)
+- Parses Java, TypeScript/TSX, JavaScript/JSX (incl. Express routes), Python, and common config/build files
+- Builds a Neo4j knowledge graph (repositories, files, routes, API calls, components)
+- Generates embeddings into Qdrant for semantic search
 
 ## 🏗️ Architecture
 
@@ -52,7 +57,7 @@ A **production-ready GraphRAG system** for enterprise codebase understanding, PR
 
 ### Prerequisites
 
-- Python 3.11+
+- Python 3.12+
 - Docker & Docker Compose
 - Node.js 18+ (for frontend)
 
@@ -104,7 +109,13 @@ GIT_REPOS_CONFIG='[
 uvicorn src.api.main:app --reload
 
 # Trigger ingestion (in another terminal)
-curl -X POST http://localhost:8000/api/v1/ingestion/trigger
+curl -X POST http://localhost:8000/api/v1/trigger/trigger \
+  -H "Content-Type: application/json" \
+  -d '{"force_refresh": false, "skip_embeddings": false}'
+
+# Check job status
+# (use the job_id returned by the trigger endpoint)
+curl http://localhost:8000/api/v1/trigger/status/{job_id}
 ```
 
 ### 6. Start Using
@@ -164,7 +175,7 @@ backend/
 │   │   └── supabase_session.py   # Auth & audit client
 │   └── services/
 │       ├── data_ingestion_service.py  # Ingestion orchestration
-│       ├── embedding_service.py       # Local embeddings
+│       ├── embedding_service.py       # Vertex AI embeddings (text-embedding-004)
 │       ├── graph_service.py           # Graph queries
 │       ├── search_service.py          # Hybrid search
 │       └── vector_service.py          # Vector operations
@@ -182,16 +193,23 @@ backend/
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `NEO4J_URI` | Neo4j connection URI | bolt://localhost:7687 |
-| `NEO4J_PASSWORD` | Neo4j password | - |
+| `NEO4J_PASSWORD` | Neo4j password | password |
 | `QDRANT_URL` | Qdrant server URL | http://localhost:6333 |
+| `QDRANT_COLLECTION_NAME` | Qdrant collection name | code_embeddings |
+| `QDRANT_VECTOR_SIZE` | Embedding vector size (must match model) | 768 |
 | `SUPABASE_URL` | Supabase project URL | - |
 | `SUPABASE_KEY` | Supabase anon key | - |
-| `OPENAI_API_KEY` | OpenAI API key | - |
-| `LLM_PROVIDER` | LLM provider (openai/azure/anthropic) | openai |
-| `ARCHITECT_MODEL` | Model for PRD analysis | gpt-4-turbo-preview |
-| `DEVELOPER_MODEL` | Model for dev assistant | gpt-4-turbo-preview |
-| `QA_MODEL` | Model for QA generation | gpt-4-turbo-preview |
-| `EMBEDDING_MODEL` | Local embedding model | all-MiniLM-L6-v2 |
+| `SUPABASE_SERVICE_KEY` | Supabase service key (admin ops) | - |
+| `LLM_PROVIDER` | LLM provider (openai/azure/anthropic/gemini) | gemini |
+| `GEMINI_API_KEY` | Gemini API key (if using Gemini) | - |
+| `OPENAI_API_KEY` | OpenAI API key (if using OpenAI) | - |
+| `ARCHITECT_MODEL` | Model for PRD analysis | gemini-2.5-flash |
+| `DEVELOPER_MODEL` | Model for dev assistant | gemini-2.5-flash |
+| `QA_MODEL` | Model for QA generation | gemini-2.5-flash |
+| `EMBEDDING_MODEL` | Embedding model (Vertex AI) | text-embedding-004 |
+| `GOOGLE_CLOUD_PROJECT_ID` | GCP project id for Vertex AI | - |
+| `GOOGLE_CLOUD_REGION` | Vertex AI region | us-central1 |
+| `GOOGLE_CLOUD_SERVICE_ACCOUNT_FILE` | Service account JSON path | ./service.json |
 
 ### Multi-Repository Configuration
 
@@ -211,10 +229,12 @@ backend/
 ## 📊 API Endpoints
 
 ### Ingestion
-- `POST /api/v1/ingestion/trigger` - Start codebase ingestion
-- `GET /api/v1/ingestion/status/{job_id}` - Check ingestion status
-- `GET /api/v1/ingestion/repositories` - List indexed repositories
-- `GET /api/v1/ingestion/stats` - Get ingestion statistics
+- `POST /api/v1/trigger/trigger` - Start codebase ingestion
+- `GET /api/v1/trigger/status/{job_id}` - Check ingestion status
+- `GET /api/v1/trigger/repositories` - List configured repositories + ingestion state
+- `POST /api/v1/trigger/repositories/{repo_name}/refresh` - Force refresh a single repo
+- `GET /api/v1/trigger/stats` - Neo4j/Qdrant ingestion statistics
+- `DELETE /api/v1/trigger/cache` - Clear ingestion job cache
 
 ### PRD & QA
 - `POST /api/v1/prd-qa/analyze` - Analyze PRD and generate blueprint
@@ -224,7 +244,7 @@ backend/
 
 ### Developer Assistant
 - `POST /api/v1/developer/ask` - Ask development questions
-- `GET /api/v1/developer/scan/{module}` - Scan module quality
+- `POST /api/v1/developer/scan/{module}` - Scan module quality
 - `POST /api/v1/developer/analyze-pr` - Analyze PR impact
 - `GET /api/v1/developer/search` - Semantic code search
 - `GET /api/v1/developer/component/{name}` - Get component details
@@ -241,6 +261,10 @@ backend/
 - `GET /api/v1/admin/ready` - Kubernetes readiness probe
 - `GET /api/v1/admin/live` - Kubernetes liveness probe
 - `GET /api/v1/admin/stats` - System statistics
+- `GET /api/v1/admin/config` - Effective configuration (sanitized)
+- `POST /api/v1/admin/cache/invalidate` - Clear caches
+- `POST /api/v1/admin/reindex` - Reindex repositories
+- `GET /api/v1/admin/audit/recent` - Recent audit events
 - `GET /api/v1/admin/metrics` - Prometheus metrics
 
 ## 🔒 Security
