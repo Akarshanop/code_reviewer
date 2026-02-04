@@ -1,13 +1,13 @@
-
 import logging
 import sys
 import time
 import uuid
 import os
+import asyncio
 from pathlib import Path
 from contextlib import asynccontextmanager
-
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
@@ -18,7 +18,9 @@ from config.settings import settings
 from src.core.logger import setup_logging, get_logger
 from src.api.v1.endpoints import admin, ingestion, developer, chat, prd_qa
 from src.agents.orchestrator import AgentOrchestrator
+from src.database.neo4j_client import neo4j_client
 from src.database.qdrant_client import qdrant_client
+from src.database.supabase_session import supabase_client
 
 setup_logging()
 logger = get_logger(__name__)
@@ -43,22 +45,10 @@ if settings.LLM_PROVIDER == "gemini" and settings.GOOGLE_CLOUD_SERVICE_ACCOUNT_F
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("🔄 Starting Code Intelligence Platform...")
-
-    # Initialize Qdrant client
-    try:
-        await qdrant_client.initialize()
-        logger.info("✅ Qdrant client initialized")
-    except Exception as e:
-        logger.error(f"Failed to initialize Qdrant client: {e}")
-        # Don't fail startup, but log the error
-
-    # Initialize Agent Orchestrator
     app.state.agent_orchestrator = AgentOrchestrator()
     await app.state.agent_orchestrator.initialize()
     logger.info("✅ Agent orchestrator initialized")
-
     yield
-
     logger.info("🛑 Application shutdown complete")
 
 
@@ -72,17 +62,58 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# CORS middleware MUST be added before other middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:5173"
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["X-Request-ID", "X-Response-Time"]
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+    allow_headers=[
+        "Content-Type",
+        "Authorization",
+        "X-Requested-With",
+        "Accept",
+        "Origin"
+    ],
+    expose_headers=["X-Request-ID", "X-Response-Time", "Content-Length"],
+    max_age=3600
 )
 
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
+
+
+@app.middleware("http")
+async def cors_preflight_handler(request: Request, call_next):
+    """Handle CORS preflight requests explicitly."""
+    if request.method == "OPTIONS":
+        origin = request.headers.get("origin", "")
+        allowed_origins = [
+            "http://localhost:3000",
+            "http://localhost:5173",
+            "http://127.0.0.1:3000",
+            "http://127.0.0.1:5173"
+        ]
+        
+        if origin in allowed_origins:
+            return Response(
+                status_code=200,
+                headers={
+                    "Access-Control-Allow-Origin": origin,
+                    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+                    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With, Accept, Origin",
+                    "Access-Control-Allow-Credentials": "true",
+                    "Access-Control-Max-Age": "3600"
+                }
+            )
+    
+    response = await call_next(request)
+    return response
 
 
 @app.middleware("http")
@@ -123,7 +154,7 @@ async def log_requests(request: Request, call_next):
 # -------------------- ROUTERS --------------------
 
 app.include_router(admin.router, prefix="/api/v1/admin", tags=["admin"])
-app.include_router(ingestion.router, prefix="/api/v1/trigger", tags=["ingestion"])
+app.include_router(ingestion.router, prefix="/api/v1/ingestion", tags=["ingestion"])
 app.include_router(developer.router, prefix="/api/v1/developer", tags=["developer"])
 app.include_router(chat.router, prefix="/api/v1/chat", tags=["chat"])
 app.include_router(prd_qa.router, prefix="/api/v1/prd-qa", tags=["prd-qa"])
@@ -147,6 +178,31 @@ async def health():
         "timestamp": time.time(),
         "version": "2.0.0"
     }
+
+@app.get("/ready")
+async def ready():
+    try:
+        checks = await asyncio.gather(
+            neo4j_client.health_check(),
+            qdrant_client.health_check(),
+            supabase_client.health_check(),
+            return_exceptions=True
+        )
+
+        # Only True counts as healthy
+        all_healthy = all(
+            check is True for check in checks
+            if not isinstance(check, Exception)
+        )
+
+        if all_healthy:
+            return {"status": "ready"}
+        else:
+            raise HTTPException(status_code=503, detail="Service not ready")
+
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Readiness check failed: {str(e)}")
+
 
 
 # -------------------- LOCAL RUN --------------------

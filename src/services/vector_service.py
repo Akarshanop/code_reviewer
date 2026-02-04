@@ -30,22 +30,42 @@ class VectorService:
     ) -> Dict[str, Any]:
         """Index code artifacts (classes, methods, components, etc.)"""
         if not artifacts:
+            logger.warning("No artifacts to index")
             return {"indexed": 0, "errors": []}
         
         total_indexed = 0
         errors = []
         
+        logger.info(
+            "Starting artifact indexing",
+            total_artifacts=len(artifacts),
+            batch_size=batch_size
+        )
+        
         for i in range(0, len(artifacts), batch_size):
             batch = artifacts[i:i + batch_size]
+            batch_num = (i // batch_size) + 1
             
             try:
                 # Extract texts for embedding
                 texts = []
                 metadata_list = []
+                artifact_names = []
                 
                 for artifact in batch:
                     text = self._create_index_text(artifact)
+                    
+                    # ✅ Validate: ensure we have content to embed
+                    if not text or len(text.strip()) < 5:
+                        logger.warning(
+                            f"Artifact has minimal content",
+                            artifact_type=artifact.get("type"),
+                            artifact_name=artifact.get("name"),
+                            text_length=len(text) if text else 0
+                        )
+                    
                     texts.append(text)
+                    artifact_names.append(artifact.get("name", "unknown"))
                     
                     metadata = {
                         "type": artifact.get("type", "unknown"),
@@ -62,7 +82,19 @@ class VectorService:
                     metadata_list.append(metadata)
                 
                 # Generate embeddings
+                logger.debug(
+                    f"Generating embeddings for batch {batch_num}",
+                    batch_size=len(batch),
+                    text_samples=artifact_names[:3]
+                )
+                
                 points_data = await self.embedding.batch_generate_with_ids(texts, metadata_list)
+                
+                if not points_data:
+                    error_msg = f"Batch {batch_num}: Failed to generate embeddings (empty result)"
+                    logger.error(error_msg, batch_index=batch_num)
+                    errors.append(error_msg)
+                    continue
                 
                 # Convert to Qdrant PointStruct
                 points = []
@@ -74,25 +106,51 @@ class VectorService:
                     )
                     points.append(point)
                 
+                # ✅ Validate embeddings before upsert
+                if not points:
+                    error_msg = f"Batch {batch_num}: No valid points to upsert"
+                    logger.error(error_msg)
+                    errors.append(error_msg)
+                    continue
+                
                 # Upsert to Qdrant
+                logger.debug(
+                    f"Upserting batch {batch_num} to Qdrant",
+                    point_count=len(points)
+                )
+                
                 await self.qdrant.upsert_vectors(points)
                 
                 total_indexed += len(batch)
-                logger.debug(
-                    f"Indexed batch {i//batch_size + 1}",
+                logger.info(
+                    f"Indexed batch {batch_num} successfully",
                     batch_size=len(batch),
-                    total_indexed=total_indexed
+                    total_indexed=total_indexed,
+                    batch_artifacts=artifact_names[:3]
                 )
                 
             except Exception as e:
-                error_msg = f"Batch {i//batch_size + 1} failed: {str(e)}"
-                logger.error("Failed to index batch", error=str(e), batch_index=i//batch_size + 1)
+                error_msg = f"Batch {batch_num} failed: {str(e)}"
+                logger.error(
+                    f"Failed to index batch {batch_num}",
+                    error=str(e),
+                    batch_index=batch_num,
+                    exc_info=True
+                )
                 errors.append(error_msg)
+        
+        logger.info(
+            "Artifact indexing completed",
+            total_indexed=total_indexed,
+            total_artifacts=len(artifacts),
+            error_count=len(errors),
+            success_rate=f"{(total_indexed/len(artifacts)*100):.1f}%" if artifacts else "N/A"
+        )
         
         return {
             "indexed": total_indexed,
             "errors": errors,
-            "success": len(errors) == 0
+            "success": len(errors) == 0 and total_indexed > 0
         }
     
     def _create_index_text(self, artifact: Dict[str, Any]) -> str:

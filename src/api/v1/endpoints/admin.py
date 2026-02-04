@@ -71,7 +71,7 @@ async def health_check():
         neo4j_healthy = await neo4j_client.health_check()
         services["neo4j"] = {
             "status": "healthy" if neo4j_healthy else "unhealthy",
-            "uri": settings.NEO4J_URI
+            "url": settings.NEO4J_URI
         }
         if not neo4j_healthy:
             overall_status = "degraded"
@@ -122,33 +122,7 @@ async def health_check():
         services=services
     )
 
-
-@router.get("/ready")
-async def readiness_check():
-    """
-    Kubernetes-style readiness check.
-    Returns 200 if the service is ready to accept traffic.
-    """
-    try:
-        checks = await asyncio.gather(
-            neo4j_client.health_check(),
-            qdrant_client.health_check(),
-            supabase_client.health_check(),
-            return_exceptions=True
-        )
-        
-        all_healthy = all(
-            check is True for check in checks 
-            if not isinstance(check, Exception)
-        )
-        
-        if all_healthy:
-            return {"status": "ready"}
-        else:
-            raise HTTPException(status_code=503, detail="Service not ready")
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Readiness check failed: {str(e)}")
-
+    
 
 @router.get("/live")
 async def liveness_check():

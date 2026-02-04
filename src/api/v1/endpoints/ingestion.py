@@ -7,7 +7,6 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
-
 from src.core.logger import get_logger
 from src.services.data_ingestion_service import DataIngestionService
 from src.data_ingestion.git_service import git_service
@@ -388,6 +387,10 @@ async def _run_ingestion_pipeline(
         job = _ingestion_jobs[job_id]
         ingestion_service = DataIngestionService()
         
+        # Initialize all services (including vector_service and database clients)
+        await ingestion_service.initialize()
+        logger.info(f"Ingestion service initialized for job {job_id}")
+        
         # Step 1: Clone repositories
         job["status"] = "cloning"
         job["current_step"] = "Cloning repositories"
@@ -418,6 +421,7 @@ async def _run_ingestion_pipeline(
         )
         
         job["stats"]["files_processed"] = parse_results.get("files_processed", 0)
+        parsed_data = parse_results.get("parsed_data", {})
         
         # Step 3: Build knowledge graph
         job["status"] = "building_graph"
@@ -426,24 +430,47 @@ async def _run_ingestion_pipeline(
         job["updated_at"] = datetime.utcnow()
         
         graph_results = await ingestion_service.build_knowledge_graph(
-            parsed_data=parse_results.get("parsed_data", {})
+            parsed_data=parsed_data
         )
         
         job["stats"]["nodes_created"] = graph_results.get("nodes_created", 0)
         job["stats"]["edges_created"] = graph_results.get("edges_created", 0)
         
-        # Step 4: Generate embeddings
+        # Step 4: Generate embeddings from PARSED CODE (not graph nodes!)
         if not skip_embeddings:
             job["status"] = "embedding"
             job["current_step"] = "Generating embeddings"
             job["progress"] = 0.8
             job["updated_at"] = datetime.utcnow()
             
-            embedding_results = await ingestion_service.generate_embeddings(
-                nodes=graph_results.get("nodes", [])
-            )
-            
-            job["stats"]["embeddings_generated"] = embedding_results.get("embeddings_generated", 0)
+            try:
+                total_embeddings = 0
+                
+                # ✅ Generate embeddings for each repository's parsed data
+                for repo_name, repo_parsed_data in parsed_data.items():
+                    embedding_results = await ingestion_service._generate_embeddings(
+                        parsed_data=repo_parsed_data,  # Pass per-repo parsed data (has language keys)
+                        repo_url=repo_name,
+                        repo_hash=clone_results.get("repository_hash", "")
+                    )
+                    
+                    stats = embedding_results.get("statistics", {})
+                    total_embeddings += stats.get("embeddings_created", 0)
+                    
+                    if stats.get("errors"):
+                        job["errors"].extend(stats["errors"])
+                
+                job["stats"]["embeddings_generated"] = total_embeddings
+                
+                if job["errors"]:
+                    logger.warning(
+                        "Some embeddings failed",
+                        error_count=len(job["errors"]),
+                        job_id=job_id
+                    )
+            except Exception as e:
+                logger.error(f"Embedding generation failed: {e}", exc_info=True)
+                job["errors"].append(f"Embedding failed: {str(e)}")
         
         # Complete
         job["status"] = "completed"

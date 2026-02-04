@@ -650,9 +650,9 @@ class DataIngestionService:
         try:
             artifacts = []
             
-            # Extract artifacts from Java files
-            for java_file in parsed_data["java"]:
-                file_data = java_file["data"]
+            # Extract artifacts from Java files (use .get() to avoid KeyError)
+            for java_file in parsed_data.get("java", []):
+                file_data = java_file.get("data", {})
                 
                 # Routes
                 for route in file_data.get("routes", []):
@@ -662,7 +662,8 @@ class DataIngestionService:
                         "language": "java",
                         "repository": repo_url,
                         "repository_hash": repo_hash,
-                        "file": java_file["file"],
+                        "file": java_file.get("file", ""),
+                        "code": f"Vert.x Route: {route.get('path', '')} Method: {route.get('method', '')} Handler: {route.get('handler_method', '')}",
                         "text": f"Vert.x Route: {route.get('path', '')} "
                                f"Method: {route.get('method', '')} "
                                f"Handler: {route.get('handler_method', '')}",
@@ -681,7 +682,8 @@ class DataIngestionService:
                         "language": "java",
                         "repository": repo_url,
                         "repository_hash": repo_hash,
-                        "file": java_file["file"],
+                        "file": java_file.get("file", ""),
+                        "code": f"EventBus address: {eb.get('address', '')} type: {eb.get('type', '')} handler: {eb.get('handler_method', '')}",
                         "text": f"EventBus: {eb.get('address', '')} "
                                f"Type: {eb.get('type', '')} "
                                f"Handler: {eb.get('handler_method', '')}",
@@ -700,9 +702,10 @@ class DataIngestionService:
                         "language": "java",
                         "repository": repo_url,
                         "repository_hash": repo_hash,
-                        "file": java_file["file"],
+                        "file": java_file.get("file", ""),
+                        "code": f"DTO class {dto.get('name', '')} with fields: {', '.join([f.get('name', '') for f in dto.get('fields', [])])}",
                         "text": f"DTO: {dto.get('name', '')} "
-                               f"Fields: {', '.join([f['name'] for f in dto.get('fields', [])])}",
+                               f"Fields: {', '.join([f.get('name', '') for f in dto.get('fields', [])])}",
                         "metadata": {
                             "name": dto.get("name"),
                             "fields": dto.get("fields", []),
@@ -711,25 +714,46 @@ class DataIngestionService:
                     })
             
             # Extract artifacts from TypeScript files
-            for ts_file in parsed_data["typescript"]:
-                file_data = ts_file["data"]
+            for ts_file in parsed_data.get("typescript", []):
+                file_data = ts_file.get("data", {})
+                file_metadata = ts_file.get("metadata", {})
                 
-                # Components
-                for comp in file_data.get("components", []):
+                # Components - try file_data first, then metadata
+                components = file_data.get("components", []) or file_metadata.get("components", [])
+                for comp in components:
                     artifacts.append({
                         "type": "react_component",
                         "name": comp.get("name", ""),
                         "language": "typescript",
                         "repository": repo_url,
                         "repository_hash": repo_hash,
-                        "file": ts_file["file"],
+                        "file": ts_file.get("file", ""),
+                        "code": f"React component {comp.get('name', '')} with props: {', '.join([p.get('name', '') for p in comp.get('props', [])])} and hooks: {', '.join(comp.get('hooks', []))}",
                         "text": f"React Component: {comp.get('name', '')} "
-                               f"Props: {', '.join([p['name'] for p in comp.get('props', [])])} "
+                               f"Props: {', '.join([p.get('name', '') for p in comp.get('props', [])])} "
                                f"Hooks: {', '.join(comp.get('hooks', []))}",
                         "metadata": {
                             "name": comp.get("name"),
                             "props": comp.get("props", []),
                             "hooks": comp.get("hooks", [])
+                        }
+                    })
+                
+                # Functions/Methods from TypeScript (not components)
+                functions = file_data.get("functions", [])
+                for func in functions:
+                    artifacts.append({
+                        "type": "function",
+                        "name": func.get("name", ""),
+                        "language": "typescript",
+                        "repository": repo_url,
+                        "repository_hash": repo_hash,
+                        "file": ts_file.get("file", ""),
+                        "code": f"Function {func.get('name', '')} - {func.get('description', '')}",
+                        "text": f"Function: {func.get('name', '')} - {func.get('description', '')}",
+                        "metadata": {
+                            "name": func.get("name"),
+                            "description": func.get("description", "")
                         }
                     })
                 
@@ -741,7 +765,8 @@ class DataIngestionService:
                         "language": "typescript",
                         "repository": repo_url,
                         "repository_hash": repo_hash,
-                        "file": ts_file["file"],
+                        "file": ts_file.get("file", ""),
+                        "code": f"API call to {api.get('url', '')} using {api.get('method', '')} in hook {api.get('hook', '')}",
                         "text": f"API Call: {api.get('url', '')} "
                                f"Method: {api.get('method', '')} "
                                f"Hook: {api.get('hook', '')}",
@@ -753,28 +778,112 @@ class DataIngestionService:
                         }
                     })
             
-            # Generate embeddings
+            # Extract artifacts from JavaScript files (same as TypeScript)
+            for js_file in parsed_data.get("javascript", []):
+                file_data = js_file.get("data", {})
+                file_metadata = js_file.get("metadata", {})
+                
+                # Components
+                components = file_data.get("components", []) or file_metadata.get("components", [])
+                for comp in components:
+                    artifacts.append({
+                        "type": "react_component",
+                        "name": comp.get("name", ""),
+                        "language": "javascript",
+                        "repository": repo_url,
+                        "repository_hash": repo_hash,
+                        "file": js_file.get("file", ""),
+                        "code": f"React component {comp.get('name', '')} with props: {', '.join([p.get('name', '') for p in comp.get('props', [])])}",
+                        "text": f"React Component: {comp.get('name', '')} Props: {', '.join([p.get('name', '') for p in comp.get('props', [])])}",
+                        "metadata": {
+                            "name": comp.get("name"),
+                            "props": comp.get("props", [])
+                        }
+                    })
+                
+                # Functions
+                functions = file_data.get("functions", [])
+                for func in functions:
+                    artifacts.append({
+                        "type": "function",
+                        "name": func.get("name", ""),
+                        "language": "javascript",
+                        "repository": repo_url,
+                        "repository_hash": repo_hash,
+                        "file": js_file.get("file", ""),
+                        "code": f"Function {func.get('name', '')} - {func.get('description', '')}",
+                        "text": f"Function: {func.get('name', '')}",
+                        "metadata": {
+                            "name": func.get("name")
+                        }
+                    })
+                
+                # API Calls
+                for api in file_data.get("api_calls", []):
+                    artifacts.append({
+                        "type": "api_call",
+                        "name": api.get("url", ""),
+                        "language": "javascript",
+                        "repository": repo_url,
+                        "repository_hash": repo_hash,
+                        "file": js_file.get("file", ""),
+                        "code": f"API call to {api.get('url', '')} using {api.get('method', '')}",
+                        "text": f"API Call: {api.get('url', '')} Method: {api.get('method', '')}",
+                        "metadata": {
+                            "url": api.get("url"),
+                            "method": api.get("method")
+                        }
+                    })
+            
+            # Generate embeddings from actual code snippets
             if artifacts:
-                result = await self.vector_service.index_code_artifacts(artifacts)
-                statistics["embeddings_created"] = result.get("indexed", 0)
+                logger.info(
+                    "Starting embedding generation",
+                    repository=repo_url,
+                    artifact_count=len(artifacts),
+                    artifact_types=dict(statistics["by_artifact_type"])
+                )
                 
-                # Count by type
-                for artifact in artifacts:
-                    statistics["by_artifact_type"][artifact["type"]] += 1
-                
-                statistics["errors"] = result.get("errors", [])
+                try:
+                    result = await self.vector_service.index_code_artifacts(artifacts)
+                    statistics["embeddings_created"] = result.get("indexed", 0)
+                    statistics["errors"] = result.get("errors", [])
+                    
+                    # Validate: ensure we actually indexed something
+                    if statistics["embeddings_created"] == 0 and len(artifacts) > 0:
+                        error_msg = "No artifacts were indexed despite having code to embed"
+                        logger.warning(error_msg, artifact_count=len(artifacts))
+                        statistics["errors"].append(error_msg)
+                    
+                    # Log success
+                    logger.info(
+                        "Embeddings generated successfully",
+                        repository=repo_url,
+                        embeddings_created=statistics["embeddings_created"],
+                        total_artifacts=len(artifacts),
+                        artifact_types=dict(statistics["by_artifact_type"]),
+                        error_count=len(statistics["errors"])
+                    )
+                except Exception as embed_error:
+                    error_msg = f"Embedding indexing failed: {str(embed_error)}"
+                    logger.error(error_msg, exc_info=True)
+                    statistics["errors"].append(error_msg)
+            else:
+                logger.warning(
+                    "No artifacts found for embedding",
+                    repository=repo_url,
+                    parsed_data_keys=list(parsed_data.keys())
+                )
             
-            logger.info(
-                "Embeddings generated",
-                repository=repo_url,
-                embeddings_created=statistics["embeddings_created"],
-                artifact_types=dict(statistics["by_artifact_type"])
-            )
-            
-            return {"statistics": statistics, "status": "success"}
+            return {"statistics": statistics, "status": "success" if not statistics["errors"] else "partial"}
             
         except Exception as e:
-            logger.error("Failed to generate embeddings", error=str(e))
+            logger.error(
+                "Failed to generate embeddings",
+                error=str(e),
+                repository=repo_url,
+                exc_info=True
+            )
             statistics["errors"].append(str(e))
             return {"statistics": statistics, "status": "failed"}
     

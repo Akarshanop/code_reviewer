@@ -98,7 +98,7 @@ async def chat_with_ai(request: ChatRequest):
         logger.info(
             "Processing chat request",
             question_length=len(request.question),
-            has_history=len(request.chat_history) > 0
+            has_history=len(request.chat_history) >= 0
         )
         
         # Ensure orchestrator is initialized
