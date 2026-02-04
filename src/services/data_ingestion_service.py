@@ -1009,6 +1009,27 @@ class DataIngestionService:
                             "language": "javascript",
                             "data": api,
                         })
+
+                    for fn in file_data.get("functions", []):
+                        if not isinstance(fn, dict):
+                            continue
+                        all_nodes.append({
+                            "type": "function",
+                            "name": fn.get("name", ""),
+                            "repository": repo_name,
+                            "file": js_file.get("file", ""),
+                            "language": "javascript",
+                            # Avoid pushing full function bodies into vector payloads
+                            "data": {
+                                "name": fn.get("name"),
+                                "type": fn.get("type"),
+                                "is_async": fn.get("is_async"),
+                                "params": fn.get("params"),
+                                "start_line": fn.get("start_line"),
+                                "end_line": fn.get("end_line"),
+                                "calls": fn.get("calls"),
+                            },
+                        })
                 
             except Exception as e:
                 logger.error(f"Failed to build graph for {repo_name}", error=str(e))

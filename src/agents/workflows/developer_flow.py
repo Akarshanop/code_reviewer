@@ -220,13 +220,113 @@ async def get_codebase_metrics() -> Dict[str, Any]:
         return {"error": str(e)}
 
 
+@tool
+async def get_repository_architecture(repo_name: str = None) -> Dict[str, Any]:
+    """
+    Get detailed architecture information about a repository including technology stack,
+    main files, routes, and folder structure. USE THIS FIRST to understand the codebase!
+    
+    Args:
+        repo_name: Optional repository name filter (e.g., 'intergration-studio-be')
+    
+    Returns:
+        Architecture details including technology stack, entry points, routes, and structure
+    """
+    try:
+        from src.database.neo4j_client import neo4j_client
+        await neo4j_client.initialize()
+        
+        # Get repository info
+        repo_query = """
+        MATCH (r:Repository)
+        WHERE $repo_name IS NULL OR r.name CONTAINS $repo_name
+        RETURN r.name as name, r.language as language, r.path as path
+        """
+        repos = await neo4j_client.execute_query(repo_query, {"repo_name": repo_name})
+        
+        result = {"repositories": []}
+        
+        for repo in repos:
+            repo_info = {
+                "name": repo["name"],
+                "detected_language": repo["language"],
+                "path": repo["path"],
+                "structure": {},
+                "entry_points": [],
+                "routes": [],
+                "key_files": []
+            }
+            
+            # Get file structure overview
+            files_query = """
+            MATCH (f:File)-[:BELONGS_TO]->(r:Repository {name: $name})
+            RETURN f.path as path, f.language as language, f.framework as framework
+            ORDER BY f.path
+            LIMIT 50
+            """
+            files = await neo4j_client.execute_query(files_query, {"name": repo["name"]})
+            
+            # Analyze structure
+            folders = set()
+            languages = {}
+            frameworks = set()
+            for f in files:
+                path = f["path"]
+                parts = path.split("/")
+                if len(parts) > 1:
+                    folders.add(parts[0])
+                lang = f["language"] or "unknown"
+                languages[lang] = languages.get(lang, 0) + 1
+                if f["framework"]:
+                    frameworks.add(f["framework"])
+                # Identify entry points
+                if path in ["index.js", "app.js", "server.js", "main.py", "Application.java"]:
+                    repo_info["entry_points"].append(path)
+            
+            repo_info["structure"] = {
+                "folders": list(folders)[:20],
+                "languages": languages,
+                "frameworks": list(frameworks),
+                "file_count": len(files)
+            }
+            
+            # Get routes
+            routes_query = """
+            MATCH (route:Route)-[:EXPOSES]-(f:File)-[:BELONGS_TO]->(r:Repository {name: $name})
+            RETURN route.method as method, route.path as path, f.path as file
+            ORDER BY route.path
+            LIMIT 30
+            """
+            routes = await neo4j_client.execute_query(routes_query, {"name": repo["name"]})
+            repo_info["routes"] = [{"method": r["method"], "path": r["path"], "file": r["file"]} for r in routes]
+            
+            # Get key files (controllers, services, models)
+            key_files_query = """
+            MATCH (f:File)-[:BELONGS_TO]->(r:Repository {name: $name})
+            WHERE f.path CONTAINS 'controller' OR f.path CONTAINS 'service' 
+                  OR f.path CONTAINS 'model' OR f.path CONTAINS 'route'
+            RETURN f.path as path
+            LIMIT 20
+            """
+            key_files = await neo4j_client.execute_query(key_files_query, {"name": repo["name"]})
+            repo_info["key_files"] = [f["path"] for f in key_files]
+            
+            result["repositories"].append(repo_info)
+        
+        return result
+        
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # Create tools list
 tools = [
     search_codebase,
     analyze_impact,
     find_component,
     get_api_flow,
-    get_codebase_metrics
+    get_codebase_metrics,
+    get_repository_architecture
 ]
 
 
@@ -265,10 +365,15 @@ async def developer_agent(state: DeveloperState) -> Dict[str, Any]:
             for t in tools
         ])
         
-        formatted_system = system_prompt.format(
-            tool_descriptions=tool_descriptions,
-            context_files=", ".join(state.get('context_files', []))
-        )
+        # Use safer string formatting to avoid KeyErrors from JSON in prompts
+        try:
+            formatted_system = system_prompt.format(
+                tool_descriptions=tool_descriptions,
+                context_files=", ".join(state.get('context_files', []))
+            )
+        except KeyError:
+            # If format fails (e.g., due to { } in the prompt), use as-is
+            formatted_system = system_prompt
         
         # Convert messages to LiteLLM format
         llm_messages = [{"role": "system", "content": formatted_system}]
@@ -302,28 +407,59 @@ async def developer_agent(state: DeveloperState) -> Dict[str, Any]:
                 pass
         
         # Define tools for LiteLLM
-        llm_tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": t.args_schema.schema() if hasattr(t, 'args_schema') else {}
-                }
-            }
-            for t in tools
-        ]
+        llm_tools = []
+        for t in tools:
+            try:
+                # Try to get schema from args_schema
+                params = {}
+                if hasattr(t, 'args_schema') and t.args_schema:
+                    try:
+                        params = t.args_schema.schema()
+                    except (KeyError, AttributeError, ValueError):
+                        # Fallback: try to extract parameters from docstring or use empty
+                        params = {
+                            "type": "object",
+                            "properties": {},
+                            "required": []
+                        }
+                
+                llm_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": params
+                    }
+                })
+            except Exception as e:
+                logger.warning(f"Failed to add tool {t.name} to LLM tools: {e}")
+                # Still add the tool but with minimal parameters
+                llm_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                })
         
-        # Call LLM
+        # Call LLM with proper authentication
+        # For Gemini models, use Vertex AI API with service account credentials
+        model_name = settings.get_litellm_model("developer")
+        
+        if "gemini" in settings.DEVELOPER_MODEL.lower():
+            # Use Vertex AI endpoint which supports service account auth
+            model_name = f"vertex_ai/{settings.DEVELOPER_MODEL}"
+        
         response = await acompletion(
-            model=settings.get_litellm_model("developer"),
+            model=model_name,
             messages=llm_messages,
             tools=llm_tools if llm_tools else None,
             tool_choice="auto",
-            api_key=settings.get_api_key_for_model(settings.DEVELOPER_MODEL),
             max_tokens=settings.LLM_MAX_TOKENS,
             temperature=0.2,
-            timeout=settings.LLM_TIMEOUT
+            timeout=settings.LLM_TIMEOUT,
+            api_key=settings.get_api_key_for_model(settings.DEVELOPER_MODEL) or "vertex-ai"
         )
         
         response_message = response.choices[0].message
@@ -346,9 +482,9 @@ async def developer_agent(state: DeveloperState) -> Dict[str, Any]:
         return {"messages": [ai_message]}
         
     except Exception as e:
-        logger.error(f"Developer agent failed: {e}")
+        logger.error(f"Developer agent failed: {e}", exc_info=True)
         error_message = AIMessage(
-            content=f"I encountered an error while processing your request: {str(e)}. Please try rephrasing your question."
+            content=f"I encountered an error while processing your request. Please try rephrasing your question."
         )
         return {"messages": [error_message]}
 

@@ -267,19 +267,25 @@ async def generate_test_strategy(state: QAState) -> QAState:
             test_focus=state.get('test_focus', 'all')
         )
         
-        # Get LLM response
-        response = await acompletion(
-            model=settings.get_litellm_model("qa"),
-            messages=[
+        # Get LLM response using Vertex AI for Gemini models
+        model_name = settings.get_litellm_model("qa")
+        if "gemini" in settings.QA_MODEL.lower():
+            model_name = f"vertex_ai/{settings.QA_MODEL}"
+        
+        qa_kwargs = {
+            "model": model_name,
+            "messages": [
                 {"role": "system", "content": "You are a Senior QA Engineer. Generate comprehensive test strategies. Always respond with valid JSON."},
                 {"role": "user", "content": formatted_prompt}
             ],
-            api_key=settings.get_api_key_for_model(settings.QA_MODEL),
-            max_tokens=settings.LLM_MAX_TOKENS,
-            temperature=0.3,  # Slightly higher for creative test case generation
-            response_format={"type": "json_object"},
-            timeout=settings.LLM_TIMEOUT
-        )
+            "max_tokens": settings.LLM_MAX_TOKENS,
+            "temperature": 0.3,  # Slightly higher for creative test case generation
+            "response_format": {"type": "json_object"},
+            "timeout": settings.LLM_TIMEOUT,
+            "api_key": settings.get_api_key_for_model(settings.QA_MODEL) or "vertex-ai"
+        }
+        
+        response = await acompletion(**qa_kwargs)
         
         # Parse response
         test_strategy = json.loads(response.choices[0].message.content)

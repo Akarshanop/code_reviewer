@@ -95,7 +95,7 @@ class TsReactParser:
                 'functions': self._extract_functions(root_node, content),
                 'classes': self._extract_classes(root_node, content),
                 'components': self._extract_components(root_node, content, file_path),
-                'routes': self._extract_express_routes(root_node, content),
+                'routes': self._extract_express_routes(root_node, content, file_path),
                 'middleware': self._extract_middleware(root_node, content),
                 'models': self._extract_models(root_node, content),
                 'hooks': self._extract_hooks(root_node, content),
@@ -328,6 +328,7 @@ class TsReactParser:
                 'params': params,
                 'is_async': is_async,
                 'is_generator': is_generator,
+                'calls': self._extract_call_names_within(node, content),
                 **self._get_node_location(node),
                 'body': self._get_node_text(node, content),
             }
@@ -363,6 +364,7 @@ class TsReactParser:
                 'type': 'arrow_function' if func_node.type == 'arrow_function' else 'function_expression',
                 'params': params,
                 'is_async': is_async,
+                'calls': self._extract_call_names_within(func_node, content),
                 **self._get_node_location(node),
                 'body': self._get_node_text(func_node, content),
             }
@@ -389,10 +391,41 @@ class TsReactParser:
                 'name': left,
                 'type': 'assigned_function',
                 'params': params,
+                'calls': self._extract_call_names_within(right, content),
                 **self._get_node_location(node),
                 'body': self._get_node_text(right, content),
             }
         return None
+
+    def _extract_call_names_within(self, node, content: str) -> list[str]:
+        """Extract called function identifiers (best-effort) within a subtree."""
+        callees: set[str] = set()
+        if node is None:
+            return []
+
+        for call in self._find_nodes_by_type(node, 'call_expression'):
+            callee_node = call.child_by_field_name('function') if hasattr(call, 'child_by_field_name') else None
+            if callee_node is None:
+                for ch in call.children:
+                    if ch.type in ('identifier', 'member_expression', 'subscript_expression'):
+                        callee_node = ch
+                        break
+
+            if callee_node is None:
+                continue
+
+            if callee_node.type == 'identifier':
+                name = self._get_node_text(callee_node, content).strip()
+                if name:
+                    callees.add(name)
+            elif callee_node.type == 'member_expression':
+                # Capture `obj.method()` as `method` (useful within a file/module)
+                prop = callee_node.child_by_field_name('property') if hasattr(callee_node, 'child_by_field_name') else None
+                name = self._get_node_text(prop, content).strip() if prop else ''
+                if name:
+                    callees.add(name)
+
+        return sorted(callees)
 
     def _parse_parameters(self, node, content: str) -> list[dict]:
         """Parse function parameters."""
@@ -763,46 +796,300 @@ class TsReactParser:
     # Express.js Route Extraction
     # =========================================================================
 
-    def _extract_express_routes(self, root_node, content: str) -> list[dict]:
+    def _collect_express_identifiers(self, root_node, content: str) -> tuple[set[str], set[str]]:
+        """Collect likely Express app and router variable names within a file."""
+        app_names: set[str] = {"app"}
+        router_names: set[str] = {"router"}
+
+        for node in self._find_nodes_by_type(root_node, "variable_declarator"):
+            name = None
+            value_node = None
+            for child in node.children:
+                if child.type == "identifier" and name is None:
+                    name = self._get_node_text(child, content)
+                elif child.type in ("call_expression", "new_expression"):
+                    value_node = child
+
+            if not name or not value_node:
+                continue
+
+            value_text = self._get_node_text(value_node, content).lower()
+
+            # Express app patterns: const api = express();
+            if re.search(r"\bexpress\s*\(\s*\)", value_text):
+                app_names.add(name)
+
+            # Router patterns: const r = express.Router(); const r = Router();
+            if re.search(r"\bexpress\.router\s*\(", value_text) or re.search(
+                r"\brouter\s*\(", value_text
+            ):
+                router_names.add(name)
+
+        return app_names, router_names
+
+    def _extract_express_routes(self, root_node, content: str, file_path: str) -> list[dict]:
         """Extract Express.js route definitions."""
         routes = []
+
+        app_names, router_names = self._collect_express_identifiers(root_node, content)
+        require_map = self._collect_commonjs_requires(content)
         
         # Find method calls like app.get(), router.post(), etc.
         for node in self._find_nodes_by_type(root_node, 'call_expression'):
-            route = self._parse_express_route(node, content)
+            route = self._parse_express_route(node, content, app_names, router_names)
             if route:
                 routes.append(route)
+
+        # Also capture mount points: app.use('/prefix', router)
+        for node in self._find_nodes_by_type(root_node, 'call_expression'):
+            mount_route = self._parse_express_use_mount(
+                node,
+                content,
+                app_names,
+                router_names,
+                require_map=require_map,
+                current_file_path=file_path,
+            )
+            if mount_route:
+                routes.append(mount_route)
         
         return routes
 
-    def _parse_express_route(self, node, content: str) -> Optional[dict]:
-        """Parse an Express route call expression."""
-        text = self._get_node_text(node, content)
-        
-        # Match patterns like app.get('/path', handler) or router.post('/path', ...)
-        http_methods = ['get', 'post', 'put', 'patch', 'delete', 'options', 'head', 'all']
-        
+    def _parse_express_use_mount(
+        self,
+        node,
+        content: str,
+        app_names: set[str],
+        router_names: set[str],
+        require_map: Optional[dict[str, str]] = None,
+        current_file_path: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Treat app/router .use('/prefix', ...) as a route-like mount (method=USE)."""
+        callee = node.child_by_field_name('function') if hasattr(node, 'child_by_field_name') else None
+        if callee is None:
+            for child in node.children:
+                if child.type in ('member_expression', 'subscript_expression', 'identifier'):
+                    callee = child
+                    break
+
+        if not callee or callee.type != 'member_expression':
+            return None
+
+        obj_node = callee.child_by_field_name('object') if hasattr(callee, 'child_by_field_name') else None
+        prop_node = callee.child_by_field_name('property') if hasattr(callee, 'child_by_field_name') else None
+        prop = (self._get_node_text(prop_node, content) if prop_node else '').lower()
+        if prop != 'use':
+            return None
+
+        obj_text = (self._get_node_text(obj_node, content) if obj_node else '').strip()
+        if not obj_text or obj_text not in (app_names | router_names):
+            return None
+
+        base_path = self._extract_first_string_argument(node, content)
+        if not base_path:
+            return None
+
+        mount_target = None
+        mount_target_kind = None
+        require_map = require_map or {}
+
+        # Extract the second argument to `.use('/prefix', <target>)`
+        args_node = None
         for child in node.children:
-            if child.type == 'member_expression':
-                member_text = self._get_node_text(child, content)
-                
-                # Check if it's a route definition
-                for method in http_methods:
-                    patterns = [
-                        f'app.{method}',
-                        f'router.{method}',
-                        f'express.{method}',
-                        f'Router.{method}',
-                    ]
-                    for pattern in patterns:
-                        if pattern in member_text.lower():
-                            return self._extract_route_details(node, content, method.upper())
-        
+            if child.type == 'arguments':
+                args_node = child
+                break
+
+        if args_node:
+            meaningful = [c for c in args_node.children if c.type not in ('(', ')', ',')]
+            if len(meaningful) >= 2:
+                target_node = meaningful[1]
+                if target_node.type == 'identifier':
+                    ident = self._get_node_text(target_node, content).strip()
+                    mount_target_kind = 'identifier'
+                    mount_target = require_map.get(ident)
+                    if mount_target:
+                        mount_target_kind = 'require'
+                elif target_node.type == 'call_expression':
+                    # Common: app.use('/x', require('./routes/x'))
+                    callee = target_node.child_by_field_name('function') if hasattr(target_node, 'child_by_field_name') else None
+                    callee_text = self._get_node_text(callee, content).strip() if callee else ''
+                    if callee_text == 'require':
+                        module_path = self._extract_first_string_argument(target_node, content)
+                        if module_path:
+                            mount_target_kind = 'require'
+                            mount_target = module_path
+
+        if mount_target:
+            mount_target = mount_target.strip().strip('"\'`')
+            if mount_target.startswith('./'):
+                mount_target = mount_target[2:]
+
+        mount_target_files: list[str] = []
+        if mount_target and current_file_path:
+            mount_target_files = self._resolve_mount_target_files(current_file_path, mount_target)
+
+        return {
+            'method': 'USE',
+            'path': base_path,
+            'mount_target': mount_target,
+            'mount_target_kind': mount_target_kind,
+            'mount_target_files': mount_target_files,
+            'handlers': [],
+            'middleware': [],
+            **self._get_node_location(node),
+        }
+
+    def _resolve_mount_target_files(self, current_file_path: str, mount_target: str) -> list[str]:
+        """Resolve `require('./x')`/`./x` module paths to likely file paths (best-effort)."""
+        try:
+            current = Path(current_file_path)
+            base_dir = current.parent
+            raw = mount_target.replace('\\', '/').lstrip('./')
+            p = (base_dir / raw).as_posix()
+            # Normalize any leading './'
+            if p.startswith('./'):
+                p = p[2:]
+
+            candidates: list[str] = []
+            if re.search(r"\.(js|cjs|mjs|ts|tsx|jsx)$", p):
+                candidates.append(p)
+            else:
+                candidates.append(f"{p}.js")
+                candidates.append(f"{p}.cjs")
+                candidates.append(f"{p}.mjs")
+                candidates.append(f"{p}/index.js")
+                candidates.append(f"{p}/index.cjs")
+                candidates.append(f"{p}/index.mjs")
+
+            # Deduplicate while preserving order
+            seen: set[str] = set()
+            out: list[str] = []
+            for c in candidates:
+                if c not in seen:
+                    seen.add(c)
+                    out.append(c)
+            return out
+        except Exception:
+            return []
+
+    def _collect_commonjs_requires(self, content: str) -> dict[str, str]:
+        """Collect `const X = require('./path')` assignments (best-effort)."""
+        require_map: dict[str, str] = {}
+
+        # Covers common patterns:
+        #   const foo = require('./routes/foo')
+        #   let foo = require("./routes/foo")
+        #   var foo = require(`./routes/foo`)
+        pattern = re.compile(
+            r"\b(?:const|let|var)\s+(?P<name>[A-Za-z_$][\w$]*)\s*=\s*require\(\s*(?P<q>['\"`])(?P<path>[^'\"`]+)(?P=q)\s*\)",
+            re.MULTILINE,
+        )
+        for m in pattern.finditer(content):
+            name = m.group('name')
+            path = m.group('path')
+            if not name or not path:
+                continue
+            if path.startswith('./'):
+                path = path[2:]
+            require_map[name] = path
+
+        return require_map
+
+    def _parse_express_route(
+        self,
+        node,
+        content: str,
+        app_names: set[str],
+        router_names: set[str],
+    ) -> Optional[dict]:
+        """Parse an Express route call expression."""
+        http_methods = ['get', 'post', 'put', 'patch', 'delete', 'options', 'head', 'all']
+
+        callee = node.child_by_field_name('function') if hasattr(node, 'child_by_field_name') else None
+        if callee is None:
+            for child in node.children:
+                if child.type in ('member_expression', 'subscript_expression', 'identifier'):
+                    callee = child
+                    break
+
+        if callee is None:
+            return None
+
+        # Handle direct member calls: app.get('/x', ...), myRouter.post('/y', ...)
+        if callee.type == 'member_expression':
+            obj_node = callee.child_by_field_name('object') if hasattr(callee, 'child_by_field_name') else None
+            prop_node = callee.child_by_field_name('property') if hasattr(callee, 'child_by_field_name') else None
+            if obj_node is None or prop_node is None:
+                # Fallback: first significant child is object, last is property
+                significant = [c for c in callee.children if c.type not in ('.',)]
+                if len(significant) >= 2:
+                    obj_node, prop_node = significant[0], significant[-1]
+
+            method = (self._get_node_text(prop_node, content) if prop_node else '').lower()
+            if method not in http_methods:
+                return None
+
+            obj_text = (self._get_node_text(obj_node, content) if obj_node else '').strip()
+
+            # Direct: identifier.get(...)
+            if obj_node and obj_node.type == 'identifier' and obj_text in (app_names | router_names):
+                return self._extract_route_details(node, content, method.upper())
+
+            # Chained: app.route('/x').get(...), router.route('/x').post(...)
+            if obj_node and obj_node.type == 'call_expression':
+                inner = obj_node
+                inner_callee = inner.child_by_field_name('function') if hasattr(inner, 'child_by_field_name') else None
+                if inner_callee is None:
+                    for ch in inner.children:
+                        if ch.type in ('member_expression', 'identifier'):
+                            inner_callee = ch
+                            break
+
+                if inner_callee and inner_callee.type == 'member_expression':
+                    inner_obj = inner_callee.child_by_field_name('object') if hasattr(inner_callee, 'child_by_field_name') else None
+                    inner_prop = inner_callee.child_by_field_name('property') if hasattr(inner_callee, 'child_by_field_name') else None
+
+                    inner_prop_text = (self._get_node_text(inner_prop, content) if inner_prop else '').lower()
+                    inner_obj_text = (self._get_node_text(inner_obj, content) if inner_obj else '').strip()
+
+                    if inner_prop_text == 'route' and inner_obj and inner_obj.type == 'identifier' and inner_obj_text in (app_names | router_names):
+                        base_path = self._extract_first_string_argument(inner, content)
+                        if base_path:
+                            return self._extract_route_details(node, content, method.upper(), path_override=base_path)
+
         return None
 
-    def _extract_route_details(self, node, content: str, method: str) -> Optional[dict]:
+    def _extract_first_string_argument(self, call_expr, content: str) -> Optional[str]:
+        """Extract first string/template_string argument from a call_expression."""
+        args_node = None
+        for child in call_expr.children:
+            if child.type == 'arguments':
+                args_node = child
+                break
+
+        if not args_node:
+            return None
+
+        for child in args_node.children:
+            if child.type in ('(', ')', ','):
+                continue
+            if child.type == 'string':
+                return self._get_node_text(child, content).strip('"\'`')
+            if child.type == 'template_string':
+                return self._get_node_text(child, content)
+
+        return None
+
+    def _extract_route_details(
+        self,
+        node,
+        content: str,
+        method: str,
+        path_override: Optional[str] = None,
+    ) -> Optional[dict]:
         """Extract route path and handler details."""
-        path = None
+        path = path_override
         handlers = []
         middleware = []
         
@@ -815,10 +1102,14 @@ class TsReactParser:
         if args_node:
             arg_index = 0
             for child in args_node.children:
+                if child.type in ('(', ')', ','):
+                    continue
                 if child.type == 'string':
-                    path = self._get_node_text(child, content).strip('"\'`')
+                    if path is None:
+                        path = self._get_node_text(child, content).strip('"\'`')
                 elif child.type == 'template_string':
-                    path = self._get_node_text(child, content)
+                    if path is None:
+                        path = self._get_node_text(child, content)
                 elif child.type in ('identifier', 'arrow_function', 'function_expression', 'member_expression'):
                     handler_text = self._get_node_text(child, content)
                     if arg_index == 0 and path is None:

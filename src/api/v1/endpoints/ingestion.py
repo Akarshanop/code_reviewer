@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from src.core.logger import get_logger
 from src.services.data_ingestion_service import DataIngestionService
 from src.data_ingestion.git_service import git_service
+from src.database.neo4j_client import neo4j_client
 from config.settings import settings
 
 logger = get_logger(__name__)
@@ -163,20 +164,60 @@ async def list_repositories():
     """List all configured repositories with their status"""
     try:
         repos = settings.get_repositories()
+
+        # Pull graph stats from Neo4j once (if available)
+        repo_graph_stats: Dict[str, Dict[str, Any]] = {}
+        try:
+            await neo4j_client.initialize()
+            async with neo4j_client.driver.session() as session:
+                res = await session.run(
+                    """
+                    MATCH (r:Repository)
+                    RETURN r.name AS name,
+                           r.nodes_count AS nodes_count,
+                           r.edges_count AS edges_count,
+                           r.last_ingested AS last_ingested,
+                           r.ingestion_status AS ingestion_status
+                    """
+                )
+                async for rec in res:
+                    repo_graph_stats[rec["name"]] = {
+                        "nodes_count": rec.get("nodes_count") or 0,
+                        "edges_count": rec.get("edges_count") or 0,
+                        "last_ingested": rec.get("last_ingested"),
+                        "ingestion_status": rec.get("ingestion_status"),
+                    }
+        except Exception as e:
+            logger.debug(f"Failed to fetch repository graph stats: {e}")
+
         repo_statuses = []
         
         for repo in repos:
-            # Get repo stats from git service
-            repo_state = git_service.get_repository_state(repo.name)
+            # Get repo stats from git service (in-memory state keyed by URL)
+            repo_state = await git_service.get_repository_info(repo.url)
+            graph_state = repo_graph_stats.get(repo.name, {})
+
+            last_ingested = graph_state.get("last_ingested")
+            if last_ingested is not None:
+                # Neo4j driver returns neo4j.time.DateTime; convert for Pydantic
+                try:
+                    last_ingested = last_ingested.to_native()
+                except Exception:
+                    try:
+                        last_ingested = last_ingested.to_datetime()
+                    except Exception:
+                        last_ingested = None
             
             status = RepositoryStatus(
                 name=repo.name,
                 url=repo.url,
                 last_commit=repo_state.get("last_commit") if repo_state else None,
-                last_ingestion=repo_state.get("last_ingestion") if repo_state else None,
+                last_ingestion=last_ingested,
                 file_count=repo_state.get("file_count", 0) if repo_state else 0,
-                node_count=repo_state.get("node_count", 0) if repo_state else 0,
-                status=repo_state.get("status", "not_cloned") if repo_state else "not_cloned"
+                node_count=graph_state.get("nodes_count", 0),
+                status=(repo_state.get("status") if repo_state else None)
+                or graph_state.get("ingestion_status")
+                or "not_cloned",
             )
             repo_statuses.append(status)
         

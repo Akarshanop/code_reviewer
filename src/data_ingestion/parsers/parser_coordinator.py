@@ -236,14 +236,16 @@ class ParserCoordinator:
         parsed = parser.parse(str(file_path), content)
         
         if parsed:
-            result.classes = parsed.get("components", [])
-            result.functions = parsed.get("hooks", [])
+            result.classes = parsed.get("classes", []) + parsed.get("components", [])
+            result.functions = parsed.get("functions", []) + parsed.get("hooks", [])
             result.routes = parsed.get("routes", [])
             result.api_calls = parsed.get("api_calls", [])
             result.imports = parsed.get("imports", [])
             result.exports = parsed.get("exports", [])
             result.metadata.update({
                 "components": parsed.get("components", []),
+                "models": parsed.get("models", []),
+                "middleware": parsed.get("middleware", []),
                 "state": parsed.get("state", []),
                 "props": parsed.get("props", []),
             })

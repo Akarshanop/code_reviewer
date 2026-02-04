@@ -3,6 +3,7 @@ import logging
 import sys
 import time
 import uuid
+import os
 from pathlib import Path
 from contextlib import asynccontextmanager
 
@@ -13,6 +14,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from config.settings import settings
 from src.core.logger import setup_logging, get_logger
 from src.api.v1.endpoints import admin, ingestion, developer, chat, prd_qa
 from src.agents.orchestrator import AgentOrchestrator
@@ -21,6 +23,21 @@ from src.database.qdrant_client import qdrant_client
 setup_logging()
 logger = get_logger(__name__)
 
+# Set Google Cloud credentials for Vertex AI / Gemini
+if settings.LLM_PROVIDER == "gemini" and settings.GOOGLE_CLOUD_SERVICE_ACCOUNT_FILE:
+    if os.path.exists(settings.GOOGLE_CLOUD_SERVICE_ACCOUNT_FILE):
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath(
+            settings.GOOGLE_CLOUD_SERVICE_ACCOUNT_FILE
+        )
+        logger.info(
+            "Google Cloud credentials configured for Gemini",
+            project_id=settings.GOOGLE_CLOUD_PROJECT_ID
+        )
+    else:
+        logger.warning(
+            "GOOGLE_CLOUD_SERVICE_ACCOUNT_FILE not found",
+            path=settings.GOOGLE_CLOUD_SERVICE_ACCOUNT_FILE
+        )
 
 
 @asynccontextmanager

@@ -228,13 +228,15 @@ class SearchService:
             where_clauses.append("r.repository = $repository")
             params["repository"] = repository
         
-        where_clause = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+        # Build additional conditions if any
+        additional_conditions = " AND " + " AND ".join(where_clauses) if where_clauses else ""
         
         query = f"""
-        MATCH (r:VertxRoute)
-        {where_clause}
-        OPTIONAL MATCH (r)-[:HAS_HANDLER]->(handler)
-        OPTIONAL MATCH (api:ApiCall)-[:CALLS_ROUTE]->(r)
+        MATCH (r)
+        WHERE (r:VertxRoute OR r:Route OR r:APIEndpoint)
+        {additional_conditions}
+        OPTIONAL MATCH (r)-[:HAS_HANDLER|HANDLED_BY]->(handler)
+        OPTIONAL MATCH (api:ApiCall)-[:CALLS_ROUTE|CALLS_API]->(r)
         RETURN 
             r,
             collect(DISTINCT handler.name) as handlers,
@@ -319,7 +321,7 @@ class SearchService:
         
         smells_query = """
         MATCH (c)
-        WHERE c:VertxRoute OR c:ReactComponent OR c:Service
+        WHERE c:VertxRoute OR c:Route OR c:ReactComponent OR c:Service OR c:Function
         OPTIONAL MATCH (c)-[r]->()
         WITH c, count(r) as outgoing_count
         
@@ -352,8 +354,8 @@ class SearchService:
         params = {}
         if repository:
             smells_query = smells_query.replace(
-                "WHERE c:VertxRoute",
-                f"WHERE c:VertxRoute AND c.repository = $repository"
+                "WHERE c:VertxRoute OR c:Route",
+                f"WHERE (c:VertxRoute OR c:Route) AND c.repository = $repository"
             )
             params["repository"] = repository
         

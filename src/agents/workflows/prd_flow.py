@@ -112,17 +112,24 @@ async def validate_prd(state: PRDState) -> PRDState:
         }}
         """
         
-        response = await acompletion(
-            model=settings.get_litellm_model("architect"),
-            messages=[{
+        # Use Vertex AI API for Gemini models (service account auth)
+        model_name = settings.get_litellm_model("architect")
+        if "gemini" in settings.ARCHITECT_MODEL.lower():
+            model_name = f"vertex_ai/{settings.ARCHITECT_MODEL}"
+        
+        llm_kwargs = {
+            "model": model_name,
+            "messages": [{
                 "role": "user",
                 "content": validation_prompt.format(prd_text=state.get('prd_text', ''))
             }],
-            api_key=settings.get_api_key_for_model(settings.ARCHITECT_MODEL),
-            response_format={"type": "json_object"},
-            timeout=settings.LLM_TIMEOUT,
-            max_tokens=1000
-        )
+            "response_format": {"type": "json_object"},
+            "timeout": settings.LLM_TIMEOUT,
+            "max_tokens": 1000,
+            "api_key": settings.get_api_key_for_model(settings.ARCHITECT_MODEL) or "vertex-ai"
+        }
+        
+        response = await acompletion(**llm_kwargs)
         
         validation_result = json.loads(response.choices[0].message.content)
         
@@ -179,14 +186,21 @@ async def retrieve_codebase_context(state: PRDState) -> PRDState:
         }}
         """
         
-        extraction_response = await acompletion(
-            model=settings.get_litellm_model("architect"),
-            messages=[{"role": "user", "content": extraction_prompt.format(prd_text=state.get('prd_text', ''))}],
-            api_key=settings.get_api_key_for_model(settings.ARCHITECT_MODEL),
-            response_format={"type": "json_object"},
-            timeout=settings.LLM_TIMEOUT,
-            max_tokens=1000
-        )
+        # Use Vertex AI API for Gemini models
+        model_name = settings.get_litellm_model("architect")
+        if "gemini" in settings.ARCHITECT_MODEL.lower():
+            model_name = f"vertex_ai/{settings.ARCHITECT_MODEL}"
+        
+        extract_kwargs = {
+            "model": model_name,
+            "messages": [{"role": "user", "content": extraction_prompt.format(prd_text=state.get('prd_text', ''))}],
+            "response_format": {"type": "json_object"},
+            "timeout": settings.LLM_TIMEOUT,
+            "max_tokens": 1000,
+            "api_key": settings.get_api_key_for_model(settings.ARCHITECT_MODEL) or "vertex-ai"
+        }
+        
+        extraction_response = await acompletion(**extract_kwargs)
         
         concepts = json.loads(extraction_response.choices[0].message.content)
         
@@ -283,18 +297,24 @@ async def analyze_architecture(state: PRDState) -> PRDState:
         )
         
         # Get LLM response
-        response = await acompletion(
-            model=settings.get_litellm_model("architect"),
-            messages=[
+        model_name = settings.get_litellm_model("architect")
+        if "gemini" in settings.ARCHITECT_MODEL.lower():
+            model_name = f"vertex_ai/{settings.ARCHITECT_MODEL}"
+        
+        arch_kwargs = {
+            "model": model_name,
+            "messages": [
                 {"role": "system", "content": "You are a Senior Software Architect. Always respond with valid JSON."},
                 {"role": "user", "content": formatted_prompt}
             ],
-            api_key=settings.get_api_key_for_model(settings.ARCHITECT_MODEL),
-            max_tokens=settings.LLM_MAX_TOKENS,
-            temperature=0.1,  # Low temperature for architectural decisions
-            response_format={"type": "json_object"},
-            timeout=settings.LLM_TIMEOUT
-        )
+            "max_tokens": settings.LLM_MAX_TOKENS,
+            "temperature": 0.1,  # Low temperature for architectural decisions
+            "response_format": {"type": "json_object"},
+            "timeout": settings.LLM_TIMEOUT,
+            "api_key": settings.get_api_key_for_model(settings.ARCHITECT_MODEL) or "vertex-ai"
+        }
+        
+        response = await acompletion(**arch_kwargs)
         
         # Parse and validate response
         blueprint = json.loads(response.choices[0].message.content)

@@ -8,6 +8,7 @@ import logging
 from typing import List, Dict, Any, Optional
 import numpy as np
 from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import RetryError
 import asyncio
 import json
 import os
@@ -18,6 +19,20 @@ from src.core.logger import get_logger
 from src.core.exceptions import InternalServerException
 
 logger = get_logger(__name__)
+
+
+def _safe_error_summary(exc: BaseException) -> str:
+    """Return a safe, non-recursive summary string for logging."""
+    if isinstance(exc, RetryError):
+        last_attempt = getattr(exc, "last_attempt", None)
+        inner_exc = None
+        try:
+            inner_exc = last_attempt.exception() if last_attempt else None
+        except Exception:
+            inner_exc = None
+        inner_name = type(inner_exc).__name__ if inner_exc else "unknown"
+        return f"RetryError(last_exception={inner_name})"
+    return type(exc).__name__
 
 try:
     import google.auth
@@ -123,7 +138,7 @@ class EmbeddingService:
                 except Exception as e:  # pragma: no cover
                     logger.warning(
                         "Vertex AI embedding test call failed; continuing without size auto-detect",
-                        error=str(e),
+                        error=_safe_error_summary(e),
                     )
 
                 logger.info(
@@ -137,7 +152,7 @@ class EmbeddingService:
             except Exception as e:
                 # Reset init flag on failure so callers can retry after config fixes.
                 self._initialized = False
-                logger.error("Failed to initialize embedding service", error=str(e))
+                logger.error("Failed to initialize embedding service", error=_safe_error_summary(e))
                 raise
     
     def _get_credentials(self) -> Credentials:
@@ -237,8 +252,14 @@ class EmbeddingService:
             return all_embeddings
             
         except Exception as e:
-            logger.error("Failed to generate embeddings", error=str(e), text_count=len(texts))
-            raise InternalServerException(f"Embedding generation failed: {str(e)}")
+            logger.error(
+                "Failed to generate embeddings",
+                error=_safe_error_summary(e),
+                text_count=len(texts),
+            )
+            raise InternalServerException(
+                f"Embedding generation failed: {_safe_error_summary(e)}"
+            )
     
     async def generate_embedding(self, text: str) -> List[float]:
         """Generate embedding for a single text"""

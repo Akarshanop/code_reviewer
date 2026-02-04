@@ -349,7 +349,51 @@ class GitService:
                 "file_count": state.file_count,
                 "status": state.status
             }
-        return None
+
+        # Fallback: after app restarts, in-memory state is empty; infer from disk.
+        repo_config = next((r for r in settings.get_repositories() if r.url == repo_url), None)
+        if not repo_config:
+            return None
+
+        repo_path = self._get_repo_path(repo_config)
+        if not repo_path.exists():
+            return {
+                "url": repo_config.url,
+                "name": repo_config.name,
+                "branch": repo_config.branch,
+                "local_path": None,
+                "last_commit": None,
+                "last_sync": None,
+                "file_count": 0,
+                "status": "not_cloned",
+            }
+
+        try:
+            repo = Repo(repo_path)
+            commit_hash = str(repo.head.commit.hexsha) if repo.head and repo.head.commit else None
+            file_count = sum(1 for _ in repo_path.rglob("*") if _.is_file())
+            return {
+                "url": repo_config.url,
+                "name": repo_config.name,
+                "branch": repo_config.branch,
+                "local_path": str(repo_path),
+                "last_commit": commit_hash,
+                "last_sync": None,
+                "file_count": file_count,
+                "status": "cloned",
+            }
+        except Exception as e:
+            logger.debug(f"Failed to read repository state from disk: {e}", repo=repo_config.name)
+            return {
+                "url": repo_config.url,
+                "name": repo_config.name,
+                "branch": repo_config.branch,
+                "local_path": str(repo_path),
+                "last_commit": None,
+                "last_sync": None,
+                "file_count": 0,
+                "status": "error",
+            }
     
     async def get_all_repository_states(self) -> List[Dict[str, Any]]:
         """Get state of all managed repositories"""

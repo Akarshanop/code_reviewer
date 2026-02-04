@@ -13,6 +13,7 @@ from enum import Enum
 import logging
 import json
 import re
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -167,7 +168,7 @@ class Settings(BaseSettings):
     # ======================
     GOOGLE_CLOUD_PROJECT_ID: Optional[str] = Field(default=None)
     GOOGLE_CLOUD_REGION: str = Field(default="us-central1")
-    GOOGLE_CLOUD_SERVICE_ACCOUNT_FILE: Optional[str] = Field(default="./service.json")
+    GOOGLE_CLOUD_SERVICE_ACCOUNT_FILE: Optional[str]
     
     # ======================
     # LLM Configuration
@@ -351,15 +352,20 @@ class Settings(BaseSettings):
         return repos
     
     def get_api_key_for_model(self, model_name: str) -> Optional[str]:
-        """Get appropriate API key based on model name"""
+        """Get appropriate API key based on model name
+        
+        Note: For Gemini/Vertex AI models, this returns None as they use
+        service account authentication via GOOGLE_CLOUD_SERVICE_ACCOUNT_FILE
+        """
         model_lower = model_name.lower()
         
         if "gpt" in model_lower or model_lower.startswith("text-embedding"):
             return self.OPENAI_API_KEY
         elif "claude" in model_lower:
             return self.ANTHROPIC_API_KEY
-        elif "gemini" in model_lower:
-            return self.GEMINI_API_KEY
+        elif "gemini" in model_lower or "vertex" in model_lower:
+            # Gemini/Vertex AI uses service account authentication, not API key
+            return None
         elif self.LLM_PROVIDER == "azure":
             return self.AZURE_OPENAI_API_KEY
         
@@ -413,8 +419,9 @@ class Settings(BaseSettings):
         if self.LLM_PROVIDER == "anthropic" and not self.ANTHROPIC_API_KEY:
             errors.append("ANTHROPIC_API_KEY is required for Anthropic models")
         
-        if self.LLM_PROVIDER == "gemini" and not self.GEMINI_API_KEY:
-            errors.append("GEMINI_API_KEY is required for Gemini models")
+        if self.LLM_PROVIDER == "gemini":
+            if not self.GOOGLE_CLOUD_SERVICE_ACCOUNT_FILE or not os.path.exists(self.GOOGLE_CLOUD_SERVICE_ACCOUNT_FILE):
+                errors.append(f"GOOGLE_CLOUD_SERVICE_ACCOUNT_FILE is required for Gemini models: {self.GOOGLE_CLOUD_SERVICE_ACCOUNT_FILE}")
         
         # Check database connections
         if not self.SUPABASE_URL:

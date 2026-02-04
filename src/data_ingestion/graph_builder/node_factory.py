@@ -64,6 +64,7 @@ class NodeFactory:
                 f.repository = $repository,
                 f.repository_hash = $repository_hash,
                 f.language = $language,
+                f.imports_json = $imports_json,
                 f.last_updated = datetime()
             RETURN f
             """
@@ -73,7 +74,8 @@ class NodeFactory:
                 "path": file_path,
                 "repository": repository or "",
                 "repository_hash": repository_hash or "",
-                "language": parsed_data.get("language", self._detect_language(file_path))
+                "language": parsed_data.get("language", self._detect_language(file_path)),
+                "imports_json": json.dumps(parsed_data.get("imports", [])) if parsed_data.get("imports") else "[]",
             })
             stats["created"] += 1
             stats["by_type"]["File"] = 1
@@ -149,6 +151,52 @@ class NodeFactory:
                     stats["by_type"]["ApiCall"] = stats["by_type"].get("ApiCall", 0) + 1
                 except Exception as e:
                     stats["errors"].append(f"ApiCall error: {str(e)}")
+
+            # Create Function nodes (JS/TS) + same-file call graph edges
+            functions = parsed_data.get('functions', [])
+            function_id_by_name: Dict[str, str] = {}
+            for fn in functions:
+                try:
+                    fn_result = await self._create_function_node(
+                        session, fn, file_path, file_node_id, repository_hash
+                    )
+                    if fn_result.get("created"):
+                        stats["created"] += 1
+                        stats["by_type"]["Function"] = stats["by_type"].get("Function", 0) + 1
+                    if fn_result.get("id") and fn_result.get("name"):
+                        function_id_by_name[fn_result["name"]] = fn_result["id"]
+                except Exception as e:
+                    stats["errors"].append(f"Function error: {str(e)}")
+
+            try:
+                pairs: list[dict[str, str]] = []
+                for fn in functions:
+                    if not isinstance(fn, dict):
+                        continue
+                    caller_name = (fn.get("name") or "").strip()
+                    caller_id = function_id_by_name.get(caller_name)
+                    if not caller_id:
+                        continue
+                    for callee_name in (fn.get("calls") or []):
+                        callee_id = function_id_by_name.get(callee_name)
+                        if callee_id and callee_id != caller_id:
+                            pairs.append({"caller": caller_id, "callee": callee_id})
+
+                if pairs:
+                    await session.run(
+                        """
+                        UNWIND $pairs AS p
+                        MATCH (caller:Function {id: p.caller})
+                        MATCH (callee:Function {id: p.callee})
+                        MERGE (caller)-[r:CALLS]->(callee)
+                        SET r.created_at = coalesce(r.created_at, datetime()),
+                            r.last_updated = datetime(),
+                            r.file = $file
+                        """,
+                        {"pairs": pairs, "file": file_path},
+                    )
+            except Exception as e:
+                stats["errors"].append(f"Function CALLS edge error: {str(e)}")
             
             logger.info(
                 f"Nodes created from {file_path}",
@@ -175,6 +223,17 @@ class NodeFactory:
             path = route.get('path') or route.get('route_info', {}).get('path', '')
             method = route.get('method') or route.get('route_info', {}).get('method', 'GET')
             handler = route.get('handler_method') or route.get('name', '')
+
+            if not handler and isinstance(route.get('handlers'), list) and route['handlers']:
+                first = route['handlers'][0]
+                if isinstance(first, dict) and first.get('type') == 'reference' and first.get('name'):
+                    handler = first.get('name')
+                elif isinstance(first, dict) and first.get('type') == 'inline':
+                    handler = 'inline_handler'
+
+            mount_target = route.get('mount_target')
+            mount_target_kind = route.get('mount_target_kind')
+            mount_target_files = route.get('mount_target_files') or []
         else:
             return {"created": 0}
         
@@ -186,6 +245,10 @@ class NodeFactory:
             r.method = $method,
             r.handler_method = $handler_method,
             r.file = $file,
+            r.file_path = $file,
+            r.mount_target = $mount_target,
+            r.mount_target_kind = $mount_target_kind,
+            r.mount_target_files = $mount_target_files,
             r.repository_hash = $repository_hash,
             r.last_updated = datetime()
         WITH r
@@ -201,6 +264,9 @@ class NodeFactory:
             "handler_method": handler,
             "file": file_path,
             "file_id": file_node_id,
+            "mount_target": mount_target if isinstance(route, dict) else None,
+            "mount_target_kind": mount_target_kind if isinstance(route, dict) else None,
+            "mount_target_files": mount_target_files if isinstance(route, dict) else [],
             "repository_hash": repository_hash or ""
         })
         
@@ -249,6 +315,63 @@ class NodeFactory:
         })
         
         return {"created": 1}
+
+    async def _create_function_node(
+        self,
+        session,
+        fn: Dict[str, Any],
+        file_path: str,
+        file_node_id: str,
+        repository_hash: str,
+    ) -> Dict[str, Any]:
+        """Create a Function node (best-effort for JS/TS)."""
+        if not isinstance(fn, dict):
+            return {"created": 0}
+
+        name = (fn.get("name") or "").strip()
+        if not name:
+            return {"created": 0}
+
+        kind = fn.get("type") or "function"
+        is_async = bool(fn.get("is_async"))
+        start_line = fn.get("start_line")
+        end_line = fn.get("end_line")
+
+        node_id = self._generate_node_id("Function", repository_hash or "", file_path, name)
+
+        query = """
+        MERGE (fn:Function {id: $id})
+        SET fn.name = $name,
+            fn.kind = $kind,
+            fn.is_async = $is_async,
+            fn.start_line = $start_line,
+            fn.end_line = $end_line,
+            fn.file = $file,
+            fn.file_path = $file,
+            fn.repository_hash = $repository_hash,
+            fn.last_updated = datetime()
+        WITH fn
+        MATCH (f:File {id: $file_id})
+        MERGE (f)-[:CONTAINS]->(fn)
+        RETURN fn
+        """
+
+        await session.run(
+            query,
+            {
+                "id": node_id,
+                "name": name,
+                "kind": kind,
+                "is_async": is_async,
+                "start_line": start_line,
+                "end_line": end_line,
+                "file": file_path,
+                "file_id": file_node_id,
+                "repository_hash": repository_hash or "",
+            },
+        )
+
+        return {"created": 1, "id": node_id, "name": name}
     
     async def _create_dto_node(self, session, dto: Dict[str, Any],
                               file_path: str, file_node_id: str,

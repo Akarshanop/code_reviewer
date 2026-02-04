@@ -67,33 +67,101 @@ class EdgeLinker:
     
     async def _link_all_edges_internal(self, session, stats: Dict[str, Any]) -> Dict[str, Any]:
         """Internal method to link all edges with provided session"""
-        
-        # 1. Link API calls to Vert.x routes
+
+        # 1. Compose mount points (app.use) to downstream routes
+        mounts_result = await self._link_mounts_to_routes(session)
+        stats["relationships_created"] += mounts_result.get("created", 0)
+        stats["by_type"]["MOUNTS"] = mounts_result.get("created", 0)
+
+        # 2. Link API calls to Vert.x routes
         api_result = await self._link_api_calls_to_routes(session)
         stats["relationships_created"] += api_result.get("created", 0)
         stats["by_type"]["CALLS_ROUTE"] = api_result.get("created", 0)
         
-        # 2. Link EventBus producers to consumers
+        # 3. Link routes to handler functions (best-effort)
+        handler_result = await self._link_routes_to_functions(session)
+        stats["relationships_created"] += handler_result.get("created", 0)
+        stats["by_type"]["HANDLED_BY"] = handler_result.get("created", 0)
+
+        # 4. Link EventBus producers to consumers
         eventbus_result = await self._link_eventbus_producers_consumers(session)
         stats["relationships_created"] += eventbus_result.get("created", 0)
         stats["by_type"]["PUBLISHES_TO"] = eventbus_result.get("created", 0)
         
-        # 3. Link DTO usages
+        # 5. Link DTO usages
         dto_result = await self._link_dto_usages(session)
         stats["relationships_created"] += dto_result.get("created", 0)
         stats["by_type"]["USES_DTO"] = dto_result.get("created", 0)
         
-        # 4. Link component hierarchies
+        # 6. Link component hierarchies
         component_result = await self._link_component_hierarchies(session)
         stats["relationships_created"] += component_result.get("created", 0)
         stats["by_type"]["RENDERS"] = component_result.get("created", 0)
         
-        # 5. Link services to their dependencies
+        # 7. Link services to their dependencies
         service_result = await self._link_service_dependencies(session)
         stats["relationships_created"] += service_result.get("created", 0)
         stats["by_type"]["DEPENDS_ON"] = service_result.get("created", 0)
         
         return stats
+
+    async def _link_mounts_to_routes(self, session) -> Dict[str, Any]:
+        """Link app.use('/prefix', router) mounts to routes within mounted modules and compute full_path."""
+        query = """
+        MATCH (mount:VertxRoute)
+        WHERE mount.method = 'USE'
+          AND mount.path IS NOT NULL AND mount.path <> ''
+          AND mount.mount_target_files IS NOT NULL
+          AND size(mount.mount_target_files) > 0
+        UNWIND mount.mount_target_files AS target_file
+        MATCH (f:File {path: target_file})-[:CONTAINS]->(route:VertxRoute)
+        WHERE route.method <> 'USE'
+        MERGE (mount)-[m:MOUNTS]->(route)
+        SET m.created_at = coalesce(m.created_at, datetime()),
+            m.last_updated = datetime(),
+            route.full_path = CASE
+                WHEN mount.path ENDS WITH '/' AND route.path STARTS WITH '/' THEN substring(mount.path, 0, size(mount.path) - 1) + route.path
+                WHEN NOT mount.path ENDS WITH '/' AND NOT route.path STARTS WITH '/' THEN mount.path + '/' + route.path
+                ELSE mount.path + route.path
+            END,
+            route.last_updated = datetime()
+        RETURN count(m) AS relationships_created
+        """
+
+        try:
+            result = await session.run(query)
+            record = await result.single()
+            created = record["relationships_created"] if record else 0
+            return {"created": created}
+        except Exception as e:
+            logger.error("Failed to link mounts to routes", error=str(e))
+            return {"created": 0, "error": str(e)}
+
+    async def _link_routes_to_functions(self, session) -> Dict[str, Any]:
+        """Link VertxRoute nodes to Function nodes when handler_method matches function name (same file)."""
+        query = """
+        MATCH (route:VertxRoute)
+        WHERE route.handler_method IS NOT NULL AND route.handler_method <> ''
+        MATCH (fn:Function)
+        WHERE fn.file = route.file
+          AND (
+            route.handler_method = fn.name
+            OR route.handler_method ENDS WITH '.' + fn.name
+          )
+        MERGE (route)-[r:HANDLED_BY]->(fn)
+        SET r.created_at = coalesce(r.created_at, datetime()),
+            r.last_updated = datetime()
+        RETURN count(r) AS relationships_created
+        """
+
+        try:
+            result = await session.run(query)
+            record = await result.single()
+            created = record["relationships_created"] if record else 0
+            return {"created": created}
+        except Exception as e:
+            logger.error("Failed to link routes to functions", error=str(e))
+            return {"created": 0, "error": str(e)}
     
     async def _link_api_calls_to_routes(self, session) -> Dict[str, Any]:
         """Link React API calls to Vert.x routes with path normalization"""
@@ -102,23 +170,23 @@ class EdgeLinker:
         // Find all API calls and routes
         MATCH (api:ApiCall)
         WHERE api.url IS NOT NULL AND api.url <> ''
-        MATCH (route:VertxRoute)
-        WHERE route.path IS NOT NULL AND route.path <> ''
+           MATCH (route:VertxRoute)
+           WHERE (route.path IS NOT NULL AND route.path <> '')
         
         // Normalize and match paths
         WITH api, route,
              // Remove common prefixes for matching
              replace(replace(replace(api.url, '/api/v1', ''), '/api/v2', ''), '/api', '') AS normalized_api_url,
-             replace(replace(replace(route.path, '/api/v1', ''), '/api/v2', ''), '/api', '') AS normalized_route_path
+               replace(replace(replace(coalesce(route.full_path, route.path), '/api/v1', ''), '/api/v2', ''), '/api', '') AS normalized_route_path
         
         // Match routes - exact match or pattern match
         WHERE normalized_api_url = normalized_route_path
            OR normalized_route_path CONTAINS normalized_api_url
            OR normalized_api_url CONTAINS normalized_route_path
            OR (api.method = route.method AND (
-               route.path = api.url 
-               OR replace(api.url, '/api/', '/') = route.path
-               OR api.url ENDS WITH route.path
+               coalesce(route.full_path, route.path) = api.url 
+               OR replace(api.url, '/api/', '/') = coalesce(route.full_path, route.path)
+               OR api.url ENDS WITH coalesce(route.full_path, route.path)
            ))
         
         // Create relationship with metadata

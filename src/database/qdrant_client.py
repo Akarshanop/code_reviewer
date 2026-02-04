@@ -163,13 +163,14 @@ class QdrantClient:
         with_payload: bool = True,
         with_vectors: bool = False
     ) -> List[models.ScoredPoint]:
-        """Search for similar vectors"""
+        """Search for similar vectors using query_points API"""
         start_time = datetime.utcnow()
         
         try:
-            results = await self.client.search(
+            # Use query_points API (replaces deprecated search method)
+            results = await self.client.query_points(
                 collection_name=self._collection_name,
-                query_vector=vector,
+                query=vector,
                 query_filter=filter_conditions,
                 limit=limit,
                 score_threshold=score_threshold,
@@ -181,11 +182,12 @@ class QdrantClient:
             logger.debug(
                 "Vector search completed",
                 duration_ms=round(duration, 2),
-                results_count=len(results),
+                results_count=len(results.points) if hasattr(results, 'points') else 0,
                 filter=str(filter_conditions)[:100] if filter_conditions else None
             )
             
-            return results
+            # Return points from QueryResponse
+            return results.points if hasattr(results, 'points') else []
             
         except Exception as e:
             logger.error("Vector search failed", error=str(e))
