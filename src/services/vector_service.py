@@ -67,17 +67,28 @@ class VectorService:
                     texts.append(text)
                     artifact_names.append(artifact.get("name", "unknown"))
                     
+                    # Extract file_name and relative_path from file path
+                    file_path = artifact.get("file", "")
+                    file_name = file_path.split('/')[-1] if file_path else ""
+                    
+                    # REQUIRED metadata fields per spec
                     metadata = {
                         "type": artifact.get("type", "unknown"),
                         "language": artifact.get("language", "unknown"),
                         "repository": artifact.get("repository", "unknown"),
-                        "file": artifact.get("file", ""),
+                        "file": file_path,
                         "line": artifact.get("line", 0),
                         "name": artifact.get("name", ""),
                         "signature": artifact.get("signature", ""),
                         "description": artifact.get("description", ""),
                         "metadata": artifact.get("metadata", {}),
-                        "created_at": datetime.utcnow().isoformat()
+                        "created_at": datetime.utcnow().isoformat(),
+                        # REQUIRED FIELDS for enterprise-grade system
+                        "repository_name": artifact.get("repository_name", ""),
+                        "file_name": file_name,
+                        "relative_path": file_path,
+                        "entry_file": artifact.get("entry_file", ""),
+                        "repo_type": artifact.get("repo_type", ""),
                     }
                     metadata_list.append(metadata)
                 

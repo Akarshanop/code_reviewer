@@ -311,6 +311,51 @@ async def get_conversation(conversation_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/sessions")
+async def list_chat_sessions(limit: int = 50):
+    """List all chat sessions with titles"""
+    try:
+        if not supabase_client:
+            raise HTTPException(status_code=503, detail="Database not available")
+        
+        await supabase_client.initialize()
+        sessions = await supabase_client.get_all_chat_sessions(limit=limit)
+        
+        return {
+            "status": "success",
+            "sessions": sessions,
+            "count": len(sessions)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to list sessions: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/sessions/{session_id}")
+async def delete_chat_session(session_id: str):
+    """Delete a chat session and all its messages"""
+    try:
+        if not supabase_client:
+            raise HTTPException(status_code=503, detail="Database not available")
+        
+        await supabase_client.initialize()
+        success = await supabase_client.delete_chat_session(session_id)
+        
+        if success:
+            return {"status": "success", "message": f"Session {session_id} deleted"}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to delete session")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to delete session: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/jobs/{job_id}/status", response_model=JobStatus)
 async def get_job_status(job_id: str):
     """Get status of async job"""

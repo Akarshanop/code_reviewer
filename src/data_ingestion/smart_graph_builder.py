@@ -48,16 +48,18 @@ class SmartGraphBuilder:
     starting from entry points and following code flow.
     """
     
-    def __init__(self, repo_path: str, repo_name: str):
+    def __init__(self, repo_path: str, repo_name: str, repo_type: str = None):
         """
         Initialize the smart graph builder.
         
         Args:
             repo_path: Absolute path to repository
             repo_name: Name/identifier for the repository
+            repo_type: 'backend' or 'frontend' (from .env classification)
         """
         self.repo_path = Path(repo_path)
         self.repo_name = repo_name
+        self.repo_type = repo_type  # 'backend' or 'frontend'
         self.repo_hash = hashlib.md5(repo_name.encode()).hexdigest()[:12]
         
         # Initialize components
@@ -68,6 +70,9 @@ class SmartGraphBuilder:
         self.processed_files: Set[str] = set()
         self.nodes: Dict[str, GraphNode] = {}
         self.edges: List[GraphEdge] = []
+        
+        # Entry file tracking (detected or primary)
+        self.entry_file: Optional[str] = None
         
         # Statistics
         self.stats = {
@@ -100,7 +105,7 @@ class SmartGraphBuilder:
         Returns:
             Statistics about the graph building process
         """
-        logger.info(f"Starting smart graph build for {self.repo_name}")
+        logger.info(f"Starting smart graph build for {self.repo_name} (type: {self.repo_type})")
         start_time = datetime.now()
         
         try:
@@ -111,7 +116,11 @@ class SmartGraphBuilder:
             entry_points = self.entry_detector.detect_entry_points()
             logger.info(f"Detected {len(entry_points)} entry points")
             
-            if not entry_points:
+            # Store the primary entry file
+            if entry_points:
+                self.entry_file = str(Path(entry_points[0].file_path).relative_to(self.repo_path))
+                logger.info(f"Primary entry file: {self.entry_file}")
+            else:
                 logger.warning("No entry points detected, falling back to full scan")
                 entry_points = []
             
@@ -136,6 +145,8 @@ class SmartGraphBuilder:
             # Calculate duration
             duration = (datetime.now() - start_time).total_seconds()
             self.stats['duration_seconds'] = duration
+            self.stats['entry_file'] = self.entry_file
+            self.stats['repo_type'] = self.repo_type
             
             logger.info(
                 "Graph build complete",
@@ -163,6 +174,7 @@ class SmartGraphBuilder:
                 'name': self.repo_name,
                 'hash': self.repo_hash,
                 'path': str(self.repo_path),
+                'repo_type': self.repo_type or 'unknown',  # 'backend' or 'frontend'
                 'language': self.entry_detector.language,
                 'created_at': datetime.now().isoformat(),
             }
@@ -230,14 +242,25 @@ class SmartGraphBuilder:
             return None
     
     async def _create_file_node(self, file_path: str, parsed: ParsedFile):
-        """Create a File node"""
+        """Create a File node with required metadata"""
         relative_path = str(Path(file_path).relative_to(self.repo_path))
+        file_name = Path(file_path).name
         file_id = self._generate_id('File', relative_path)
+        
+        # Determine if this is an entry file
+        is_entry_file = relative_path == self.entry_file
         
         self.nodes[file_id] = GraphNode(
             id=file_id,
-            labels=['File'],
+            labels=['File', 'EntryFile'] if is_entry_file else ['File'],
             properties={
+                # REQUIRED metadata as per spec
+                'repository_name': self.repo_name,
+                'file_name': file_name,
+                'relative_path': relative_path,
+                'entry_file': self.entry_file or '',
+                'repo_type': self.repo_type or 'unknown',
+                # Additional metadata
                 'path': relative_path,
                 'full_path': file_path,
                 'language': parsed.language,
@@ -246,6 +269,7 @@ class SmartGraphBuilder:
                 'exports_json': json.dumps(parsed.exports[:50]),
                 'repository': self.repo_name,
                 'repository_hash': self.repo_hash,
+                'is_entry_file': is_entry_file,
             }
         )
         
@@ -257,9 +281,10 @@ class SmartGraphBuilder:
         ))
     
     async def _create_function_node(self, file_path: str, func: Dict[str, Any]):
-        """Create a Function node"""
+        """Create a Function node with required metadata"""
         func_name = func.get('name', 'anonymous')
         relative_path = str(Path(file_path).relative_to(self.repo_path))
+        file_name = Path(file_path).name
         func_id = self._generate_id('Function', relative_path, func_name, func.get('start_line', 0))
         
         # Determine if this is a service, controller, middleware, etc.
@@ -278,10 +303,22 @@ class SmartGraphBuilder:
         elif '/utils/' in lower_path or '/helpers/' in lower_path:
             labels.append('Utility')
         
+        # For backend repos, add HandlerFunction label if it's a route handler
+        if self.repo_type == 'backend' and ('handler' in func_name.lower() or 
+            '/controllers/' in lower_path or '/routes/' in lower_path):
+            labels.append('HandlerFunction')
+        
         self.nodes[func_id] = GraphNode(
             id=func_id,
             labels=labels,
             properties={
+                # REQUIRED metadata as per spec
+                'repository_name': self.repo_name,
+                'file_name': file_name,
+                'relative_path': relative_path,
+                'entry_file': self.entry_file or '',
+                'repo_type': self.repo_type or 'unknown',
+                # Function-specific metadata
                 'name': func_name,
                 'file_path': relative_path,
                 'start_line': func.get('start_line', 0),
@@ -343,16 +380,24 @@ class SmartGraphBuilder:
         ))
     
     async def _create_route_node(self, file_path: str, route: Dict[str, Any]):
-        """Create a Route node for Express/API routes"""
+        """Create a Route node for Express/API routes with required metadata"""
         method = route.get('method', 'GET').upper()
         path = route.get('path', route.get('route', '/unknown'))
         relative_path = str(Path(file_path).relative_to(self.repo_path))
+        file_name = Path(file_path).name
         route_id = self._generate_id('Route', method, path)
         
         self.nodes[route_id] = GraphNode(
             id=route_id,
             labels=['Route', 'APIEndpoint'],
             properties={
+                # REQUIRED metadata as per spec
+                'repository_name': self.repo_name,
+                'file_name': file_name,
+                'relative_path': relative_path,
+                'entry_file': self.entry_file or '',
+                'repo_type': self.repo_type or 'unknown',
+                # Route-specific metadata
                 'method': method,
                 'path': path,
                 'full_path': f"{method} {path}",
@@ -381,15 +426,23 @@ class SmartGraphBuilder:
         self.stats['routes_found'] += 1
     
     async def _create_component_node(self, file_path: str, comp: Dict[str, Any]):
-        """Create a ReactComponent node"""
+        """Create a ReactComponent node with required metadata"""
         comp_name = comp.get('name', 'AnonymousComponent')
         relative_path = str(Path(file_path).relative_to(self.repo_path))
+        file_name = Path(file_path).name
         comp_id = self._generate_id('Component', relative_path, comp_name)
         
         self.nodes[comp_id] = GraphNode(
             id=comp_id,
             labels=['ReactComponent', 'Component'],
             properties={
+                # REQUIRED metadata as per spec
+                'repository_name': self.repo_name,
+                'file_name': file_name,
+                'relative_path': relative_path,
+                'entry_file': self.entry_file or '',
+                'repo_type': self.repo_type or 'unknown',
+                # Component-specific metadata
                 'name': comp_name,
                 'file_path': relative_path,
                 'hooks_json': json.dumps(comp.get('hooks', [])),

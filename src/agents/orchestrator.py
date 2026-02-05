@@ -406,10 +406,13 @@ class AgentOrchestrator:
                     "errors": []
                 }
                 
-                # Execute workflow with timeout
+                # Execute workflow with timeout and increased recursion limit
                 try:
                     result = await asyncio.wait_for(
-                        developer_app.ainvoke(initial_state),
+                        developer_app.ainvoke(
+                            initial_state,
+                            config={"recursion_limit": 50}
+                        ),
                         timeout=settings.AGENT_TIMEOUT_SECONDS
                     )
                 except asyncio.TimeoutError:

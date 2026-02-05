@@ -531,6 +531,62 @@ class SupabaseClient:
             logger.error(f"Failed to get chat history: {session_id}", error=str(e))
             return []
     
+    async def get_all_chat_sessions(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Get all chat sessions with their first message as title"""
+        try:
+            async with self.get_connection() as client:
+                # Get distinct session IDs with their first message
+                response = client.table("chat_messages") \
+                    .select("session_id, content, created_at, role") \
+                    .order("created_at", desc=True) \
+                    .execute()
+                
+                # Group by session_id
+                sessions_map = {}
+                for row in (response.data or []):
+                    session_id = row.get("session_id")
+                    if session_id not in sessions_map:
+                        sessions_map[session_id] = {
+                            "session_id": session_id,
+                            "created_at": row.get("created_at"),
+                            "title": "",
+                            "last_message_at": row.get("created_at"),
+                            "message_count": 0
+                        }
+                    
+                    sessions_map[session_id]["message_count"] += 1
+                    
+                    # Use first user message as title
+                    if row.get("role") == "user" and not sessions_map[session_id]["title"]:
+                        content = row.get("content", "")
+                        sessions_map[session_id]["title"] = content[:100] + ("..." if len(content) > 100 else "")
+                
+                # Convert to list and sort by last message
+                sessions = list(sessions_map.values())
+                sessions.sort(key=lambda x: x.get("last_message_at", ""), reverse=True)
+                
+                return sessions[:limit]
+                
+        except Exception as e:
+            logger.error("Failed to get chat sessions", error=str(e))
+            return []
+    
+    async def delete_chat_session(self, session_id: str) -> bool:
+        """Delete all messages in a chat session"""
+        try:
+            async with self.get_connection() as client:
+                response = client.table("chat_messages") \
+                    .delete() \
+                    .eq("session_id", session_id) \
+                    .execute()
+                
+                logger.info(f"Deleted chat session: {session_id}")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Failed to delete chat session: {session_id}", error=str(e))
+            return False
+    
     async def store_chat_message(
         self,
         session_id: str,

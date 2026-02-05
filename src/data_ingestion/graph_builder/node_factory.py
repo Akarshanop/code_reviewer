@@ -34,7 +34,10 @@ class NodeFactory:
     
     async def create_nodes(self, session, parsed_data: Dict[str, Any], 
                           file_path: str, repository: str = None,
-                          repository_hash: str = None) -> Dict[str, Any]:
+                          repository_hash: str = None,
+                          repo_type: str = None,
+                          repository_name: str = None,
+                          entry_file: str = None) -> Dict[str, Any]:
         """
         Create all nodes from parsed file data.
         
@@ -44,10 +47,16 @@ class NodeFactory:
             file_path: Path to the source file
             repository: Repository URL
             repository_hash: Repository hash identifier
+            repo_type: Type of repository ('backend' or 'frontend')
+            repository_name: Name of the repository
+            entry_file: Entry point file path for the repository
             
         Returns:
             Statistics about created nodes
         """
+        # Extract required metadata
+        file_name = file_path.split('/')[-1] if file_path else ''
+        relative_path = file_path  # Will be set by caller with proper relative path
         stats = {
             "created": 0,
             "updated": 0,
@@ -56,15 +65,26 @@ class NodeFactory:
         }
         
         try:
-            # Create File node first
+            # Create File node first with REQUIRED metadata
             file_node_id = self._generate_node_id("File", file_path)
-            file_query = """
-            MERGE (f:File {id: $id})
+            
+            # Detect if this is an entry file
+            is_entry_file = self._is_entry_file(file_path, repo_type)
+            file_labels = "File:EntryFile" if is_entry_file else "File"
+            
+            file_query = f"""
+            MERGE (f:{file_labels} {{id: $id}})
             SET f.path = $path,
                 f.repository = $repository,
                 f.repository_hash = $repository_hash,
                 f.language = $language,
                 f.imports_json = $imports_json,
+                f.repository_name = $repository_name,
+                f.file_name = $file_name,
+                f.relative_path = $relative_path,
+                f.entry_file = $entry_file,
+                f.repo_type = $repo_type,
+                f.is_entry_file = $is_entry_file,
                 f.last_updated = datetime()
             RETURN f
             """
@@ -76,6 +96,12 @@ class NodeFactory:
                 "repository_hash": repository_hash or "",
                 "language": parsed_data.get("language", self._detect_language(file_path)),
                 "imports_json": json.dumps(parsed_data.get("imports", [])) if parsed_data.get("imports") else "[]",
+                "repository_name": repository_name or "",
+                "file_name": file_name,
+                "relative_path": relative_path,
+                "entry_file": entry_file or "",
+                "repo_type": repo_type or "",
+                "is_entry_file": is_entry_file,
             })
             stats["created"] += 1
             stats["by_type"]["File"] = 1
@@ -85,7 +111,9 @@ class NodeFactory:
             for route in routes:
                 try:
                     route_result = await self._create_route_node(
-                        session, route, file_path, file_node_id, repository_hash
+                        session, route, file_path, file_node_id, repository_hash,
+                        repo_type=repo_type, repository_name=repository_name,
+                        entry_file=entry_file, file_name=file_name, relative_path=relative_path
                     )
                     stats["created"] += route_result.get("created", 0)
                     stats["by_type"]["VertxRoute"] = stats["by_type"].get("VertxRoute", 0) + 1
@@ -97,7 +125,9 @@ class NodeFactory:
             for eb in eventbus_nodes:
                 try:
                     eb_result = await self._create_eventbus_node(
-                        session, eb, file_path, file_node_id, repository_hash
+                        session, eb, file_path, file_node_id, repository_hash,
+                        repo_type=repo_type, repository_name=repository_name,
+                        entry_file=entry_file, file_name=file_name, relative_path=relative_path
                     )
                     stats["created"] += eb_result.get("created", 0)
                     stats["by_type"]["EventBusNode"] = stats["by_type"].get("EventBusNode", 0) + 1
@@ -109,7 +139,9 @@ class NodeFactory:
             for dto in dtos:
                 try:
                     dto_result = await self._create_dto_node(
-                        session, dto, file_path, file_node_id, repository_hash
+                        session, dto, file_path, file_node_id, repository_hash,
+                        repo_type=repo_type, repository_name=repository_name,
+                        entry_file=entry_file, file_name=file_name, relative_path=relative_path
                     )
                     stats["created"] += dto_result.get("created", 0)
                     stats["by_type"]["DTO"] = stats["by_type"].get("DTO", 0) + 1
@@ -121,7 +153,9 @@ class NodeFactory:
             for service in services:
                 try:
                     service_result = await self._create_service_node(
-                        session, service, file_path, file_node_id, repository_hash
+                        session, service, file_path, file_node_id, repository_hash,
+                        repo_type=repo_type, repository_name=repository_name,
+                        entry_file=entry_file, file_name=file_name, relative_path=relative_path
                     )
                     stats["created"] += service_result.get("created", 0)
                     stats["by_type"]["Service"] = stats["by_type"].get("Service", 0) + 1
@@ -133,7 +167,9 @@ class NodeFactory:
             for comp in components:
                 try:
                     comp_result = await self._create_component_node(
-                        session, comp, file_path, file_node_id, repository_hash
+                        session, comp, file_path, file_node_id, repository_hash,
+                        repo_type=repo_type, repository_name=repository_name,
+                        entry_file=entry_file, file_name=file_name, relative_path=relative_path
                     )
                     stats["created"] += comp_result.get("created", 0)
                     stats["by_type"]["ReactComponent"] = stats["by_type"].get("ReactComponent", 0) + 1
@@ -145,7 +181,9 @@ class NodeFactory:
             for api in api_calls:
                 try:
                     api_result = await self._create_api_call_node(
-                        session, api, file_path, file_node_id, repository_hash
+                        session, api, file_path, file_node_id, repository_hash,
+                        repo_type=repo_type, repository_name=repository_name,
+                        entry_file=entry_file, file_name=file_name, relative_path=relative_path
                     )
                     stats["created"] += api_result.get("created", 0)
                     stats["by_type"]["ApiCall"] = stats["by_type"].get("ApiCall", 0) + 1
@@ -158,7 +196,9 @@ class NodeFactory:
             for fn in functions:
                 try:
                     fn_result = await self._create_function_node(
-                        session, fn, file_path, file_node_id, repository_hash
+                        session, fn, file_path, file_node_id, repository_hash,
+                        repo_type=repo_type, repository_name=repository_name,
+                        entry_file=entry_file, file_name=file_name, relative_path=relative_path
                     )
                     if fn_result.get("created"):
                         stats["created"] += 1
@@ -212,8 +252,13 @@ class NodeFactory:
     
     async def _create_route_node(self, session, route: Dict[str, Any], 
                                 file_path: str, file_node_id: str,
-                                repository_hash: str) -> Dict[str, Any]:
-        """Create a Vert.x Route node"""
+                                repository_hash: str,
+                                repo_type: str = None,
+                                repository_name: str = None,
+                                entry_file: str = None,
+                                file_name: str = None,
+                                relative_path: str = None) -> Dict[str, Any]:
+        """Create a Vert.x Route node with REQUIRED metadata"""
         # Handle different route data formats
         if hasattr(route, 'path'):  # Dataclass
             path = route.path
@@ -250,6 +295,11 @@ class NodeFactory:
             r.mount_target_kind = $mount_target_kind,
             r.mount_target_files = $mount_target_files,
             r.repository_hash = $repository_hash,
+            r.repository_name = $repository_name,
+            r.file_name = $file_name,
+            r.relative_path = $relative_path,
+            r.entry_file = $entry_file,
+            r.repo_type = $repo_type,
             r.last_updated = datetime()
         WITH r
         MATCH (f:File {id: $file_id})
@@ -267,15 +317,25 @@ class NodeFactory:
             "mount_target": mount_target if isinstance(route, dict) else None,
             "mount_target_kind": mount_target_kind if isinstance(route, dict) else None,
             "mount_target_files": mount_target_files if isinstance(route, dict) else [],
-            "repository_hash": repository_hash or ""
+            "repository_hash": repository_hash or "",
+            "repository_name": repository_name or "",
+            "file_name": file_name or "",
+            "relative_path": relative_path or "",
+            "entry_file": entry_file or "",
+            "repo_type": repo_type or ""
         })
         
         return {"created": 1}
     
     async def _create_eventbus_node(self, session, eb: Dict[str, Any],
                                    file_path: str, file_node_id: str,
-                                   repository_hash: str) -> Dict[str, Any]:
-        """Create an EventBus node"""
+                                   repository_hash: str,
+                                   repo_type: str = None,
+                                   repository_name: str = None,
+                                   entry_file: str = None,
+                                   file_name: str = None,
+                                   relative_path: str = None) -> Dict[str, Any]:
+        """Create an EventBus node with REQUIRED metadata"""
         # Handle different data formats
         if hasattr(eb, 'address'):  # Dataclass
             address = eb.address
@@ -297,6 +357,11 @@ class NodeFactory:
             e.handler_method = $handler_method,
             e.file = $file,
             e.repository_hash = $repository_hash,
+            e.repository_name = $repository_name,
+            e.file_name = $file_name,
+            e.relative_path = $relative_path,
+            e.entry_file = $entry_file,
+            e.repo_type = $repo_type,
             e.last_updated = datetime()
         WITH e
         MATCH (f:File {id: $file_id})
@@ -311,7 +376,12 @@ class NodeFactory:
             "handler_method": handler,
             "file": file_path,
             "file_id": file_node_id,
-            "repository_hash": repository_hash or ""
+            "repository_hash": repository_hash or "",
+            "repository_name": repository_name or "",
+            "file_name": file_name or "",
+            "relative_path": relative_path or "",
+            "entry_file": entry_file or "",
+            "repo_type": repo_type or ""
         })
         
         return {"created": 1}
@@ -323,8 +393,13 @@ class NodeFactory:
         file_path: str,
         file_node_id: str,
         repository_hash: str,
+        repo_type: str = None,
+        repository_name: str = None,
+        entry_file: str = None,
+        file_name: str = None,
+        relative_path: str = None,
     ) -> Dict[str, Any]:
-        """Create a Function node (best-effort for JS/TS)."""
+        """Create a Function node with REQUIRED metadata. For backend, add HandlerFunction label if route handler."""
         if not isinstance(fn, dict):
             return {"created": 0}
 
@@ -336,11 +411,15 @@ class NodeFactory:
         is_async = bool(fn.get("is_async"))
         start_line = fn.get("start_line")
         end_line = fn.get("end_line")
+        
+        # Check if this is a handler function for backend repos
+        is_handler = fn.get("is_handler", False) or fn.get("is_route_handler", False)
+        labels = "Function:HandlerFunction" if (repo_type == "backend" and is_handler) else "Function"
 
         node_id = self._generate_node_id("Function", repository_hash or "", file_path, name)
 
-        query = """
-        MERGE (fn:Function {id: $id})
+        query = f"""
+        MERGE (fn:{labels} {{id: $id}})
         SET fn.name = $name,
             fn.kind = $kind,
             fn.is_async = $is_async,
@@ -349,9 +428,15 @@ class NodeFactory:
             fn.file = $file,
             fn.file_path = $file,
             fn.repository_hash = $repository_hash,
+            fn.repository_name = $repository_name,
+            fn.file_name = $file_name,
+            fn.relative_path = $relative_path,
+            fn.entry_file = $entry_file,
+            fn.repo_type = $repo_type,
+            fn.is_handler = $is_handler,
             fn.last_updated = datetime()
         WITH fn
-        MATCH (f:File {id: $file_id})
+        MATCH (f:File {{id: $file_id}})
         MERGE (f)-[:CONTAINS]->(fn)
         RETURN fn
         """
@@ -368,6 +453,12 @@ class NodeFactory:
                 "file": file_path,
                 "file_id": file_node_id,
                 "repository_hash": repository_hash or "",
+                "repository_name": repository_name or "",
+                "file_name": file_name or "",
+                "relative_path": relative_path or "",
+                "entry_file": entry_file or "",
+                "repo_type": repo_type or "",
+                "is_handler": is_handler,
             },
         )
 
@@ -375,8 +466,13 @@ class NodeFactory:
     
     async def _create_dto_node(self, session, dto: Dict[str, Any],
                               file_path: str, file_node_id: str,
-                              repository_hash: str) -> Dict[str, Any]:
-        """Create a DTO node"""
+                              repository_hash: str,
+                              repo_type: str = None,
+                              repository_name: str = None,
+                              entry_file: str = None,
+                              file_name: str = None,
+                              relative_path: str = None) -> Dict[str, Any]:
+        """Create a DTO node with REQUIRED metadata"""
         # Handle different data formats
         if hasattr(dto, 'name'):  # Dataclass
             name = dto.name
@@ -406,6 +502,11 @@ class NodeFactory:
             d.is_data_object = $is_data_object,
             d.file = $file,
             d.repository_hash = $repository_hash,
+            d.repository_name = $repository_name,
+            d.file_name = $file_name,
+            d.relative_path = $relative_path,
+            d.entry_file = $entry_file,
+            d.repo_type = $repo_type,
             d.last_updated = datetime()
         WITH d
         MATCH (f:File {id: $file_id})
@@ -421,15 +522,25 @@ class NodeFactory:
             "is_data_object": is_data_object,
             "file": file_path,
             "file_id": file_node_id,
-            "repository_hash": repository_hash or ""
+            "repository_hash": repository_hash or "",
+            "repository_name": repository_name or "",
+            "file_name": file_name or "",
+            "relative_path": relative_path or "",
+            "entry_file": entry_file or "",
+            "repo_type": repo_type or ""
         })
         
         return {"created": 1}
     
     async def _create_service_node(self, session, service: Dict[str, Any],
                                   file_path: str, file_node_id: str,
-                                  repository_hash: str) -> Dict[str, Any]:
-        """Create a Service/Config node"""
+                                  repository_hash: str,
+                                  repo_type: str = None,
+                                  repository_name: str = None,
+                                  entry_file: str = None,
+                                  file_name: str = None,
+                                  relative_path: str = None) -> Dict[str, Any]:
+        """Create a Service/Config node with REQUIRED metadata"""
         name = service.get('name', '')
         service_type = service.get('type', 'Service')
         
@@ -448,6 +559,11 @@ class NodeFactory:
             s.type = $type,
             s.file = $file,
             s.repository_hash = $repository_hash,
+            s.repository_name = $repository_name,
+            s.file_name = $file_name,
+            s.relative_path = $relative_path,
+            s.entry_file = $entry_file,
+            s.repo_type = $repo_type,
             s.last_updated = datetime()
         WITH s
         MATCH (f:File {id: $file_id})
@@ -461,15 +577,25 @@ class NodeFactory:
             "type": service_type,
             "file": file_path,
             "file_id": file_node_id,
-            "repository_hash": repository_hash or ""
+            "repository_hash": repository_hash or "",
+            "repository_name": repository_name or "",
+            "file_name": file_name or "",
+            "relative_path": relative_path or "",
+            "entry_file": entry_file or "",
+            "repo_type": repo_type or ""
         })
         
         return {"created": 1}
     
     async def _create_component_node(self, session, comp: Any,
                                     file_path: str, file_node_id: str,
-                                    repository_hash: str) -> Dict[str, Any]:
-        """Create a React Component node"""
+                                    repository_hash: str,
+                                    repo_type: str = None,
+                                    repository_name: str = None,
+                                    entry_file: str = None,
+                                    file_name: str = None,
+                                    relative_path: str = None) -> Dict[str, Any]:
+        """Create a React Component node with REQUIRED metadata"""
         # Handle different data formats
         if hasattr(comp, 'name'):  # Dataclass/ComponentInfo
             name = comp.name
@@ -498,6 +624,11 @@ class NodeFactory:
             c.hooks = $hooks,
             c.file = $file,
             c.repository_hash = $repository_hash,
+            c.repository_name = $repository_name,
+            c.file_name = $file_name,
+            c.relative_path = $relative_path,
+            c.entry_file = $entry_file,
+            c.repo_type = $repo_type,
             c.last_updated = datetime()
         WITH c
         MATCH (f:File {id: $file_id})
@@ -512,15 +643,25 @@ class NodeFactory:
             "hooks": hooks if isinstance(hooks, list) else [],
             "file": file_path,
             "file_id": file_node_id,
-            "repository_hash": repository_hash or ""
+            "repository_hash": repository_hash or "",
+            "repository_name": repository_name or "",
+            "file_name": file_name or "",
+            "relative_path": relative_path or "",
+            "entry_file": entry_file or "",
+            "repo_type": repo_type or ""
         })
         
         return {"created": 1}
     
     async def _create_api_call_node(self, session, api: Any,
                                    file_path: str, file_node_id: str,
-                                   repository_hash: str) -> Dict[str, Any]:
-        """Create an API Call node"""
+                                   repository_hash: str,
+                                   repo_type: str = None,
+                                   repository_name: str = None,
+                                   entry_file: str = None,
+                                   file_name: str = None,
+                                   relative_path: str = None) -> Dict[str, Any]:
+        """Create an API Call node with REQUIRED metadata"""
         # Handle different data formats
         if hasattr(api, 'url'):  # Dataclass/ApiCall
             url = api.url
@@ -545,6 +686,11 @@ class NodeFactory:
             a.component = $component,
             a.file = $file,
             a.repository_hash = $repository_hash,
+            a.repository_name = $repository_name,
+            a.file_name = $file_name,
+            a.relative_path = $relative_path,
+            a.entry_file = $entry_file,
+            a.repo_type = $repo_type,
             a.last_updated = datetime()
         WITH a
         MATCH (f:File {id: $file_id})
@@ -568,7 +714,12 @@ class NodeFactory:
             "component": component,
             "file": file_path,
             "file_id": file_node_id,
-            "repository_hash": repository_hash or ""
+            "repository_hash": repository_hash or "",
+            "repository_name": repository_name or "",
+            "file_name": file_name or "",
+            "relative_path": relative_path or "",
+            "entry_file": entry_file or "",
+            "repo_type": repo_type or ""
         })
         
         return {"created": 1}
@@ -595,3 +746,37 @@ class NodeFactory:
         }
         
         return language_map.get(ext, 'unknown')
+    
+    def _is_entry_file(self, file_path: str, repo_type: str = None) -> bool:
+        """
+        Detect if a file is an entry point based on repo type and filename patterns.
+        
+        Backend entry files: index.js, app.js, server.js, main.js, index.ts, app.ts, etc.
+        Frontend entry files: main.jsx, main.tsx, index.jsx, index.tsx, App.jsx, App.tsx
+        """
+        if not file_path:
+            return False
+        
+        file_name = file_path.split('/')[-1].lower()
+        
+        # Backend entry patterns
+        backend_entry_patterns = [
+            'index.js', 'index.ts', 'app.js', 'app.ts',
+            'server.js', 'server.ts', 'main.js', 'main.ts',
+            'application.java', 'main.java', 'app.java'
+        ]
+        
+        # Frontend entry patterns
+        frontend_entry_patterns = [
+            'main.jsx', 'main.tsx', 'index.jsx', 'index.tsx',
+            'app.jsx', 'app.tsx', 'main.js', 'main.ts',
+            'index.js', 'index.ts'
+        ]
+        
+        if repo_type == 'backend':
+            return file_name in backend_entry_patterns
+        elif repo_type == 'frontend':
+            return file_name in frontend_entry_patterns
+        else:
+            # Check both patterns if repo_type is unknown
+            return file_name in backend_entry_patterns or file_name in frontend_entry_patterns

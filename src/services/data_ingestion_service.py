@@ -92,7 +92,8 @@ class DataIngestionService:
         logger.info("Data ingestion service initialized")
     
     async def ingest_repository(self, repo_url: str, branch: str = "main", 
-                               incremental: bool = True) -> Dict[str, Any]:
+                               incremental: bool = True,
+                               repo_type: str = None) -> Dict[str, Any]:
         """
         Ingest a single repository with full analysis.
         
@@ -102,6 +103,7 @@ class DataIngestionService:
             repo_url: Repository URL to ingest (GitLab, GitHub, etc.)
             branch: Git branch to analyze
             incremental: Whether to perform incremental update
+            repo_type: Type of repository ('backend' or 'frontend') - auto-detected if not provided
         
         Returns:
             Comprehensive ingestion results including auto-detected language/framework
@@ -109,7 +111,11 @@ class DataIngestionService:
         start_time = datetime.utcnow()
         repo_hash = hashlib.md5(repo_url.encode()).hexdigest()[:12]
         
-        logger.info(f"Starting repository ingestion: {repo_url}", repo_hash=repo_hash)
+        # Auto-detect repo_type if not provided
+        if not repo_type:
+            repo_type = self._detect_repo_type(repo_url)
+        
+        logger.info(f"Starting repository ingestion: {repo_url}", repo_hash=repo_hash, repo_type=repo_type)
         
         try:
             # 1. Clone or update repository
@@ -127,11 +133,17 @@ class DataIngestionService:
             # 3. Convert to internal format for knowledge graph
             parsed_data = self._convert_parse_result(parse_result)
             
-            # 4. Build knowledge graph
-            graph_results = await self._build_knowledge_graph(parsed_data, repo_url, repo_hash)
+            # 4. Build knowledge graph with repo_type metadata
+            graph_results = await self._build_knowledge_graph(
+                parsed_data, repo_url, repo_hash, 
+                repo_type=repo_type
+            )
             
-            # 5. Generate embeddings and index
-            vector_results = await self._generate_embeddings(parsed_data, repo_url, repo_hash)
+            # 5. Generate embeddings and index with repo_type metadata
+            vector_results = await self._generate_embeddings(
+                parsed_data, repo_url, repo_hash,
+                repo_type=repo_type
+            )
             
             # 6. Cross-repository linking
             cross_repo_links = await self._link_cross_repository_dependencies(repo_url, repo_hash)
@@ -234,6 +246,32 @@ class DataIngestionService:
             repo_path=repo_path,
             batch_size=50
         )
+    
+    def _detect_repo_type(self, repo_url: str) -> str:
+        """
+        Auto-detect repository type (backend or frontend) from URL patterns.
+        
+        Args:
+            repo_url: Repository URL
+            
+        Returns:
+            'backend' or 'frontend' or empty string if unknown
+        """
+        url_lower = repo_url.lower()
+        
+        # Backend patterns
+        backend_patterns = ['backend', 'api', 'server', '-be', '_be', 'service']
+        for pattern in backend_patterns:
+            if pattern in url_lower:
+                return 'backend'
+        
+        # Frontend patterns
+        frontend_patterns = ['frontend', 'ui', 'web', '-fe', '_fe', 'client']
+        for pattern in frontend_patterns:
+            if pattern in url_lower:
+                return 'frontend'
+        
+        return ''
     
     def _convert_parse_result(self, parse_result: RepositoryParseResult) -> Dict[str, Any]:
         """Convert RepositoryParseResult to the format expected by graph building"""
@@ -508,8 +546,10 @@ class DataIngestionService:
                 parsed_data["summary"]["skipped_files"] += 1
     
     async def _build_knowledge_graph(self, parsed_data: Dict[str, Any], 
-                                    repo_url: str, repo_hash: str) -> Dict[str, Any]:
-        """Build Neo4j knowledge graph from parsed data"""
+                                    repo_url: str, repo_hash: str,
+                                    repo_type: str = None,
+                                    entry_file: str = None) -> Dict[str, Any]:
+        """Build Neo4j knowledge graph from parsed data with REQUIRED metadata"""
         statistics = {
             "nodes_created": 0,
             "edges_created": 0,
@@ -517,10 +557,13 @@ class DataIngestionService:
             "by_relationship_type": defaultdict(int)
         }
         
+        # Extract repository name for metadata
+        repo_name = repo_url.split("/")[-1].replace(".git", "")
+        
         try:
             # Start transaction
             async with neo4j_client.session() as session:
-                # First, create repository node
+                # First, create repository node with repo_type
                 repo_query = """
                 MERGE (r:Repository {
                     url: $url,
@@ -528,25 +571,34 @@ class DataIngestionService:
                     name: $name
                 })
                 SET r.last_ingested = datetime(),
-                    r.ingestion_status = 'in_progress'
+                    r.ingestion_status = 'in_progress',
+                    r.repo_type = $repo_type,
+                    r.entry_file = $entry_file
                 RETURN r
                 """
                 
-                repo_name = repo_url.split("/")[-1].replace(".git", "")
                 await session.run(repo_query, {
                     "url": repo_url,
                     "hash": repo_hash,
-                    "name": repo_name
+                    "name": repo_name,
+                    "repo_type": repo_type or "",
+                    "entry_file": entry_file or ""
                 })
                 
                 # Process Java files
                 for java_file in parsed_data["java"]:
+                    file_path = java_file["file"]
+                    file_name = file_path.split('/')[-1] if file_path else ''
+                    
                     nodes_created = await self.node_factory.create_nodes(
                         session,
                         java_file["data"],
-                        java_file["file"],
+                        file_path,
                         repository=repo_url,
                         repository_hash=repo_hash,
+                        repo_type=repo_type,
+                        repository_name=repo_name,
+                        entry_file=entry_file,
                     )
                     statistics["nodes_created"] += nodes_created.get("created", 0)
                     
@@ -563,12 +615,18 @@ class DataIngestionService:
                 
                 # Process TypeScript/React files
                 for ts_file in parsed_data["typescript"]:
+                    file_path = ts_file["file"]
+                    file_name = file_path.split('/')[-1] if file_path else ''
+                    
                     nodes_created = await self.node_factory.create_nodes(
                         session,
                         ts_file["data"],
-                        ts_file["file"],
+                        file_path,
                         repository=repo_url,
                         repository_hash=repo_hash,
+                        repo_type=repo_type,
+                        repository_name=repo_name,
+                        entry_file=entry_file,
                     )
                     statistics["nodes_created"] += nodes_created.get("created", 0)
                     
@@ -585,12 +643,18 @@ class DataIngestionService:
 
                 # Process JavaScript files (Express.js / Node.js / JSX)
                 for js_file in parsed_data.get("javascript", []):
+                    file_path = js_file["file"]
+                    file_name = file_path.split('/')[-1] if file_path else ''
+                    
                     nodes_created = await self.node_factory.create_nodes(
                         session,
                         js_file["data"],
-                        js_file["file"],
+                        file_path,
                         repository=repo_url,
                         repository_hash=repo_hash,
+                        repo_type=repo_type,
+                        repository_name=repo_name,
+                        entry_file=entry_file,
                     )
                     statistics["nodes_created"] += nodes_created.get("created", 0)
 
@@ -639,13 +703,18 @@ class DataIngestionService:
             return {"statistics": statistics, "status": "failed", "error": str(e)}
     
     async def _generate_embeddings(self, parsed_data: Dict[str, Any], 
-                                  repo_url: str, repo_hash: str) -> Dict[str, Any]:
-        """Generate vector embeddings for code artifacts"""
+                                  repo_url: str, repo_hash: str,
+                                  repo_type: str = None,
+                                  entry_file: str = None) -> Dict[str, Any]:
+        """Generate vector embeddings for code artifacts with REQUIRED metadata"""
         statistics = {
             "embeddings_created": 0,
             "by_artifact_type": defaultdict(int),
             "errors": []
         }
+        
+        # Extract repository_name for metadata
+        repo_name = repo_url.split("/")[-1].replace(".git", "")
         
         try:
             artifacts = []
@@ -653,6 +722,8 @@ class DataIngestionService:
             # Extract artifacts from Java files (use .get() to avoid KeyError)
             for java_file in parsed_data.get("java", []):
                 file_data = java_file.get("data", {})
+                file_path = java_file.get("file", "")
+                file_name = file_path.split('/')[-1] if file_path else ""
                 
                 # Routes
                 for route in file_data.get("routes", []):
@@ -662,7 +733,7 @@ class DataIngestionService:
                         "language": "java",
                         "repository": repo_url,
                         "repository_hash": repo_hash,
-                        "file": java_file.get("file", ""),
+                        "file": file_path,
                         "code": f"Vert.x Route: {route.get('path', '')} Method: {route.get('method', '')} Handler: {route.get('handler_method', '')}",
                         "text": f"Vert.x Route: {route.get('path', '')} "
                                f"Method: {route.get('method', '')} "
@@ -671,7 +742,13 @@ class DataIngestionService:
                             "path": route.get("path"),
                             "method": route.get("method"),
                             "handler": route.get("handler_method")
-                        }
+                        },
+                        # REQUIRED fields
+                        "repository_name": repo_name,
+                        "file_name": file_name,
+                        "relative_path": file_path,
+                        "entry_file": entry_file or "",
+                        "repo_type": repo_type or "",
                     })
                 
                 # EventBus
@@ -682,7 +759,7 @@ class DataIngestionService:
                         "language": "java",
                         "repository": repo_url,
                         "repository_hash": repo_hash,
-                        "file": java_file.get("file", ""),
+                        "file": file_path,
                         "code": f"EventBus address: {eb.get('address', '')} type: {eb.get('type', '')} handler: {eb.get('handler_method', '')}",
                         "text": f"EventBus: {eb.get('address', '')} "
                                f"Type: {eb.get('type', '')} "
@@ -691,7 +768,13 @@ class DataIngestionService:
                             "address": eb.get("address"),
                             "type": eb.get("type"),
                             "handler": eb.get("handler_method")
-                        }
+                        },
+                        # REQUIRED fields
+                        "repository_name": repo_name,
+                        "file_name": file_name,
+                        "relative_path": file_path,
+                        "entry_file": entry_file or "",
+                        "repo_type": repo_type or "",
                     })
                 
                 # DTOs
@@ -702,7 +785,7 @@ class DataIngestionService:
                         "language": "java",
                         "repository": repo_url,
                         "repository_hash": repo_hash,
-                        "file": java_file.get("file", ""),
+                        "file": file_path,
                         "code": f"DTO class {dto.get('name', '')} with fields: {', '.join([f.get('name', '') for f in dto.get('fields', [])])}",
                         "text": f"DTO: {dto.get('name', '')} "
                                f"Fields: {', '.join([f.get('name', '') for f in dto.get('fields', [])])}",
@@ -710,13 +793,21 @@ class DataIngestionService:
                             "name": dto.get("name"),
                             "fields": dto.get("fields", []),
                             "is_data_object": dto.get("is_data_object", False)
-                        }
+                        },
+                        # REQUIRED fields
+                        "repository_name": repo_name,
+                        "file_name": file_name,
+                        "relative_path": file_path,
+                        "entry_file": entry_file or "",
+                        "repo_type": repo_type or "",
                     })
             
             # Extract artifacts from TypeScript files
             for ts_file in parsed_data.get("typescript", []):
                 file_data = ts_file.get("data", {})
                 file_metadata = ts_file.get("metadata", {})
+                file_path = ts_file.get("file", "")
+                file_name = file_path.split('/')[-1] if file_path else ""
                 
                 # Components - try file_data first, then metadata
                 components = file_data.get("components", []) or file_metadata.get("components", [])
@@ -727,7 +818,7 @@ class DataIngestionService:
                         "language": "typescript",
                         "repository": repo_url,
                         "repository_hash": repo_hash,
-                        "file": ts_file.get("file", ""),
+                        "file": file_path,
                         "code": f"React component {comp.get('name', '')} with props: {', '.join([p.get('name', '') for p in comp.get('props', [])])} and hooks: {', '.join(comp.get('hooks', []))}",
                         "text": f"React Component: {comp.get('name', '')} "
                                f"Props: {', '.join([p.get('name', '') for p in comp.get('props', [])])} "
@@ -736,7 +827,13 @@ class DataIngestionService:
                             "name": comp.get("name"),
                             "props": comp.get("props", []),
                             "hooks": comp.get("hooks", [])
-                        }
+                        },
+                        # REQUIRED fields
+                        "repository_name": repo_name,
+                        "file_name": file_name,
+                        "relative_path": file_path,
+                        "entry_file": entry_file or "",
+                        "repo_type": repo_type or "",
                     })
                 
                 # Functions/Methods from TypeScript (not components)
@@ -748,13 +845,19 @@ class DataIngestionService:
                         "language": "typescript",
                         "repository": repo_url,
                         "repository_hash": repo_hash,
-                        "file": ts_file.get("file", ""),
+                        "file": file_path,
                         "code": f"Function {func.get('name', '')} - {func.get('description', '')}",
                         "text": f"Function: {func.get('name', '')} - {func.get('description', '')}",
                         "metadata": {
                             "name": func.get("name"),
                             "description": func.get("description", "")
-                        }
+                        },
+                        # REQUIRED fields
+                        "repository_name": repo_name,
+                        "file_name": file_name,
+                        "relative_path": file_path,
+                        "entry_file": entry_file or "",
+                        "repo_type": repo_type or "",
                     })
                 
                 # API Calls
@@ -765,7 +868,7 @@ class DataIngestionService:
                         "language": "typescript",
                         "repository": repo_url,
                         "repository_hash": repo_hash,
-                        "file": ts_file.get("file", ""),
+                        "file": file_path,
                         "code": f"API call to {api.get('url', '')} using {api.get('method', '')} in hook {api.get('hook', '')}",
                         "text": f"API Call: {api.get('url', '')} "
                                f"Method: {api.get('method', '')} "
@@ -775,13 +878,21 @@ class DataIngestionService:
                             "method": api.get("method"),
                             "hook": api.get("hook"),
                             "component": api.get("component")
-                        }
+                        },
+                        # REQUIRED fields
+                        "repository_name": repo_name,
+                        "file_name": file_name,
+                        "relative_path": file_path,
+                        "entry_file": entry_file or "",
+                        "repo_type": repo_type or "",
                     })
             
             # Extract artifacts from JavaScript files (same as TypeScript)
             for js_file in parsed_data.get("javascript", []):
                 file_data = js_file.get("data", {})
                 file_metadata = js_file.get("metadata", {})
+                file_path = js_file.get("file", "")
+                file_name = file_path.split('/')[-1] if file_path else ""
                 
                 # Components
                 components = file_data.get("components", []) or file_metadata.get("components", [])
@@ -792,13 +903,19 @@ class DataIngestionService:
                         "language": "javascript",
                         "repository": repo_url,
                         "repository_hash": repo_hash,
-                        "file": js_file.get("file", ""),
+                        "file": file_path,
                         "code": f"React component {comp.get('name', '')} with props: {', '.join([p.get('name', '') for p in comp.get('props', [])])}",
                         "text": f"React Component: {comp.get('name', '')} Props: {', '.join([p.get('name', '') for p in comp.get('props', [])])}",
                         "metadata": {
                             "name": comp.get("name"),
                             "props": comp.get("props", [])
-                        }
+                        },
+                        # REQUIRED fields
+                        "repository_name": repo_name,
+                        "file_name": file_name,
+                        "relative_path": file_path,
+                        "entry_file": entry_file or "",
+                        "repo_type": repo_type or "",
                     })
                 
                 # Functions
@@ -810,12 +927,18 @@ class DataIngestionService:
                         "language": "javascript",
                         "repository": repo_url,
                         "repository_hash": repo_hash,
-                        "file": js_file.get("file", ""),
+                        "file": file_path,
                         "code": f"Function {func.get('name', '')} - {func.get('description', '')}",
                         "text": f"Function: {func.get('name', '')}",
                         "metadata": {
                             "name": func.get("name")
-                        }
+                        },
+                        # REQUIRED fields
+                        "repository_name": repo_name,
+                        "file_name": file_name,
+                        "relative_path": file_path,
+                        "entry_file": entry_file or "",
+                        "repo_type": repo_type or "",
                     })
                 
                 # API Calls
@@ -826,13 +949,19 @@ class DataIngestionService:
                         "language": "javascript",
                         "repository": repo_url,
                         "repository_hash": repo_hash,
-                        "file": js_file.get("file", ""),
+                        "file": file_path,
                         "code": f"API call to {api.get('url', '')} using {api.get('method', '')}",
                         "text": f"API Call: {api.get('url', '')} Method: {api.get('method', '')}",
                         "metadata": {
                             "url": api.get("url"),
                             "method": api.get("method")
-                        }
+                        },
+                        # REQUIRED fields
+                        "repository_name": repo_name,
+                        "file_name": file_name,
+                        "relative_path": file_path,
+                        "entry_file": entry_file or "",
+                        "repo_type": repo_type or "",
                     })
             
             # Generate embeddings from actual code snippets
@@ -988,7 +1117,6 @@ class DataIngestionService:
         
         for repo_info in repositories:
             repo_name = repo_info.get("name", "unknown")
-            # Handle both "path" and "local_path" keys for compatibility
             repo_path = Path(repo_info.get("path") or repo_info.get("local_path", ""))
             
             if not repo_path.exists():
@@ -996,13 +1124,9 @@ class DataIngestionService:
                 continue
             
             try:
-                # Analyze structure
                 structure = await self._analyze_repository_structure(repo_path)
-                
-                # Parse files
                 parsed = await self._parse_repository_files(repo_path, structure)
                 
-                # Apply file type filter if specified
                 if file_types:
                     filtered_parsed = {
                         "java": parsed.get("java", []) if "java" in file_types else [],
@@ -1046,10 +1170,7 @@ class DataIngestionService:
                 continue
             
             try:
-                # Generate repo hash
                 repo_hash = hashlib.md5(repo_name.encode()).hexdigest()[:12]
-                
-                # Build graph for this repo
                 graph_results = await self._build_knowledge_graph(
                     repo_parsed,
                     repo_name,
@@ -1059,8 +1180,6 @@ class DataIngestionService:
                 total_nodes += graph_results.get("statistics", {}).get("nodes_created", 0)
                 total_edges += graph_results.get("statistics", {}).get("edges_created", 0)
                 
-                # Collect nodes for embedding
-                # Extract node info for later embedding
                 for java_file in repo_parsed.get("java", []):
                     file_data = java_file.get("data", {})
                     
@@ -1099,7 +1218,6 @@ class DataIngestionService:
                     file_data = js_file.get("data", {})
 
                     for route in file_data.get("routes", []):
-                        # Express routes (stored as VertxRoute nodes in graph)
                         all_nodes.append({
                             "type": "route",
                             "name": route.get("path", ""),
@@ -1128,7 +1246,6 @@ class DataIngestionService:
                             "repository": repo_name,
                             "file": js_file.get("file", ""),
                             "language": "javascript",
-                            # Avoid pushing full function bodies into vector payloads
                             "data": {
                                 "name": fn.get("name"),
                                 "type": fn.get("type"),
@@ -1167,7 +1284,6 @@ class DataIngestionService:
         if not nodes:
             return {"embeddings_generated": 0, "errors": []}
         
-        # Convert nodes to artifacts for vector service
         artifacts = []
         
         for node in nodes:
@@ -1183,7 +1299,6 @@ class DataIngestionService:
             }
             artifacts.append(artifact)
         
-        # Index through vector service
         try:
             results = await self.vector_service.index_code_artifacts(artifacts)
             

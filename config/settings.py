@@ -38,10 +38,12 @@ class RepositoryConfig:
     Just provide the URL and optionally the branch.
     """
     def __init__(self, url: str, branch: str = "main", name: str = None,
-                 include_patterns: List[str] = None, exclude_patterns: List[str] = None):
+                 include_patterns: List[str] = None, exclude_patterns: List[str] = None,
+                 repo_type: str = None):
         self.url = url.strip()
         self.branch = branch
         self._name = name
+        self.repo_type = repo_type  # 'backend' or 'frontend' - from .env classification
         self.include_patterns = include_patterns or ["**/*"]
         self.exclude_patterns = exclude_patterns or [
             "**/node_modules/**", "**/target/**", "**/build/**", 
@@ -52,6 +54,7 @@ class RepositoryConfig:
         self.detected_language: Optional[str] = None
         self.detected_framework: Optional[str] = None
         self.file_count: int = 0
+        self.entry_file: Optional[str] = None  # Detected entry point
     
     @property
     def name(self) -> str:
@@ -110,8 +113,10 @@ class RepositoryConfig:
             "name": self.name,
             "provider": self.provider.value,
             "project_path": self.project_path,
+            "repo_type": self.repo_type,
             "detected_language": self.detected_language,
             "detected_framework": self.detected_framework,
+            "entry_file": self.entry_file,
             "include_patterns": self.include_patterns,
             "exclude_patterns": self.exclude_patterns
         }
@@ -150,9 +155,9 @@ class Settings(BaseSettings):
     QDRANT_URL: str = Field(default="http://localhost:6333")
     QDRANT_API_KEY: Optional[str] = Field(default=None)
     QDRANT_COLLECTION_NAME: str = Field(default="code_embeddings")
-    # Vertex AI `text-embedding-004` outputs 768-dim vectors.
+    # Gemini `gemini-embedding-001` outputs 3072-dim vectors.
     # Keep this aligned with the embedding model (otherwise Qdrant upserts will fail).
-    QDRANT_VECTOR_SIZE: int = Field(default=768)
+    QDRANT_VECTOR_SIZE: int = Field(default=3072)
     QDRANT_DISTANCE_METRIC: str = Field(default="Cosine")  # Cosine, Euclid, Dot
     QDRANT_ON_DISK: bool = Field(default=True)
     
@@ -186,7 +191,7 @@ class Settings(BaseSettings):
     ARCHITECT_MODEL: str = Field(default="gemini-2.5-flash")
     DEVELOPER_MODEL: str = Field(default="gemini-2.5-flash")
     QA_MODEL: str = Field(default="gemini-2.5-flash")
-    EMBEDDING_MODEL: str = Field(default="text-embedding-004")  # Google Vertex AI embedding model
+    EMBEDDING_MODEL: str = Field(default="gemini-embedding-001")  # Google Vertex AI embedding model
     HF_TOKEN: Optional[str] = Field(default=None)  # HuggingFace API token (deprecated)
     
     # LLM Parameters
@@ -313,11 +318,12 @@ class Settings(BaseSettings):
         """
         Parse and return list of repository configurations.
         
-        Supports two formats:
-        1. Simple URL list: GIT_REPOS='["https://gitlab.com/org/repo1", "https://gitlab.com/org/repo2"]'
-        2. Detailed config: GIT_REPOS_CONFIG='[{"url": "https://gitlab.com/org/repo", "branch": "develop"}]'
+        Supports three formats:
+        1. Typed format: GIT_REPOS='[{"backend": ["url1", "url2"]}, {"frontend": ["url3"]}]'
+        2. Simple URL list: GIT_REPOS='["url1", "url2"]'
+        3. Detailed config: GIT_REPOS_CONFIG='[{"url": "...", "branch": "develop"}]'
         
-        Language/type is auto-detected - no need to specify.
+        Language/type is auto-detected, but backend/frontend classification comes from config.
         """
         repos = []
         
@@ -331,21 +337,64 @@ class Settings(BaseSettings):
                         branch=config.get("branch", self.GIT_DEFAULT_BRANCH),
                         name=config.get("name"),
                         include_patterns=config.get("include_patterns"),
-                        exclude_patterns=config.get("exclude_patterns")
+                        exclude_patterns=config.get("exclude_patterns"),
+                        repo_type=config.get("repo_type")
                     ))
         except (json.JSONDecodeError, TypeError) as e:
             logger.debug(f"Could not parse GIT_REPOS_CONFIG: {e}")
         
-        # Fallback to simple URL list
+        # Try typed format: [{"backend": [...]}, {"frontend": [...]}]
         if not repos:
             try:
-                repo_urls = json.loads(self.GIT_REPOS)
-                for url in repo_urls:
-                    if isinstance(url, str) and url.strip():
-                        repos.append(RepositoryConfig(
-                            url=url.strip(),
-                            branch=self.GIT_DEFAULT_BRANCH
-                        ))
+                repo_data = json.loads(self.GIT_REPOS)
+                
+                # Check if it's the typed format (list of dicts with backend/frontend keys)
+                if isinstance(repo_data, list) and repo_data and isinstance(repo_data[0], dict):
+                    is_typed_format = any(
+                        key in repo_data[0] for key in ["backend", "frontend"]
+                    )
+                    
+                    if is_typed_format:
+                        for item in repo_data:
+                            if isinstance(item, dict):
+                                for repo_type, urls in item.items():
+                                    if isinstance(urls, list):
+                                        for url in urls:
+                                            if isinstance(url, str) and url.strip():
+                                                repos.append(RepositoryConfig(
+                                                    url=url.strip(),
+                                                    branch=self.GIT_DEFAULT_BRANCH,
+                                                    repo_type=repo_type  # 'backend' or 'frontend'
+                                                ))
+                        logger.info(f"Parsed {len(repos)} repos from typed format (backend/frontend)")
+                    else:
+                        # Old format with url/branch objects
+                        for config in repo_data:
+                            if config.get("url"):
+                                repos.append(RepositoryConfig(
+                                    url=config.get("url", ""),
+                                    branch=config.get("branch", self.GIT_DEFAULT_BRANCH),
+                                    repo_type=config.get("repo_type")
+                                ))
+                
+                # Simple URL list: ["url1", "url2"]
+                elif isinstance(repo_data, list):
+                    for url in repo_data:
+                        if isinstance(url, str) and url.strip():
+                            # Auto-detect repo_type from URL
+                            url_lower = url.lower()
+                            repo_type = None
+                            if any(kw in url_lower for kw in ['backend', 'api', 'server', '-be', '_be']):
+                                repo_type = 'backend'
+                            elif any(kw in url_lower for kw in ['frontend', 'ui', 'web', 'client', '-fe', '_fe']):
+                                repo_type = 'frontend'
+                            
+                            repos.append(RepositoryConfig(
+                                url=url.strip(),
+                                branch=self.GIT_DEFAULT_BRANCH,
+                                repo_type=repo_type
+                            ))
+                            
             except (json.JSONDecodeError, TypeError) as e:
                 logger.debug(f"Could not parse GIT_REPOS: {e}")
         
