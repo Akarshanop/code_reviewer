@@ -1,6 +1,7 @@
 import logging
 import sys
 import json
+from contextvars import ContextVar
 from datetime import datetime
 from typing import Any, Dict
 import structlog
@@ -71,6 +72,9 @@ class ContextLogger:
         """Create a logger with bound context"""
         logger = structlog.get_logger()
         return logger.bind(**kwargs)
+
+# Request-scoped trace ID for observability (set by middleware, read by logging)
+trace_id_var: ContextVar[str] = ContextVar("trace_id", default="")
 
 # Singleton logger instance
 _logger = ContextLogger()

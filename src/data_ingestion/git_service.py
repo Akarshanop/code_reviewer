@@ -95,7 +95,7 @@ class GitService:
         if not url:
             return url
         
-        # Handle different Git providers
+        
         if self.git_token:
             if 'github.com' in url:
                 # GitHub: https://token@github.com/...

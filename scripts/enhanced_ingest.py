@@ -76,7 +76,6 @@ async def create_cross_repo_links():
     """Create links between frontend and backend repos"""
     print("\n=== Creating Cross-Repository Links ===")
     
-    # Find API calls in frontend that match backend routes
     query = """
     // First, find all backend routes
     MATCH (backendRoute:Route)

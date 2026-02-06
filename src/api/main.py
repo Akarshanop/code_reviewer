@@ -135,17 +135,19 @@ async def cors_preflight_handler(request: Request, call_next):
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
+    from src.core.logger import trace_id_var
+
     request_id = str(uuid.uuid4())
+    trace_id_var.set(request_id)
     start_time = time.time()
 
     logger.info(
-        f"Request started: {request.method} {request.url.path}",
-        extra={
-            "request_id": request_id,
-            "method": request.method,
-            "url": str(request.url),
-            "client": request.client.host if request.client else None
-        }
+        "request_started",
+        request_id=request_id,
+        method=request.method,
+        path=request.url.path,
+        url=str(request.url),
+        client=request.client.host if request.client else None,
     )
 
     response = await call_next(request)
@@ -153,17 +155,16 @@ async def log_requests(request: Request, call_next):
     process_time = (time.time() - start_time) * 1000
 
     logger.info(
-        f"Request completed: {request.method} {request.url.path} {response.status_code}",
-        extra={
-            "request_id": request_id,
-            "method": request.method,
-            "url": str(request.url),
-            "status_code": response.status_code,
-            "duration_ms": round(process_time, 2)
-        }
+        "request_completed",
+        request_id=request_id,
+        method=request.method,
+        path=request.url.path,
+        status_code=response.status_code,
+        duration_ms=round(process_time, 2),
     )
 
     response.headers["X-Request-ID"] = request_id
+    response.headers["X-Trace-ID"] = request_id
     response.headers["X-Response-Time"] = str(round(process_time, 2))
     return response
 
