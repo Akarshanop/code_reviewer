@@ -1,6 +1,12 @@
 """
 Developer Assistant Workflow using LangGraph
 Provides interactive assistance for developers with code understanding and debugging
+
+Enhanced with:
+    - Domain-first query resolution
+    - Confidence-aware tool responses
+    - Behavioral context in search results
+    - Trust-preserving silence when evidence is insufficient
 """
 import logging
 import yaml
@@ -19,6 +25,8 @@ from config.settings import settings
 from src.services.search_service import SearchService
 from src.services.graph_service import GraphService
 from src.agents.state_schema import DeveloperState
+from src.intelligence.domain_model import domain_engine
+from src.intelligence.evidence_links import format_confidence_for_agent
 from src.core.logger import get_logger
 from src.core.exceptions import AgentException
 
@@ -50,6 +58,12 @@ TOOL SELECTION GUIDE (PICK THE RIGHT TOOL):
 - For general codebase search → Use `search_codebase`
 - For architecture overview → Use `get_repository_architecture`
 - For impact analysis → Use `analyze_impact`
+- For security/auth questions (which routes have auth?) → Use `get_security_surface`
+- For behavioral analysis (side-effects, auth-critical, async) → Use `get_behavioral_classification`
+- For domain-level questions (how does auth/payments work?) → Use `get_domain_context`
+- For cross-repo tracing (frontend→backend flow) → Use `trace_cross_repo_flow`
+- For file imports/dependencies → Use `get_file_dependencies`
+- For QA/testing/risk assessment → Use `get_qa_risk_assessment`
 
 TOOL USAGE RULES:
 - Maximum 4 tool calls per question
@@ -108,9 +122,9 @@ async def search_codebase(query: str, search_type: str = "graph_first") -> Dict[
             )
             graph_results = graph_response.get("results", {}).get("graph", [])[:5]
         
-        # STEP 2: Vector search second (Qdrant) - only if graph had no results
+        # STEP 2: Vector search second (Qdrant) - run if graph didn't fully answer
         vector_results = []
-        if search_type != "graph_only" and len(graph_results) < 3:
+        if search_type != "graph_only" and len(graph_results) < 5:
             vector_response = await search_service.search_codebase(
                 query=query,
                 search_type="semantic",
@@ -360,23 +374,62 @@ async def get_repository_architecture(repo_name: str = None) -> Dict[str, Any]:
                 "file_count": len(files)
             }
             
-            # Get routes
+            # Get routes — query VertxRoute nodes (backend) using correct relationship
             routes_query = """
-            MATCH (route:Route)-[:EXPOSES]-(f:File)-[:BELONGS_TO]->(r:Repository {name: $name})
-            RETURN route.method as method, route.path as path, f.path as file
+            MATCH (route:VertxRoute)-[:BELONGS_TO]->(r:Repository {name: $name})
+            RETURN route.method as method, route.path as path, route.handler_method as handler, route.file as file
             ORDER BY route.path
-            LIMIT 30
+            LIMIT 40
             """
             routes = await neo4j_client.execute_query(routes_query, {"name": repo["name"]})
-            repo_info["routes"] = [{"method": r["method"], "path": r["path"], "file": r["file"]} for r in routes]
+            repo_info["routes"] = [
+                {"method": r["method"], "path": r["path"], "handler": r.get("handler", ""), "file": r.get("file", "")}
+                for r in routes
+            ]
             
-            # Get key files (controllers, services, models)
+            # Get React components (frontend)
+            components_query = """
+            MATCH (c:ReactComponent)-[:BELONGS_TO]->(r:Repository {name: $name})
+            RETURN c.name as name, c.file as file
+            ORDER BY c.name
+            LIMIT 30
+            """
+            components = await neo4j_client.execute_query(components_query, {"name": repo["name"]})
+            repo_info["react_components"] = [
+                {"name": c["name"], "file": c.get("file", "")} for c in components
+            ]
+            
+            # Get API calls (frontend → backend connections)
+            api_calls_query = """
+            MATCH (a:ApiCall)-[:BELONGS_TO]->(r:Repository {name: $name})
+            RETURN a.url as url, a.method as method, a.file as file
+            LIMIT 20
+            """
+            api_calls = await neo4j_client.execute_query(api_calls_query, {"name": repo["name"]})
+            repo_info["api_calls"] = [
+                {"url": a.get("url", ""), "method": a.get("method", ""), "file": a.get("file", "")}
+                for a in api_calls
+            ]
+            
+            # Get relationship summary
+            rels_query = """
+            MATCH (f:File)-[:BELONGS_TO]->(r:Repository {name: $name})
+            MATCH (f)-[rel]-()
+            RETURN type(rel) as rel_type, count(*) as cnt
+            ORDER BY cnt DESC
+            LIMIT 10
+            """
+            rels = await neo4j_client.execute_query(rels_query, {"name": repo["name"]})
+            repo_info["relationship_types"] = {r["rel_type"]: r["cnt"] for r in rels}
+            
+            # Get key files (controllers, services, models, routes)
             key_files_query = """
             MATCH (f:File)-[:BELONGS_TO]->(r:Repository {name: $name})
             WHERE f.path CONTAINS 'controller' OR f.path CONTAINS 'service' 
                   OR f.path CONTAINS 'model' OR f.path CONTAINS 'route'
+                  OR f.path CONTAINS 'middleware' OR f.path CONTAINS 'auth'
             RETURN f.path as path
-            LIMIT 20
+            LIMIT 30
             """
             key_files = await neo4j_client.execute_query(key_files_query, {"name": repo["name"]})
             repo_info["key_files"] = [f["path"] for f in key_files]
@@ -662,6 +715,547 @@ async def list_api_routes(repo_name: str = None, include_code: bool = True) -> D
         return {"error": str(e)}
 
 
+# ---------------------------------------------------------------------------
+# Intelligence-powered tools (behavioral, temporal, domain, security, QA)
+# ---------------------------------------------------------------------------
+
+@tool
+async def get_behavioral_classification(file_path: str = None, function_name: str = None) -> Dict[str, Any]:
+    """
+    Get behavioral classification of code nodes — AuthCritical, SideEffecting,
+    AsyncFanOut, TransactionBoundary, Idempotent, ExternallyVisible.
+    USE THIS for security, auth, side-effect, and risk questions.
+    
+    Args:
+        file_path: Optional file path filter
+        function_name: Optional function/handler name filter
+    
+    Returns:
+        Behavioral labels, confidence, and evidence for matching nodes
+    """
+    try:
+        from src.database.neo4j_client import neo4j_client
+        from src.intelligence.behavioral_layer import behavioral_classifier
+        await neo4j_client.initialize()
+
+        # Build query based on filters
+        conditions = []
+        params: Dict[str, Any] = {}
+        if file_path:
+            conditions.append("n.file CONTAINS $file_path")
+            params["file_path"] = file_path
+        if function_name:
+            conditions.append("(n.name CONTAINS $func_name OR n.handler_method CONTAINS $func_name)")
+            params["func_name"] = function_name
+
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        query = f"""
+        MATCH (n)
+        WHERE (n:Function OR n:VertxRoute OR n:ReactComponent)
+        {f'AND {" AND ".join(conditions)}' if conditions else ''}
+        OPTIONAL MATCH (n)-[:BELONGS_TO]->(r:Repository)
+        RETURN n.name as name, labels(n) as labels, n.file as file,
+               n.method as http_method, n.handler_method as handler,
+               n.code as code, r.name as repo
+        LIMIT 30
+        """
+        nodes = await neo4j_client.execute_query(query, params)
+
+        classifications = []
+        for node in (nodes or []):
+            cls = behavioral_classifier.classify_node(
+                node_id=node.get("name", ""),
+                name=node.get("name", "") or node.get("handler", ""),
+                code_body=node.get("code", "") or "",
+                node_labels=node.get("labels", []),
+                http_method=node.get("http_method"),
+                is_handler=bool(node.get("handler")),
+            )
+            if cls.labels:
+                classifications.append({
+                    "name": node.get("name", ""),
+                    "file": node.get("file", ""),
+                    "repo": node.get("repo", ""),
+                    "behavioral_labels": [l.value for l in cls.labels],
+                    "confidence": round(cls.confidence, 3),
+                    "evidence": cls.evidence[:5],
+                })
+
+        # Summary
+        label_counts: Dict[str, int] = {}
+        for c in classifications:
+            for lbl in c["behavioral_labels"]:
+                label_counts[lbl] = label_counts.get(lbl, 0) + 1
+
+        return {
+            "total_classified": len(classifications),
+            "label_summary": label_counts,
+            "nodes": classifications[:20],
+            "filter_applied": {"file_path": file_path, "function_name": function_name},
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+async def get_security_surface() -> Dict[str, Any]:
+    """
+    Analyze the security surface of the codebase: which routes have auth middleware,
+    which don't, and which code nodes are AuthCritical.
+    USE THIS for any security, authentication, or authorization questions.
+    
+    Returns:
+        Routes grouped by auth status, AuthCritical nodes, and security gaps
+    """
+    try:
+        from src.database.neo4j_client import neo4j_client
+        await neo4j_client.initialize()
+
+        # Get all routes with their handler info
+        routes_query = """
+        MATCH (route:VertxRoute)
+        RETURN route.path as path, route.method as method, 
+               route.handler_method as handler, route.file as file
+        ORDER BY route.path
+        """
+        routes = await neo4j_client.execute_query(routes_query)
+
+        protected = []
+        unprotected = []
+        for r in (routes or []):
+            handler = (r.get("handler") or "").lower()
+            file_name = (r.get("file") or "").lower()
+            route_info = {
+                "method": r.get("method", ""),
+                "path": r.get("path", ""),
+                "handler": r.get("handler", ""),
+                "file": r.get("file", ""),
+            }
+            # Heuristic: check if auth middleware is in the handler chain
+            if any(kw in handler for kw in ["auth", "middleware", "protect", "guard"]):
+                protected.append(route_info)
+            elif any(kw in file_name for kw in ["auth"]):
+                protected.append(route_info)
+            elif r.get("method", "").upper() in ("GET",) and r.get("path", "") in ("/health", "/health/details"):
+                unprotected.append({**route_info, "reason": "Public health endpoint"})
+            else:
+                unprotected.append(route_info)
+
+        # Get nodes with auth-related patterns
+        auth_query = """
+        MATCH (n:Function)
+        WHERE n.name =~ '(?i).*(auth|login|logout|token|session|password|credential).*'
+        RETURN n.name as name, n.file as file
+        LIMIT 20
+        """
+        auth_nodes = await neo4j_client.execute_query(auth_query)
+
+        return {
+            "total_routes": len(routes or []),
+            "protected_routes": len(protected),
+            "unprotected_routes": len(unprotected),
+            "protected": protected[:20],
+            "unprotected": unprotected[:20],
+            "auth_related_functions": [{"name": n["name"], "file": n.get("file", "")} for n in (auth_nodes or [])],
+            "security_gaps": [r for r in unprotected if r.get("method", "").upper() in ("POST", "PUT", "DELETE", "PATCH")],
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+async def get_domain_context(query: str) -> Dict[str, Any]:
+    """
+    Resolve a user query to business domains (authentication, payments, etc.)
+    and find all code nodes in those domains across ALL repositories.
+    USE THIS for high-level questions like 'how does auth work' or 'show me payment flow'.
+    
+    Args:
+        query: Natural language question about a business capability
+    
+    Returns:
+        Matched domains, confidence, and relevant code nodes in each domain
+    """
+    try:
+        from src.intelligence.domain_model import domain_engine
+        from src.database.neo4j_client import neo4j_client
+        await neo4j_client.initialize()
+
+        # Step 1: Resolve query to domains
+        domain_matches = domain_engine.resolve_query_to_domains(query)
+
+        if not domain_matches:
+            return {
+                "query": query,
+                "domains_found": 0,
+                "message": "No business domain could be inferred from this query.",
+            }
+
+        result_domains = []
+        for domain_name, relevance in domain_matches[:3]:
+            # Step 2: Search for nodes in this domain using domain keywords
+            keywords = domain_engine._domain_keywords.get(domain_name, [])
+            keyword_pattern = "|".join(kw.replace(".", "\\.?") for kw in keywords[:10])
+
+            # Search routes matching domain
+            routes_query = """
+            MATCH (r:VertxRoute)
+            WHERE r.path =~ $pattern OR r.handler_method =~ $pattern
+            RETURN r.path as path, r.method as method, r.handler_method as handler, r.file as file
+            LIMIT 15
+            """
+            routes = await neo4j_client.execute_query(
+                routes_query, {"pattern": f"(?i).*({keyword_pattern}).*"}
+            )
+
+            # Search functions matching domain
+            funcs_query = """
+            MATCH (f:Function)
+            WHERE f.name =~ $pattern OR f.file =~ $pattern
+            RETURN f.name as name, f.file as file
+            LIMIT 15
+            """
+            funcs = await neo4j_client.execute_query(
+                funcs_query, {"pattern": f"(?i).*({keyword_pattern}).*"}
+            )
+
+            # Search components
+            comps_query = """
+            MATCH (c:ReactComponent)
+            WHERE c.name =~ $pattern OR c.file =~ $pattern
+            RETURN c.name as name, c.file as file
+            LIMIT 10
+            """
+            comps = await neo4j_client.execute_query(
+                comps_query, {"pattern": f"(?i).*({keyword_pattern}).*"}
+            )
+
+            result_domains.append({
+                "domain": domain_name,
+                "relevance": round(relevance, 3),
+                "routes": [{"method": r["method"], "path": r["path"], "handler": r.get("handler", ""), "file": r.get("file", "")} for r in (routes or [])],
+                "functions": [{"name": f["name"], "file": f.get("file", "")} for f in (funcs or [])],
+                "components": [{"name": c["name"], "file": c.get("file", "")} for c in (comps or [])],
+            })
+
+        return {
+            "query": query,
+            "domains_found": len(result_domains),
+            "domains": result_domains,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+async def trace_cross_repo_flow(endpoint_or_component: str) -> Dict[str, Any]:
+    """
+    Trace the complete cross-repository flow for an API endpoint or component.
+    Finds: Frontend component → API call → Backend route → Handler → Service layer.
+    USE THIS for cross-repo questions about how frontend connects to backend.
+    
+    Args:
+        endpoint_or_component: API path (e.g. '/login') or component name (e.g. 'Login')
+    
+    Returns:
+        Complete flow trace across repositories with confidence
+    """
+    try:
+        from src.database.neo4j_client import neo4j_client
+        await neo4j_client.initialize()
+
+        search_term = endpoint_or_component
+        trace: Dict[str, Any] = {
+            "search_term": search_term,
+            "frontend": {"components": [], "api_calls": []},
+            "backend": {"routes": [], "handlers": [], "services": []},
+        }
+
+        # 1. Find backend routes matching the endpoint
+        routes_query = """
+        MATCH (r:VertxRoute)
+        WHERE r.path CONTAINS $term OR r.handler_method CONTAINS $term
+        RETURN r.path as path, r.method as method, r.handler_method as handler, r.file as file
+        LIMIT 10
+        """
+        routes = await neo4j_client.execute_query(routes_query, {"term": search_term})
+        trace["backend"]["routes"] = [
+            {"method": r["method"], "path": r["path"], "handler": r.get("handler", ""), "file": r.get("file", "")}
+            for r in (routes or [])
+        ]
+
+        # 2. Find frontend API calls matching the endpoint
+        api_calls_query = """
+        MATCH (a:ApiCall)
+        WHERE a.url CONTAINS $term OR a.file CONTAINS $term
+        RETURN a.url as url, a.method as method, a.file as file
+        LIMIT 10
+        """
+        api_calls = await neo4j_client.execute_query(api_calls_query, {"term": search_term})
+        trace["frontend"]["api_calls"] = [
+            {"url": a.get("url", ""), "method": a.get("method", ""), "file": a.get("file", "")}
+            for a in (api_calls or [])
+        ]
+
+        # 3. Find React components matching the name
+        comps_query = """
+        MATCH (c:ReactComponent)
+        WHERE c.name CONTAINS $term OR c.file CONTAINS $term
+        RETURN c.name as name, c.file as file
+        LIMIT 10
+        """
+        comps = await neo4j_client.execute_query(comps_query, {"term": search_term})
+        trace["frontend"]["components"] = [
+            {"name": c["name"], "file": c.get("file", "")}
+            for c in (comps or [])
+        ]
+
+        # 4. Find related functions (controllers, services)
+        funcs_query = """
+        MATCH (f:Function)
+        WHERE f.name CONTAINS $term OR f.file CONTAINS $term
+        RETURN f.name as name, f.file as file
+        LIMIT 10
+        """
+        funcs = await neo4j_client.execute_query(funcs_query, {"term": search_term})
+        for f in (funcs or []):
+            fname = (f.get("file") or "").lower()
+            info = {"name": f["name"], "file": f.get("file", "")}
+            if "service" in fname:
+                trace["backend"]["services"].append(info)
+            else:
+                trace["backend"]["handlers"].append(info)
+
+        # 5. Follow CALLS_ROUTE edges from frontend
+        if trace["frontend"]["api_calls"]:
+            cross_query = """
+            MATCH (a:ApiCall)-[:CALLS_ROUTE]->(r:VertxRoute)
+            WHERE a.url CONTAINS $term OR a.file CONTAINS $term
+            RETURN a.url as frontend_url, a.file as frontend_file,
+                   r.path as backend_path, r.method as backend_method, r.file as backend_file
+            LIMIT 10
+            """
+            cross = await neo4j_client.execute_query(cross_query, {"term": search_term})
+            trace["cross_repo_links"] = [
+                {
+                    "frontend_call": c.get("frontend_url", ""),
+                    "frontend_file": c.get("frontend_file", ""),
+                    "backend_route": c.get("backend_path", ""),
+                    "backend_file": c.get("backend_file", ""),
+                }
+                for c in (cross or [])
+            ]
+
+        total_hits = (
+            len(trace["backend"]["routes"]) + len(trace["frontend"]["api_calls"]) +
+            len(trace["frontend"]["components"]) + len(trace["backend"]["handlers"])
+        )
+        trace["total_hits"] = total_hits
+        trace["has_cross_repo_evidence"] = bool(trace.get("cross_repo_links"))
+
+        return trace
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+async def get_file_dependencies(file_path: str) -> Dict[str, Any]:
+    """
+    Show all dependencies for a file: what it imports, what imports it,
+    what functions it contains, and what routes/components it defines.
+    USE THIS for understanding code structure, imports, and dependencies.
+    
+    Args:
+        file_path: Path to the file (partial match supported)
+    
+    Returns:
+        Complete dependency map for the file
+    """
+    try:
+        from src.database.neo4j_client import neo4j_client
+        await neo4j_client.initialize()
+
+        # Find the file
+        file_query = """
+        MATCH (f:File)
+        WHERE f.path CONTAINS $path
+        RETURN f.path as path, f.name as name, f.language as language
+        LIMIT 3
+        """
+        files = await neo4j_client.execute_query(file_query, {"path": file_path})
+
+        if not files:
+            return {"error": f"File not found: {file_path}"}
+
+        results = []
+        for file_info in (files or []):
+            fpath = file_info["path"]
+            dep_info: Dict[str, Any] = {
+                "file": fpath,
+                "language": file_info.get("language"),
+                "contains": [],
+                "imports_from": [],
+                "imported_by": [],
+                "calls_routes": [],
+                "renders_components": [],
+            }
+
+            # What this file contains (functions, components, routes)
+            contains_query = """
+            MATCH (f:File {path: $path})-[:CONTAINS]->(child)
+            RETURN child.name as name, labels(child) as labels
+            """
+            contained = await neo4j_client.execute_query(contains_query, {"path": fpath})
+            dep_info["contains"] = [
+                {"name": c["name"], "type": c["labels"][0] if c.get("labels") else "Unknown"}
+                for c in (contained or [])
+            ]
+
+            # What this file calls / depends on
+            outgoing_query = """
+            MATCH (f:File {path: $path})-[rel]->(target)
+            WHERE type(rel) <> 'BELONGS_TO' AND type(rel) <> 'CONTAINS'
+            RETURN type(rel) as rel_type, target.name as name, target.path as path, labels(target) as labels
+            LIMIT 20
+            """
+            outgoing = await neo4j_client.execute_query(outgoing_query, {"path": fpath})
+            dep_info["depends_on"] = [
+                {"rel": o["rel_type"], "name": o.get("name", ""), "path": o.get("path", ""),
+                 "type": o["labels"][0] if o.get("labels") else "Unknown"}
+                for o in (outgoing or [])
+            ]
+
+            # What depends on this file
+            incoming_query = """
+            MATCH (source)-[rel]->(f:File {path: $path})
+            WHERE type(rel) <> 'BELONGS_TO'
+            RETURN type(rel) as rel_type, source.name as name, source.path as path, labels(source) as labels
+            LIMIT 20
+            """
+            incoming = await neo4j_client.execute_query(incoming_query, {"path": fpath})
+            dep_info["depended_on_by"] = [
+                {"rel": i["rel_type"], "name": i.get("name", ""), "path": i.get("path", ""),
+                 "type": i["labels"][0] if i.get("labels") else "Unknown"}
+                for i in (incoming or [])
+            ]
+
+            results.append(dep_info)
+
+        return {"files": results, "count": len(results)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+async def get_qa_risk_assessment(focus_area: str = None) -> Dict[str, Any]:
+    """
+    Generate QA-oriented risk assessment: identify high-risk code areas
+    that need testing, including async chains, auth boundaries, side effects,
+    and unprotected mutation routes.
+    USE THIS for QA, testing, and risk assessment questions.
+    
+    Args:
+        focus_area: Optional focus (e.g. 'authentication', 'file-upload', 'workflow')
+    
+    Returns:
+        Risk-ranked test scenarios with severity and rationale
+    """
+    try:
+        from src.database.neo4j_client import neo4j_client
+        from src.intelligence.behavioral_layer import behavioral_classifier
+        await neo4j_client.initialize()
+
+        risks = []
+
+        # 1. Find mutation routes (POST/PUT/DELETE) without obvious auth
+        mutation_query = """
+        MATCH (r:VertxRoute)
+        WHERE r.method IN ['POST', 'PUT', 'DELETE', 'PATCH']
+        RETURN r.path as path, r.method as method, r.handler_method as handler, r.file as file
+        """
+        if focus_area:
+            mutation_query = """
+            MATCH (r:VertxRoute)
+            WHERE r.method IN ['POST', 'PUT', 'DELETE', 'PATCH']
+            AND (r.path CONTAINS $focus OR r.handler_method CONTAINS $focus OR r.file CONTAINS $focus)
+            RETURN r.path as path, r.method as method, r.handler_method as handler, r.file as file
+            """
+        params = {"focus": focus_area} if focus_area else {}
+        mutations = await neo4j_client.execute_query(mutation_query, params)
+
+        for m in (mutations or []):
+            handler = (m.get("handler") or "").lower()
+            has_auth = any(kw in handler for kw in ["auth", "middleware", "protect", "guard", "validate"])
+            severity = "high" if not has_auth else "medium"
+            risks.append({
+                "category": "auth_boundary",
+                "severity": severity,
+                "title": f"{m['method']} {m['path']} — {'UNPROTECTED' if not has_auth else 'protected'}",
+                "rationale": f"Mutation endpoint {m['method']} {m['path']} handled by {m.get('handler', 'unknown')}" +
+                             (" has NO visible auth middleware" if not has_auth else " has auth protection"),
+                "file": m.get("file", ""),
+                "test_intent": f"Verify {'authentication is enforced' if not has_auth else 'auth + authorization'} for {m['method']} {m['path']}",
+            })
+
+        # 2. Find side-effecting functions (HTTP calls, file I/O, email)
+        side_effect_query = """
+        MATCH (f:Function)
+        WHERE f.code IS NOT NULL
+        AND (f.code =~ '(?i).*(fetch|axios|http|request|sendEmail|sendSms|fs\\.write|upload).*')
+        RETURN f.name as name, f.file as file
+        LIMIT 15
+        """
+        side_effects = await neo4j_client.execute_query(side_effect_query)
+        for se in (side_effects or []):
+            risks.append({
+                "category": "external_dependency",
+                "severity": "medium",
+                "title": f"Side-effecting function: {se['name']}",
+                "rationale": f"{se['name']} in {se.get('file', '')} makes external calls (HTTP, file I/O, etc.)",
+                "file": se.get("file", ""),
+                "test_intent": f"Test {se['name']} with external service down, slow, or returning errors",
+            })
+
+        # 3. Find concurrent execution risks (run-transform, run-workflow)
+        concurrent_query = """
+        MATCH (r:VertxRoute)
+        WHERE r.path CONTAINS 'run-' OR r.path CONTAINS 'execute' OR r.path CONTAINS 'trigger'
+        RETURN r.path as path, r.method as method, r.handler_method as handler, r.file as file
+        """
+        concurrent_routes = await neo4j_client.execute_query(concurrent_query)
+        for cr in (concurrent_routes or []):
+            risks.append({
+                "category": "race_window",
+                "severity": "high",
+                "title": f"Concurrent execution risk: {cr['method']} {cr['path']}",
+                "rationale": f"Long-running operation {cr['path']} could be called concurrently. Check for race conditions on shared state.",
+                "file": cr.get("file", ""),
+                "test_intent": f"Load test: 10 concurrent calls to {cr['method']} {cr['path']} with same resource ID",
+            })
+
+        # Sort by severity
+        severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+        risks.sort(key=lambda r: severity_order.get(r["severity"], 99))
+
+        return {
+            "total_risks": len(risks),
+            "by_severity": {
+                "critical": len([r for r in risks if r["severity"] == "critical"]),
+                "high": len([r for r in risks if r["severity"] == "high"]),
+                "medium": len([r for r in risks if r["severity"] == "medium"]),
+                "low": len([r for r in risks if r["severity"] == "low"]),
+            },
+            "by_category": {
+                cat: len([r for r in risks if r["category"] == cat])
+                for cat in set(r["category"] for r in risks)
+            },
+            "risks": risks[:25],
+            "focus_area": focus_area,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # Create tools list
 tools = [
     search_codebase,
@@ -672,7 +1266,14 @@ tools = [
     get_repository_architecture,
     read_file_content,
     search_code_pattern,
-    list_api_routes
+    list_api_routes,
+    # Intelligence-powered tools
+    get_behavioral_classification,
+    get_security_surface,
+    get_domain_context,
+    trace_cross_repo_flow,
+    get_file_dependencies,
+    get_qa_risk_assessment,
 ]
 
 

@@ -1,6 +1,11 @@
 """
 QA Test Generation Workflow using LangGraph
 Generates comprehensive testing strategies based on PRD and architectural blueprints
+
+Enhanced with:
+    - QA Projection Layer (async chains, failure surfaces, race windows)
+    - Behavioral-aware test intent generation
+    - Volatility hotspot detection
 """
 import logging
 import yaml
@@ -16,6 +21,7 @@ from litellm import acompletion
 from src.services.search_service import SearchService
 from src.services.graph_service import GraphService
 from src.agents.state_schema import QAState
+from src.intelligence.qa_projection import qa_projection_engine
 from config.settings import settings
 from src.core.logger import get_logger
 from src.core.exceptions import AgentException
@@ -246,17 +252,114 @@ async def retrieve_existing_tests(state: QAState) -> QAState:
         return state
 
 
+async def enrich_with_intelligence(state: QAState) -> QAState:
+    """
+    Enrich QA context with behavioral, domain, and security intelligence.
+    This is the key step that connects the intelligence layer to QA output.
+    """
+    try:
+        from src.database.neo4j_client import neo4j_client
+        from src.intelligence.behavioral_layer import behavioral_classifier
+        from src.intelligence.domain_model import domain_engine
+        await neo4j_client.initialize()
+
+        intelligence_context: Dict[str, Any] = {
+            "security_surface": {"protected_routes": 0, "unprotected_mutation_routes": []},
+            "behavioral_hotspots": [],
+            "domain_context": [],
+        }
+
+        # --- 1. Security surface: mutation routes without auth ---
+        mutation_query = """
+        MATCH (r:VertxRoute)
+        WHERE r.method IN ['POST', 'PUT', 'DELETE', 'PATCH']
+        RETURN r.path as path, r.method as method, r.handler_method as handler, r.file as file
+        """
+        mutations = await neo4j_client.execute_query(mutation_query)
+        unprotected = []
+        protected_count = 0
+        for m in (mutations or []):
+            handler = (m.get("handler") or "").lower()
+            if any(kw in handler for kw in ["auth", "middleware", "protect", "guard"]):
+                protected_count += 1
+            else:
+                unprotected.append({
+                    "method": m["method"], "path": m["path"],
+                    "handler": m.get("handler", ""), "file": m.get("file", ""),
+                })
+        intelligence_context["security_surface"]["protected_routes"] = protected_count
+        intelligence_context["security_surface"]["unprotected_mutation_routes"] = unprotected[:15]
+
+        # --- 2. Behavioral hotspots: classify routes ---
+        routes_query = """
+        MATCH (r:VertxRoute)
+        RETURN r.name as name, r.method as http_method, r.handler_method as handler, 
+               r.file as file, labels(r) as labels
+        LIMIT 50
+        """
+        routes = await neo4j_client.execute_query(routes_query)
+        for node in (routes or []):
+            cls = behavioral_classifier.classify_node(
+                node_id=node.get("name", ""),
+                name=node.get("handler", "") or node.get("name", ""),
+                node_labels=node.get("labels", []),
+                http_method=node.get("http_method"),
+                is_handler=True,
+            )
+            if cls.labels:
+                intelligence_context["behavioral_hotspots"].append({
+                    "name": node.get("name", ""),
+                    "handler": node.get("handler", ""),
+                    "file": node.get("file", ""),
+                    "labels": [l.value for l in cls.labels],
+                    "confidence": round(cls.confidence, 3),
+                })
+
+        # --- 3. Domain context ---
+        prd_text = state.get("prd_text", "")
+        if prd_text:
+            domain_matches = domain_engine.resolve_query_to_domains(prd_text)
+            intelligence_context["domain_context"] = [
+                {"domain": d, "relevance": round(r, 3)} for d, r in domain_matches[:5]
+            ]
+
+        # Store in state
+        if "retrieved_context" not in state or state["retrieved_context"] is None:
+            state["retrieved_context"] = {}
+        state["retrieved_context"]["intelligence"] = intelligence_context
+
+        logger.info(
+            "Intelligence enrichment completed",
+            unprotected_routes=len(unprotected),
+            behavioral_hotspots=len(intelligence_context["behavioral_hotspots"]),
+            domains_found=len(intelligence_context["domain_context"]),
+        )
+
+        return state
+
+    except Exception as e:
+        logger.error(f"Intelligence enrichment failed: {e}")
+        if "errors" not in state:
+            state["errors"] = []
+        state["errors"].append(f"Intelligence enrichment failed: {str(e)}")
+        return state
+
+
 async def generate_test_strategy(state: QAState) -> QAState:
     """Generate comprehensive test strategy using LLM"""
     try:
         # Use custom prompt from YAML or default (key: qa_engineer_system)
         qa_prompt = prompts.get('qa_engineer_system', prompts.get('qa_system', DEFAULT_QA_PROMPT))
         
-        # Prepare context
+        # Prepare context — includes intelligence enrichment
+        intelligence = state.get('retrieved_context', {}).get('intelligence', {})
         context = {
             "testing_targets": state.get('retrieved_context', {}).get('testing_targets', {}),
             "existing_tests": state.get('retrieved_context', {}).get('existing_tests', {}),
-            "test_categories": state.get('test_categories', [])
+            "test_categories": state.get('test_categories', []),
+            "security_surface": intelligence.get("security_surface", {}),
+            "behavioral_hotspots": intelligence.get("behavioral_hotspots", [])[:10],
+            "domain_context": intelligence.get("domain_context", []),
         }
         
         # Format the prompt
@@ -402,13 +505,16 @@ def create_qa_workflow() -> StateGraph:
     # Add nodes
     graph.add_node("analyze_blueprint", analyze_blueprint_for_testing)
     graph.add_node("retrieve_tests", retrieve_existing_tests)
+    graph.add_node("enrich_intelligence", enrich_with_intelligence)
     graph.add_node("generate_strategy", generate_test_strategy)
     graph.add_node("analyze_race_conditions", identify_race_conditions)
     
-    # Define workflow flow
+    # Define workflow flow:
+    #   analyze_blueprint → retrieve_tests → enrich_intelligence → generate_strategy → race_conditions → END
     graph.set_entry_point("analyze_blueprint")
     graph.add_edge("analyze_blueprint", "retrieve_tests")
-    graph.add_edge("retrieve_tests", "generate_strategy")
+    graph.add_edge("retrieve_tests", "enrich_intelligence")
+    graph.add_edge("enrich_intelligence", "generate_strategy")
     graph.add_edge("generate_strategy", "analyze_race_conditions")
     graph.add_edge("analyze_race_conditions", END)
     

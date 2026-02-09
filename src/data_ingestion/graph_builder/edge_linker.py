@@ -1,6 +1,10 @@
 """
 Enterprise Edge Linker for Neo4j Knowledge Graph
 Creates relationships between code artifacts: API calls to routes, EventBus flows, DTO usages
+
+Enhanced with:
+    - Evidence-weighted links (confidence_score, evidence_types on every edge)
+    - Behavioral edge inference (GUARDS, ESCALATES_FAILURE, REQUIRES_CONSISTENCY)
 """
 import logging
 from typing import Dict, List, Any, Optional
@@ -18,13 +22,16 @@ class EdgeLinker:
     """
     Creates and manages relationships between nodes in the code knowledge graph.
     Handles cross-language linking (React → Vert.x) and EventBus flow mapping.
+    
+    Enhanced: All edges carry confidence_score and evidence_type properties.
     """
     
     def __init__(self):
         self.stats = {
             "edges_created": 0,
             "edges_updated": 0,
-            "errors": 0
+            "errors": 0,
+            "behavioral_edges_created": 0,
         }
     
     async def link_all_edges(self, session=None) -> Dict[str, Any]:
@@ -102,6 +109,11 @@ class EdgeLinker:
         service_result = await self._link_service_dependencies(session)
         stats["relationships_created"] += service_result.get("created", 0)
         stats["by_type"]["DEPENDS_ON"] = service_result.get("created", 0)
+
+        # 8. Create behavioral edges (GUARDS, ESCALATES_FAILURE, REQUIRES_CONSISTENCY)
+        behavioral_result = await self._create_behavioral_edges(session)
+        stats["relationships_created"] += behavioral_result.get("created", 0)
+        stats["by_type"]["BEHAVIORAL"] = behavioral_result.get("created", 0)
         
         return stats
 
@@ -189,11 +201,19 @@ class EdgeLinker:
                OR api.url ENDS WITH coalesce(route.full_path, route.path)
            ))
         
-        // Create relationship with metadata
+        // Create relationship with evidence-weighted metadata
         MERGE (api)-[r:CALLS_ROUTE]->(route)
         SET r.method_match = (api.method = route.method OR api.method IS NULL),
             r.created_at = datetime(),
-            r.last_updated = datetime()
+            r.last_updated = datetime(),
+            r.confidence_score = CASE
+                WHEN normalized_api_url = normalized_route_path THEN 0.90
+                WHEN api.method = route.method AND api.url ENDS WITH coalesce(route.full_path, route.path) THEN 0.85
+                WHEN normalized_route_path CONTAINS normalized_api_url THEN 0.70
+                ELSE 0.60
+            END,
+            r.evidence_type = 'path_convention',
+            r.link_origin = 'edge_linker'
         
         RETURN count(r) as relationships_created
         """
@@ -375,6 +395,82 @@ class EdgeLinker:
             logger.error("Failed to link service dependencies", error=str(e))
             return {"created": 0, "error": str(e)}
     
+    async def _create_behavioral_edges(self, session) -> Dict[str, Any]:
+        """
+        Create behavioral edges based on node behavioral_labels.
+        
+        Rules:
+            - AuthCritical → (any connected node) → GUARDS edge
+            - (any) → AsyncFanOut via CALLS/HANDLED_BY → ESCALATES_FAILURE
+            - TransactionBoundary → SideEffecting → REQUIRES_CONSISTENCY
+        """
+        total_created = 0
+
+        # GUARDS: AuthCritical nodes guard downstream nodes
+        guards_query = """
+        MATCH (auth)-[r]->(target)
+        WHERE auth.behavioral_labels IS NOT NULL
+          AND 'AuthCritical' IN auth.behavioral_labels
+          AND NOT type(r) = 'GUARDS'
+        MERGE (auth)-[g:GUARDS]->(target)
+        SET g.created_at = coalesce(g.created_at, datetime()),
+            g.confidence_score = auth.behavioral_confidence,
+            g.evidence_type = 'behavioral_inference',
+            g.link_origin = 'behavioral_layer'
+        RETURN count(g) as created
+        """
+        try:
+            result = await session.run(guards_query)
+            record = await result.single()
+            total_created += record["created"] if record else 0
+        except Exception as e:
+            logger.debug(f"GUARDS edge creation: {e}")
+
+        # ESCALATES_FAILURE: calling into AsyncFanOut nodes
+        escalates_query = """
+        MATCH (source)-[r]->(target)
+        WHERE target.behavioral_labels IS NOT NULL
+          AND 'AsyncFanOut' IN target.behavioral_labels
+          AND type(r) IN ['CALLS', 'CALLS_FUNCTION', 'HANDLED_BY', 'CALLS_ROUTE']
+        MERGE (source)-[ef:ESCALATES_FAILURE]->(target)
+        SET ef.created_at = coalesce(ef.created_at, datetime()),
+            ef.confidence_score = 0.75,
+            ef.evidence_type = 'behavioral_inference',
+            ef.link_origin = 'behavioral_layer'
+        RETURN count(ef) as created
+        """
+        try:
+            result = await session.run(escalates_query)
+            record = await result.single()
+            total_created += record["created"] if record else 0
+        except Exception as e:
+            logger.debug(f"ESCALATES_FAILURE edge creation: {e}")
+
+        # REQUIRES_CONSISTENCY: TransactionBoundary → SideEffecting
+        consistency_query = """
+        MATCH (tx)-[r]->(side)
+        WHERE tx.behavioral_labels IS NOT NULL
+          AND 'TransactionBoundary' IN tx.behavioral_labels
+          AND side.behavioral_labels IS NOT NULL
+          AND 'SideEffecting' IN side.behavioral_labels
+        MERGE (tx)-[rc:REQUIRES_CONSISTENCY]->(side)
+        SET rc.created_at = coalesce(rc.created_at, datetime()),
+            rc.confidence_score = 0.80,
+            rc.evidence_type = 'behavioral_inference',
+            rc.link_origin = 'behavioral_layer'
+        RETURN count(rc) as created
+        """
+        try:
+            result = await session.run(consistency_query)
+            record = await result.single()
+            total_created += record["created"] if record else 0
+        except Exception as e:
+            logger.debug(f"REQUIRES_CONSISTENCY edge creation: {e}")
+
+        self.stats["behavioral_edges_created"] = total_created
+        logger.info(f"Created {total_created} behavioral edges")
+        return {"created": total_created}
+
     async def find_cross_service_dependencies(self, service_name: str) -> List[Dict[str, Any]]:
         """Find all dependencies for a given service"""
         

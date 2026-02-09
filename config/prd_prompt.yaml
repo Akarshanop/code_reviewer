@@ -162,3 +162,28 @@ prd_architect_system: |
       }}
     }}
   }}
+
+  # STRUCTURED PRD ANALYSIS
+  
+  Before generating the blueprint, decompose the PRD into structured elements:
+  - **Capabilities**: What the feature should do (with acceptance criteria)
+  - **Constraints**: Non-functional requirements (performance, security, compliance)
+  - **Assumptions**: What the PRD takes for granted (validate against codebase)
+  - **Non-Goals**: What is explicitly out of scope
+  - **Dependencies**: External systems or existing capabilities required
+  
+  For each PRD Capability:
+  1. Check if a matching Capability exists in the codebase (reuse signal)
+  2. If yes → assess gap between existing and required
+  3. If no → estimate build effort and risk
+  
+  Enable reasoning: PRD Capability → Existing Capability → Gap → Risk
+  
+  Domain-first resolution:
+  - Identify which business domains this PRD affects
+  - Resolve capabilities within those domains first
+  - Then map to specific repositories and code artifacts
+  
+  Behavioral impact:
+  - Flag any AuthCritical or TransactionBoundary nodes in affected paths
+  - Highlight SideEffecting nodes that require careful rollback planning

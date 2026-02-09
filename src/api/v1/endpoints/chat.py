@@ -1,6 +1,11 @@
 """
 Enterprise Chat Endpoint for AI-Powered Code Intelligence
 Provides interactive conversations with developer assistant agent
+
+Enhanced with:
+    - Role-aware endpoint (two-layer: Reasoning → Policy)
+    - Confidence scoring in responses
+    - Trust-preserving silence
 """
 import uuid
 from typing import Dict, Any, List, Optional
@@ -18,6 +23,15 @@ from config.settings import settings
 
 logger = get_logger(__name__)
 router = APIRouter()
+
+
+class RoleAwareChatRequest(BaseModel):
+    """Chat request with role-based output shaping."""
+    question: str = Field(..., min_length=1, max_length=10000)
+    user_role: str = Field(default="developer", description="User role: admin, architect, developer, qa, sales, viewer")
+    chat_history: Optional[List[dict]] = Field(default_factory=list)
+    context_files: Optional[List[str]] = Field(default_factory=list)
+    session_id: Optional[str] = None
 
 # In-memory job storage (use Redis in production)
 _job_store: Dict[str, Dict[str, Any]] = {}
@@ -91,6 +105,57 @@ async def chat_with_ai(request: ChatRequest):
         
     except Exception as e:
         logger.error(f"Chat failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Chat processing failed: {str(e)}")
+
+
+@router.post("/ask/role-aware")
+async def chat_with_role_policy(request: RoleAwareChatRequest):
+    """
+    Role-aware chat endpoint with two-layer architecture.
+    
+    This endpoint applies RBAC-based output shaping:
+        - admin/architect/developer: Full technical detail
+        - qa: Test-oriented view with behavioral summaries
+        - sales: Business-only (no file names, class names, architecture)
+        - viewer: Read-only codebase view
+    
+    Responses include confidence scoring and trust-preserving silence.
+    """
+    try:
+        await agent_orchestrator.initialize()
+
+        history = [
+            {"role": msg.get("role", "user"), "content": msg.get("content", "")}
+            for msg in (request.chat_history or [])
+        ]
+
+        result = await agent_orchestrator.process_with_policy(
+            question=request.question,
+            user_role=request.user_role,
+            chat_history=history,
+            context_files=request.context_files,
+        )
+
+        session_id = request.session_id or str(uuid.uuid4())
+
+        return {
+            "status": "silence" if result.get("is_silence") else "success",
+            "answer": result.get("answer", ""),
+            "confidence": result.get("confidence", "unknown"),
+            "risk_level": result.get("risk_level", "unknown"),
+            "affected_domains": result.get("affected_domains", []),
+            "impact_summary": result.get("impact_summary", ""),
+            "affected_files": result.get("affected_files", []),
+            "evidence": result.get("evidence", []),
+            "uncertainty": result.get("uncertainty", []),
+            "tools_used": result.get("tools_used", []),
+            "execution_time_seconds": result.get("execution_time_seconds", 0.0),
+            "role_applied": result.get("role_applied", request.user_role),
+            "session_id": session_id,
+        }
+
+    except Exception as e:
+        logger.error(f"Role-aware chat failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Chat processing failed: {str(e)}")
 
 

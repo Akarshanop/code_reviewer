@@ -7,11 +7,18 @@ from src.services.graph_service import GraphService
 from src.services.vector_service import VectorService
 from src.core.logger import get_logger
 from src.core.exceptions import InternalServerException
+from src.intelligence.domain_model import domain_engine
 
 logger = get_logger(__name__)
 
 class SearchService:
-    """Unified search service combining graph and vector search"""
+    """
+    Unified search service combining graph and vector search.
+    
+    Enhanced with:
+        - Domain-first query resolution (resolves domains before code)
+        - Confidence scoring on results
+    """
     
     def __init__(self):
         self.graph_service = GraphService()

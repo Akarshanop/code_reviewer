@@ -38,11 +38,25 @@ class JavaParser:
             '@Route': self._extract_vertx_route,
         }
     
+    def parse(self, file_path: str, content: str = None) -> Dict[str, Any]:
+        """Parse a Java file from path and optional pre-loaded content.
+        
+        This method is the primary interface used by ParserCoordinator.
+        If content is not provided, reads the file from disk.
+        """
+        if content is None:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        return self._parse_content(str(file_path), content)
+
     def parse_file(self, file_path: Path) -> Dict[str, Any]:
         """Parse a Java file and extract Vert.x specific patterns"""
         with open(file_path, 'r', encoding='utf-8') as f:
             code = f.read()
-        
+        return self._parse_content(str(file_path), code)
+
+    def _parse_content(self, file_path: str, code: str) -> Dict[str, Any]:
+        """Internal: parse Java source code string."""
         tree = self.parser.parse(bytes(code, 'utf-8'))
         
         results = {

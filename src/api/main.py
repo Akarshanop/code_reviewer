@@ -17,7 +17,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from config.settings import settings
 from src.core.logger import setup_logging, get_logger
-from src.api.v1.endpoints import admin, ingestion, developer, chat, prd_qa
+from src.api.v1.endpoints import admin, ingestion, developer, chat, prd_qa, intelligence
 from src.agents.orchestrator import AgentOrchestrator
 from src.database.neo4j_client import neo4j_client
 from src.database.qdrant_client import qdrant_client
@@ -176,6 +176,7 @@ app.include_router(ingestion.router, prefix="/api/v1/ingestion", tags=["ingestio
 app.include_router(developer.router, prefix="/api/v1/developer", tags=["developer"])
 app.include_router(chat.router, prefix="/api/v1/chat", tags=["chat"])
 app.include_router(prd_qa.router, prefix="/api/v1/prd-qa", tags=["prd-qa"])
+app.include_router(intelligence.router, prefix="/api/v1/intelligence", tags=["intelligence"])
 
 
 # -------------------- SYSTEM ENDPOINTS --------------------

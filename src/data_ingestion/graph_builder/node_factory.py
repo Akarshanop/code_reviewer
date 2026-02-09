@@ -1,6 +1,11 @@
 """
 Enterprise Node Factory for Neo4j Knowledge Graph
 Creates nodes for code artifacts: Routes, EventBus, DTOs, Components, Services
+
+Enhanced with:
+    - Behavioral classification (AuthCritical, SideEffecting, etc.)
+    - Temporal metadata placeholders (volatility_score, change_frequency)
+    - Domain inference (auto-classify into business domains)
 """
 import logging
 from typing import Dict, List, Any, Optional
@@ -10,6 +15,8 @@ import json
 
 from src.database.neo4j_client import neo4j_client
 from src.core.logger import get_logger
+from src.intelligence.behavioral_layer import behavioral_classifier, BehavioralNodeLabel
+from src.intelligence.domain_model import domain_engine
 
 logger = get_logger(__name__)
 
@@ -18,13 +25,17 @@ class NodeFactory:
     """
     Factory for creating Neo4j nodes from parsed code artifacts.
     Supports Vert.x backend and React frontend patterns.
+    
+    Enhanced: All nodes are behaviorally classified and domain-tagged during creation.
     """
     
     def __init__(self):
         self.stats = {
             "nodes_created": 0,
             "nodes_updated": 0,
-            "errors": 0
+            "errors": 0,
+            "behavioral_labels_applied": 0,
+            "domains_inferred": 0,
         }
     
     def _generate_node_id(self, node_type: str, *identifiers) -> str:
@@ -238,6 +249,14 @@ class NodeFactory:
             except Exception as e:
                 stats["errors"].append(f"Function CALLS edge error: {str(e)}")
             
+            # ── Behavioral + Domain enrichment (post-creation) ──
+            try:
+                await self._enrich_file_nodes_behavioral(
+                    session, file_path, parsed_data, repo_type, repository_name
+                )
+            except Exception as e:
+                logger.debug(f"Behavioral enrichment skipped for {file_path}: {e}")
+
             logger.info(
                 f"Nodes created from {file_path}",
                 total=stats["created"],
@@ -249,6 +268,103 @@ class NodeFactory:
             stats["errors"].append(str(e))
         
         return stats
+
+    async def _enrich_file_nodes_behavioral(
+        self,
+        session,
+        file_path: str,
+        parsed_data: Dict[str, Any],
+        repo_type: str = None,
+        repository_name: str = None,
+    ) -> None:
+        """
+        Post-creation pass: classify all nodes in this file behaviorally
+        and attach behavioral_labels + domain as node properties.
+        """
+        code_body = parsed_data.get("raw_content", "")[:2000]  # First 2000 chars for heuristics
+        decorators = parsed_data.get("decorators", [])
+
+        # Classify functions
+        for fn in parsed_data.get("functions", []):
+            if not isinstance(fn, dict):
+                continue
+            name = fn.get("name", "")
+            if not name:
+                continue
+            node_id = self._generate_node_id("Function", (parsed_data.get("repository_hash") or ""), file_path, name)
+            fn_body = fn.get("body", fn.get("code", ""))[:1000]
+            fn_decorators = fn.get("decorators", [])
+
+            classification = behavioral_classifier.classify_node(
+                node_id=node_id,
+                name=name,
+                code_body=fn_body,
+                decorators=fn_decorators,
+                node_labels=["Function"],
+                is_handler=fn.get("is_handler", False),
+                is_exported=fn.get("is_exported", False),
+            )
+            if classification.labels:
+                labels_list = [l.value for l in classification.labels]
+                await session.run(
+                    """
+                    MATCH (n {id: $id})
+                    SET n.behavioral_labels = $labels,
+                        n.behavioral_confidence = $confidence
+                    """,
+                    {
+                        "id": node_id,
+                        "labels": labels_list,
+                        "confidence": classification.confidence,
+                    },
+                )
+                self.stats["behavioral_labels_applied"] += len(labels_list)
+
+        # Classify routes
+        for route in parsed_data.get("routes", []):
+            if not isinstance(route, dict):
+                continue
+            path = route.get("path", "")
+            method = route.get("method", "GET")
+            node_id = self._generate_node_id("Route", path, method, file_path)
+            classification = behavioral_classifier.classify_node(
+                node_id=node_id,
+                name=route.get("handler_method", route.get("name", "")),
+                code_body=code_body,
+                node_labels=["VertxRoute"],
+                http_method=method,
+                is_handler=True,
+            )
+            if classification.labels:
+                labels_list = [l.value for l in classification.labels]
+                await session.run(
+                    """
+                    MATCH (n {id: $id})
+                    SET n.behavioral_labels = $labels,
+                        n.behavioral_confidence = $confidence
+                    """,
+                    {"id": node_id, "labels": labels_list, "confidence": classification.confidence},
+                )
+                self.stats["behavioral_labels_applied"] += len(labels_list)
+
+        # Domain inference for the file
+        domains = domain_engine.infer_domain_for_node(
+            node_name=file_path.split("/")[-1] if file_path else "",
+            file_path=file_path,
+            code_body=code_body[:500],
+        )
+        if domains:
+            top_domain, confidence, evidence = domains[0]
+            file_node_id = self._generate_node_id("File", file_path)
+            await session.run(
+                """
+                MATCH (n:File {id: $id})
+                SET n.domain = $domain,
+                    n.domain_confidence = $confidence
+                """,
+                {"id": file_node_id, "domain": top_domain, "confidence": confidence},
+            )
+            self.stats["domains_inferred"] += 1
     
     async def _create_route_node(self, session, route: Dict[str, Any], 
                                 file_path: str, file_node_id: str,

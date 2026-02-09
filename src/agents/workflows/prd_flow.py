@@ -1,6 +1,11 @@
 """
 PRD Analysis Workflow using LangGraph
 Analyzes Product Requirements Documents against the codebase knowledge graph
+
+Enhanced with:
+    - Structured PRD extraction (capabilities, constraints, assumptions)
+    - Domain-first resolution (Domain → Capability → Code)
+    - Behavioral and temporal impact assessment
 """
 import logging
 import yaml
@@ -16,6 +21,11 @@ from litellm import acompletion
 from src.services.search_service import SearchService
 from src.services.graph_service import GraphService
 from src.agents.state_schema import PRDState
+from src.intelligence.prd_graph import (
+    PRD_EXTRACTION_SYSTEM_PROMPT,
+    build_structured_prd_from_llm_output,
+)
+from src.intelligence.domain_model import domain_engine
 from config.settings import settings
 from src.core.logger import get_logger
 from src.core.exceptions import AgentException

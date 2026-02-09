@@ -47,8 +47,12 @@ async def health_check():
         }
         overall_status = "unhealthy"
     
-    # Check Qdrant
+    # Check Qdrant (initialize first so we actually try to connect)
     try:
+        try:
+            await qdrant_client.initialize()
+        except Exception as init_err:
+            logger.warning(f"Qdrant initialize during health check: {init_err}")
         qdrant_healthy = await qdrant_client.health_check()
         collections = await qdrant_client.list_collections()
         services["qdrant"] = {
@@ -61,6 +65,7 @@ async def health_check():
     except Exception as e:
         services["qdrant"] = {
             "status": "unhealthy",
+            "url": settings.QDRANT_URL,
             "error": str(e)
         }
         overall_status = "unhealthy"
@@ -297,10 +302,19 @@ async def trigger_reindex(
             else:
                 repos = settings.REPOSITORIES
             
-            # Run full pipeline
-            await service.parse_repositories([r.dict() for r in repos])
-            await service.build_knowledge_graph()
-            await service.generate_embeddings()
+            # Run full pipeline: parse → build graph → generate embeddings
+            parse_result = await service.parse_repositories([r.dict() for r in repos])
+            parsed_data = parse_result.get("parsed_data", {})
+            
+            if parsed_data:
+                graph_result = await service.build_knowledge_graph(parsed_data)
+                
+                # Collect nodes from graph result for embedding
+                nodes = graph_result.get("nodes", []) if isinstance(graph_result, dict) else []
+                if nodes:
+                    await service.generate_embeddings(nodes)
+            else:
+                logger.warning(f"Reindex job {job_id}: no parsed data to build graph from")
             
             logger.info(f"Reindex job {job_id} completed successfully")
         except Exception as e:

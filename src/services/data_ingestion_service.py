@@ -672,7 +672,21 @@ class DataIngestionService:
                 # Link edges between nodes
                 edge_results = await self.edge_linker.link_all_edges(session)
                 statistics["edges_created"] = edge_results.get("relationships_created", 0)
-                
+
+                # Enhanced graph linking (IMPORTS, CALLS_FUNCTION, CALLS_API, type hierarchy)
+                try:
+                    from src.data_ingestion.enhanced_graph_linker import EnhancedGraphLinker
+                    repo_path = parsed_data.get("repo_path", "")
+                    if repo_path:
+                        enhanced_linker = EnhancedGraphLinker(repo_path)
+                        enhanced_results = await enhanced_linker.run_all_enhancements(session)
+                        enhanced_count = enhanced_results.get("total_edges_created", 0)
+                        statistics["edges_created"] += enhanced_count
+                        statistics["enhanced_edges_created"] = enhanced_count
+                        logger.info(f"Enhanced graph linking created {enhanced_count} additional edges")
+                except Exception as e:
+                    logger.warning(f"Enhanced graph linking skipped: {e}")
+
                 # Update repository status
                 update_query = """
                 MATCH (r:Repository {hash: $hash})

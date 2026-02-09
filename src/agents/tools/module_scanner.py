@@ -184,7 +184,7 @@ class ModuleScanner:
             RETURN producer, consumer
             """
             
-            async with neo4j_client.get_session() as session:
+            async with neo4j_client.session() as session:
                 result = await session.run(query, {"module_name": module_name})
                 records = await result.data()
             
@@ -219,7 +219,7 @@ class ModuleScanner:
             RETURN route
             """
             
-            async with neo4j_client.get_session() as session:
+            async with neo4j_client.session() as session:
                 result = await session.run(query, {"module_name": module_name})
                 records = await result.data()
             
@@ -261,7 +261,7 @@ class ModuleScanner:
             RETURN DISTINCT dep.name as dependency
             """
             
-            async with neo4j_client.get_session() as session:
+            async with neo4j_client.session() as session:
                 result = await session.run(query, {"module_name": module_name})
                 records = await result.data()
             
@@ -276,7 +276,7 @@ class ModuleScanner:
             RETURN api.url as api_endpoint
             """
             
-            async with neo4j_client.get_session() as session:
+            async with neo4j_client.session() as session:
                 result = await session.run(query, {"module_name": module_name})
                 records = await result.data()
             

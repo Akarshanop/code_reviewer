@@ -1,6 +1,12 @@
 """
 Enterprise Agent Orchestrator for Code Intelligence Platform
 Manages PRD, QA, and Developer agent workflows with proper error handling and monitoring
+
+Enhanced with:
+    - Two-layer architecture (Reasoning Layer → Policy Layer)
+    - Role-based output shaping
+    - Trust-preserving silence
+    - Observable reasoning traces
 """
 import asyncio
 from typing import Dict, Any, List, Optional
@@ -17,6 +23,8 @@ from src.core.exceptions import AgentException
 from src.agents.workflows.prd_flow import prd_workflow
 from src.agents.workflows.qa_flow import qa_workflow
 from src.agents.workflows.developer_flow import developer_app
+from src.agents.policy_layer import policy_layer, PolicyOutput, UserRole
+from src.agents.reasoning_layer import reasoning_layer, ReasoningResult, ReasoningConclusion, ReasoningEvidence
 from config.settings import settings
 
 logger = get_logger(__name__)
@@ -33,7 +41,7 @@ class AgentType(Enum):
 class AgentConfig:
     """Configuration for agent execution"""
     max_tokens: int = 4096
-    temperature: float = 0.1
+    temperature: float = 0.2
     model: str = "gemini-2.5-flash"
     timeout_seconds: int = 300
     max_iterations: int = 10
@@ -509,6 +517,147 @@ class AgentOrchestrator:
         
         return tools_used
     
+    async def process_with_policy(
+        self,
+        question: str,
+        user_role: str = "developer",
+        chat_history: List[Dict[str, str]] = None,
+        context_files: List[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Two-layer processing: Reasoning → Policy.
+        
+        This is the recommended entry point for all agent interactions.
+        It applies RBAC and output shaping based on user role.
+        
+        Args:
+            question: User's question.
+            user_role: User's role (admin, architect, developer, qa, sales, viewer).
+            chat_history: Previous messages.
+            context_files: Context files.
+            
+        Returns:
+            PolicyOutput as dict — role-appropriate, redacted, confidence-scored.
+        """
+        # Step 1: Reasoning Layer (full graph access)
+        agent_result = await self.process_developer_question(
+            question=question,
+            chat_history=chat_history,
+            context_files=context_files,
+        )
+
+        raw_answer = agent_result.output.get("answer", "")
+        tools_used = agent_result.output.get("tools_used", [])
+
+        # Step 2: Build ReasoningResult from agent output with REAL confidence
+        if agent_result.success and raw_answer:
+            # Compute confidence from evidence quality, not a hardcoded value
+            tool_count = len(tools_used)
+            has_graph_tools = any(t in tools_used for t in [
+                "get_repository_architecture", "find_component", "get_api_flow",
+                "get_behavioral_classification", "get_security_surface",
+                "get_domain_context", "trace_cross_repo_flow", "get_file_dependencies",
+                "get_qa_risk_assessment", "get_codebase_metrics",
+            ])
+            has_code_tools = any(t in tools_used for t in [
+                "read_file_content", "search_code_pattern", "list_api_routes",
+            ])
+            has_search = "search_codebase" in tools_used
+
+            # Confidence scoring: tools that read actual code/graph = higher trust
+            if has_code_tools and has_graph_tools:
+                base_confidence = 0.90  # Both code AND graph evidence
+            elif has_code_tools:
+                base_confidence = 0.85  # Read actual code
+            elif has_graph_tools:
+                base_confidence = 0.80  # Graph-backed evidence
+            elif has_search:
+                base_confidence = 0.70  # Search-backed
+            elif tool_count > 0:
+                base_confidence = 0.65  # Some tool used
+            else:
+                base_confidence = 0.45  # No tools = LLM-only (low trust)
+
+            # Penalize very short answers (likely incomplete)
+            if len(raw_answer) < 100:
+                base_confidence *= 0.8
+
+            # Build evidence list from tools
+            evidence_items = []
+            for t in tools_used:
+                source = "graph_traversal" if t in (
+                    "get_repository_architecture", "find_component", "get_codebase_metrics",
+                    "get_behavioral_classification", "get_security_surface",
+                    "get_domain_context", "trace_cross_repo_flow", "get_file_dependencies",
+                    "get_qa_risk_assessment",
+                ) else "code_analysis" if t in (
+                    "read_file_content", "search_code_pattern", "list_api_routes",
+                ) else "vector_search" if t == "search_codebase" else "tool_call"
+
+                evidence_items.append(ReasoningEvidence(
+                    source=source,
+                    description=f"Data from {t}",
+                    confidence=base_confidence,
+                ))
+
+            if not evidence_items:
+                evidence_items.append(ReasoningEvidence(
+                    source="llm_generation",
+                    description="Generated without tool evidence (lower trust)",
+                    confidence=base_confidence,
+                ))
+
+            # Extract affected files from the answer (simple heuristic)
+            import re as _re
+            file_mentions = _re.findall(r"[\w/]+\.(?:js|ts|py|java|jsx|tsx)\b", raw_answer)
+
+            # Domain resolution on the question
+            from src.intelligence.domain_model import domain_engine as _de
+            domain_matches = _de.resolve_query_to_domains(question)
+            affected_domains = [d[0] for d in domain_matches[:3]]
+
+            conclusions = [
+                ReasoningConclusion(
+                    statement=raw_answer[:300],
+                    confidence=base_confidence,
+                    evidence=evidence_items,
+                    domain_context=affected_domains,
+                )
+            ]
+            reasoning_result = reasoning_layer.build_result(
+                conclusions=conclusions,
+                tools_used=tools_used,
+                affected_files=list(set(file_mentions))[:20],
+                affected_domains=affected_domains,
+                execution_time_seconds=agent_result.execution_time_seconds,
+            )
+        else:
+            reasoning_result = reasoning_layer.create_silence_result(
+                reason=agent_result.errors[0] if agent_result.errors else "No response generated"
+            )
+
+        # Step 3: Policy Layer (RBAC, redaction, shaping)
+        policy_output = policy_layer.apply_policy(
+            reasoning=reasoning_result,
+            role=user_role,
+            raw_answer=raw_answer,
+        )
+
+        return {
+            "answer": policy_output.answer,
+            "confidence": policy_output.confidence_label,
+            "risk_level": policy_output.risk_level,
+            "affected_domains": policy_output.affected_domains,
+            "impact_summary": policy_output.impact_summary,
+            "affected_files": policy_output.affected_files,
+            "evidence": policy_output.evidence_summary,
+            "uncertainty": policy_output.uncertainty_notes,
+            "is_silence": policy_output.is_silence,
+            "role_applied": policy_output.role_applied,
+            "tools_used": tools_used,
+            "execution_time_seconds": agent_result.execution_time_seconds,
+        }
+
     def get_stats(self) -> Dict[str, Any]:
         """Get orchestrator statistics"""
         return {
@@ -516,7 +665,9 @@ class AgentOrchestrator:
             "success_rate": (
                 self._stats["successful"] / self._stats["total_executions"] * 100
                 if self._stats["total_executions"] > 0 else 0
-            )
+            ),
+            "reasoning_layer": reasoning_layer.stats,
+            "policy_layer": policy_layer.stats,
         }
 
 

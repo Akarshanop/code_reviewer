@@ -8,11 +8,21 @@ import json
 from src.database.neo4j_client import neo4j_client
 from src.core.exceptions import GraphDatabaseException
 from src.core.logger import get_logger
+from src.intelligence.domain_model import domain_engine
+from src.intelligence.behavioral_layer import compute_behavioral_impact_score, BehavioralClassification, BehavioralNodeLabel
+from src.intelligence.evidence_links import format_confidence_for_agent
 
 logger = get_logger(__name__)
 
 class GraphService:
-    """Service for graph-based code analysis and queries"""
+    """
+    Service for graph-based code analysis and queries.
+    
+    Enhanced with:
+        - Domain-first query resolution
+        - Behavioral impact scoring
+        - Confidence-aware results
+    """
     
     def __init__(self):
         self.neo4j = neo4j_client
@@ -112,22 +122,55 @@ class GraphService:
                 logger.warning(f"Failed to execute impact analysis query: {name}", error=str(e))
                 results[name] = []
         
-        # Calculate impact score
+        # Calculate impact score (enhanced with behavioral intelligence)
         total_components = len(results.get("direct_dependencies", []))
         total_apis = len(results.get("api_calls", []))
         total_eventbus = len(results.get("eventbus_flows", []))
         
-        impact_score = min(100, (total_components * 5) + (total_apis * 10) + (total_eventbus * 15))
+        # Base structural score
+        structural_score = min(100, (total_components * 5) + (total_apis * 10) + (total_eventbus * 15))
+        
+        # Behavioral enrichment: check if file contains behaviorally-critical nodes
+        behavioral_flags = []
+        behavioral_boost = 0
+        try:
+            behavioral_query = """
+            MATCH (f:File {path: $file_path})-[:CONTAINS]->(n)
+            WHERE n.behavioral_labels IS NOT NULL
+            RETURN n.behavioral_labels AS labels, n.name AS name
+            """
+            beh_results = await self.neo4j.execute_query(behavioral_query, {"file_path": file_path})
+            for rec in (beh_results or []):
+                labels = rec.get("labels", [])
+                if isinstance(labels, list):
+                    behavioral_flags.extend(labels)
+                    if "AuthCritical" in labels:
+                        behavioral_boost += 20
+                    if "TransactionBoundary" in labels:
+                        behavioral_boost += 15
+                    if "AsyncFanOut" in labels:
+                        behavioral_boost += 10
+        except Exception:
+            pass  # Behavioral enrichment is best-effort
+        
+        impact_score = min(100, structural_score + behavioral_boost)
+        
+        # Domain context
+        domains = domain_engine.infer_domain_for_node(file_path=file_path)
+        domain_names = [d[0] for d in domains[:3]]
         
         return {
             "file": file_path,
             "impact_score": impact_score,
-            "risk_level": "high" if impact_score > 50 else "medium" if impact_score > 20 else "low",
+            "risk_level": "critical" if impact_score > 75 else "high" if impact_score > 50 else "medium" if impact_score > 20 else "low",
             "breakdown": {
                 "components_affected": total_components,
                 "apis_affected": total_apis,
-                "eventbus_flows_affected": total_eventbus
+                "eventbus_flows_affected": total_eventbus,
+                "behavioral_boost": behavioral_boost,
             },
+            "behavioral_flags": list(set(behavioral_flags)),
+            "domains": domain_names,
             "details": results
         }
     

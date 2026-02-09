@@ -38,24 +38,15 @@ try:
     import google.auth
     from google.auth.transport.requests import Request
     from google.oauth2.service_account import Credentials
-    from google.cloud import aiplatform
-    # google-cloud-aiplatform has changed internal module paths across versions.
-    # Keep imports flexible so the service doesn't get disabled by ImportError.
-    try:
-        from google.cloud.aiplatform_v1.services.prediction_service import (
-            PredictionServiceAsyncClient,
-        )
-    except ImportError:  # pragma: no cover
-        from google.cloud.aiplatform.gapic.services.prediction_service import (
-            PredictionServiceAsyncClient,
-        )
-    from google.api_core.gapic_v1 import client_info as client_info_lib
+    import vertexai  # noqa: F401 – used inside methods
+    from vertexai.language_models import TextEmbeddingModel  # noqa: F401
 except ImportError:
     logger.warning(
-        "Google Cloud libraries not installed or incompatible. Install/upgrade google-cloud-aiplatform."
+        "Google Cloud / Vertex AI libraries not installed or incompatible. "
+        "Install google-cloud-aiplatform and vertexai."
     )
     Credentials = Any
-    PredictionServiceAsyncClient = Any
+    TextEmbeddingModel = Any
 
 
 class EmbeddingService:
@@ -70,7 +61,6 @@ class EmbeddingService:
         self._initialized = False
         self._init_lock = asyncio.Lock()
         self._credentials: Optional[Credentials] = None
-        self._client: Optional[PredictionServiceAsyncClient] = None
         
         # Load service account credentials
         if not self.project_id:
@@ -110,15 +100,17 @@ class EmbeddingService:
                 logger.info(f"Project: {self.project_id}, Region: {self.region}")
 
                 # Initialize Vertex AI with service account credentials
-                if os.path.exists(self.service_account_file):
-                    aiplatform.init(
+                import vertexai
+
+                if self.service_account_file and os.path.exists(self.service_account_file):
+                    vertexai.init(
                         project=self.project_id,
                         location=self.region,
                         credentials=self._get_credentials(),
                     )
                 else:
                     # Use default credentials (Application Default Credentials)
-                    aiplatform.init(project=self.project_id, location=self.region)
+                    vertexai.init(project=self.project_id, location=self.region)
 
                 logger.info("Google Vertex AI initialized successfully")
 
@@ -173,27 +165,25 @@ class EmbeddingService:
         wait=wait_exponential(multiplier=2, min=4, max=30)
     )
     async def _call_vertex_api(self, texts: List[str]) -> List[List[float]]:
-        """Call Google Vertex AI Text Embedding API to get embeddings"""
+        """Call Google Vertex AI Text Embedding API to get embeddings.
+        
+        Uses vertexai.language_models.TextEmbeddingModel which is the
+        supported path in google-cloud-aiplatform >= 1.x.  The underlying
+        get_embeddings() call is synchronous (gRPC), so we run it in a
+        thread-pool via asyncio.to_thread() to avoid blocking the event loop.
+        """
         if not self._initialized:
             await self.initialize()
         
         try:
-            from google.cloud import aiplatform
+            import vertexai
+            from vertexai.language_models import TextEmbeddingModel
 
-            # Use the TextEmbeddingModel for synchronous calls (async wrapper).
-            # Depending on google-cloud-aiplatform version, the class may be exposed
-            # via google.cloud.aiplatform or via the vertexai module.
-            if hasattr(aiplatform, "TextEmbeddingModel"):
-                model = aiplatform.TextEmbeddingModel.from_pretrained(self.model_name)
-            else:  # pragma: no cover
-                import vertexai
-                from vertexai.language_models import TextEmbeddingModel
-
-                vertexai.init(project=self.project_id, location=self.region)
-                model = TextEmbeddingModel.from_pretrained(self.model_name)
+            model = TextEmbeddingModel.from_pretrained(self.model_name)
             
-            # Generate embeddings
-            embeddings = model.get_embeddings(texts)
+            # get_embeddings() is synchronous / blocking — run in a thread
+            # so the async event loop is not starved.
+            embeddings = await asyncio.to_thread(model.get_embeddings, texts)
             
             # Extract vectors from Embedding objects
             embedding_vectors = [emb.values for emb in embeddings]

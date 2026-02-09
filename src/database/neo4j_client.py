@@ -94,6 +94,23 @@ class Neo4jClient:
             "CREATE INDEX IF NOT EXISTS FOR (n:ApiCall) ON (n.url)",
             "CREATE INDEX IF NOT EXISTS FOR (n:Module) ON (n.name)",
             "CREATE INDEX IF NOT EXISTS FOR (n:File) ON (n.path)",
+
+            # --- Intelligence Layer indexes ---
+            # Behavioral classification
+            "CREATE INDEX IF NOT EXISTS FOR (n:Function) ON (n.behavioral_labels)",
+            "CREATE INDEX IF NOT EXISTS FOR (n:VertxRoute) ON (n.behavioral_labels)",
+            # Temporal metadata
+            "CREATE INDEX IF NOT EXISTS FOR (n:File) ON (n.volatility_score)",
+            "CREATE INDEX IF NOT EXISTS FOR (n:Function) ON (n.volatility_score)",
+            # Domain inference
+            "CREATE INDEX IF NOT EXISTS FOR (n:File) ON (n.domain)",
+            # Evidence-weighted edges (composite index on confidence)
+            "CREATE INDEX IF NOT EXISTS FOR ()-[r:CALLS_ROUTE]-() ON (r.confidence_score)",
+            "CREATE INDEX IF NOT EXISTS FOR ()-[r:GUARDS]-() ON (r.confidence_score)",
+            # Domain node type
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Domain) REQUIRE n.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Capability) REQUIRE n.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (n:PRD) REQUIRE n.id IS UNIQUE",
         ]
         
         # Fulltext index created separately (can be slow)
