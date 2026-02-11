@@ -16,7 +16,7 @@ dependencies = [
     "langgraph>=0.2.0,<1.0.0",
     "litellm>=1.50.0,<2.0.0",
     "tree-sitter>=0.21.0,<0.22.0",
-    "tree-sitter-languages>=1.9.0,<1.10.0",
+    "tree-sitter-languages>=1.9.0,<1.11.0",
     "gitpython>=3.1.46,<4.0.0",
     "supabase>=2.10.0,<3.0.0",
     "langchain>=0.3.0,<1.0.0",
@@ -28,6 +28,10 @@ dependencies = [
     "structlog>=24.0.0,<25.0.0",
     "google-cloud-aiplatform>=1.44.0,<2.0.0",
     "google-auth>=2.26.0,<3.0.0",
+    "fpdf2>=2.8.0,<3.0.0",
+    "weasyprint>=62.0,<63.0",
+    "pydyf>=0.11.0,<0.12.0",
+    "pygments>=2.17.0,<3.0.0",
 ]
 
 [project.optional-dependencies]

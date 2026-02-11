@@ -19,6 +19,9 @@ class ChatRequest(BaseModel):
     repository_filter: Optional[List[str]] = Field(default_factory=list)
     context_files: Optional[List[str]] = Field(default_factory=list, description="Specific files for context")
     session_id: Optional[str] = Field(default=None, description="Session ID for conversation persistence")
+    user_role: Optional[str] = Field(default=None, description="User role for role-aware routing: admin, architect, developer, qa, sales, viewer")
+    agent_type: Optional[str] = Field(default=None, description="Agent type: developer_assistant, qa_engineer, sales_advisor, system_architect")
+    user_id: Optional[str] = Field(default=None, description="Authenticated user ID")
 
 
 class ChatResponse(BaseModel):

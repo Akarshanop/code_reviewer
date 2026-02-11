@@ -9,6 +9,7 @@ from fastapi import HTTPException, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import redis.asyncio as redis
 from config.settings import settings
+from src.core.logger import get_logger
 
 logger = get_logger(__name__)
 

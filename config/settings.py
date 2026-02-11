@@ -196,7 +196,7 @@ class Settings(BaseSettings):
     
     # LLM Parameters
     LLM_TEMPERATURE: float = Field(default=0.1)
-    LLM_MAX_TOKENS: int = Field(default=4096)
+    LLM_MAX_TOKENS: int = Field(default=8192)
     LLM_TIMEOUT: int = Field(default=120)
     LLM_MAX_RETRIES: int = Field(default=3)
     
