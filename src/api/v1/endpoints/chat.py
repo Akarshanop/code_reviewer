@@ -4,17 +4,28 @@ Provides interactive conversations with developer assistant agent
 
 Enhanced with:
     - Role-aware endpoint (two-layer: Reasoning → Policy)
+    - PRD → QA → PDF pipeline
     - Confidence scoring in responses
     - Trust-preserving silence
 """
 import uuid
+import os
 from typing import Dict, Any, List, Optional
 from datetime import datetime
+from pathlib import Path
 from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel, Field
 import json
 import asyncio
+
+from src.core.exceptions import (
+    ValidationException,
+    InternalServerException,
+    AgentException as AgentExceptionHTTP,
+    LLMServiceException,
+    ResourceNotFoundException,
+)
 from src.schemas.chat_schema import ChatResponse, ChatRequest, PRDRequest, QARequest, JobStatus
 from src.core.logger import get_logger
 from src.agents.orchestrator import agent_orchestrator
@@ -33,26 +44,35 @@ class RoleAwareChatRequest(BaseModel):
     context_files: Optional[List[str]] = Field(default_factory=list)
     session_id: Optional[str] = None
 
+
+class PRDGenerateRequest(BaseModel):
+    """Request for PRD + QA generation pipeline."""
+    client_requirements: str = Field(..., min_length=20, max_length=50000, description="Client requirements text")
+    business_context: Optional[str] = Field(default="", description="Business context and background")
+    constraints: Optional[str] = Field(default="", description="Performance, security, timeline constraints")
+    prd_format_template: Optional[str] = Field(default="", description="Custom PRD format template")
+
 # In-memory job storage (use Redis in production)
 _job_store: Dict[str, Dict[str, Any]] = {}
 
 @router.post("/ask", response_model=ChatResponse)
 async def chat_with_ai(request: ChatRequest):
     """
-    Interactive chat with AI developer assistant.
+    Interactive chat with AI assistant — role-aware.
     
-    The assistant can:
-    - Search the codebase semantically
-    - Analyze impact of changes
-    - Find components and their dependencies
-    - Explain API flows
-    - Provide debugging assistance
+    Routes to the correct agent based on user_role:
+    - sales → Sales advisor (ELI5, no code)
+    - qa → Developer assistant (test-oriented view via policy)
+    - developer/architect/admin → Developer assistant (full detail)
+    
+    All responses go through the Policy Layer for RBAC and output shaping.
     """
     try:
         logger.info(
             "Processing chat request",
             question_length=len(request.question),
-            has_history=len(request.chat_history) >= 0
+            user_role=request.user_role,
+            agent_type=request.agent_type,
         )
         
         # Ensure orchestrator is initialized
@@ -64,43 +84,67 @@ async def chat_with_ai(request: ChatRequest):
             for msg in (request.chat_history or [])
         ]
         
-        # Process through developer agent
-        result = await agent_orchestrator.process_developer_question(
+        # Determine effective role
+        user_role = request.user_role or "developer"
+        
+        # Route through policy layer for role-aware processing
+        policy_result = await agent_orchestrator.process_with_policy(
             question=request.question,
+            user_role=user_role,
             chat_history=history,
-            context_files=request.context_files
+            context_files=request.context_files,
         )
         
         # Generate session ID if not provided
         session_id = request.session_id or str(uuid.uuid4())
         
+        answer = policy_result.get("answer", "I couldn't process your question. Please try again.")
+        tools_used = policy_result.get("tools_used", [])
+        execution_time = policy_result.get("execution_time_seconds", 0.0)
+        is_silence = policy_result.get("is_silence", False)
+        
         # Store conversation in Supabase if available
-        if supabase_client and result.success:
+        if supabase_client and not is_silence:
             try:
                 await _store_conversation(
                     session_id=session_id,
                     question=request.question,
-                    answer=result.output.get("answer", ""),
+                    answer=answer,
                     metadata={
-                        "tools_used": result.output.get("tools_used", []),
-                        "execution_time": result.execution_time_seconds
+                        "tools_used": tools_used,
+                        "execution_time": execution_time,
+                        "role_applied": policy_result.get("role_applied", user_role),
                     }
                 )
             except Exception as e:
                 logger.warning(f"Failed to store conversation: {e}")
         
         # Generate follow-up suggestions
-        followups = _generate_followups(request.question, result.output.get("answer", ""))
+        followups = _generate_followups(request.question, answer)
+        
+        # Map confidence label to numeric for ChatResponse schema
+        confidence_label = policy_result.get("confidence", "unknown")
+        confidence_numeric = 0.9  # default
+        if confidence_label == "low confidence":
+            confidence_numeric = 0.4
+        elif confidence_label == "uncertain":
+            confidence_numeric = 0.5
+        elif confidence_label == "moderate confidence":
+            confidence_numeric = 0.7
+        elif confidence_label == "high confidence":
+            confidence_numeric = 0.9
+        elif confidence_label == "insufficient certainty":
+            confidence_numeric = 0.2
         
         return ChatResponse(
-            status="success" if result.success else "partial",
-            answer=result.output.get("answer", "I couldn't process your question. Please try again."),
-            confidence=0.9 if result.success else 0.5,
-            sources=[],  # TODO: Extract sources from context
+            status="silence" if is_silence else "success",
+            answer=answer,
+            confidence=confidence_numeric,
+            sources=[],
             followups=followups,
-            tools_used=result.output.get("tools_used", []),
-            execution_time_seconds=result.execution_time_seconds,
-            session_id=session_id
+            tools_used=tools_used,
+            execution_time_seconds=execution_time,
+            session_id=session_id,
         )
         
     except Exception as e:
@@ -408,6 +452,98 @@ async def cancel_job(job_id: str):
         raise
     except Exception as e:
         logger.error(f"Job cancellation failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/generate-prd")
+async def generate_prd_with_qa(request: PRDGenerateRequest):
+    """
+    Generate enterprise-grade PRD + QA Test Plan (both as PDFs).
+
+    This endpoint:
+    1. Runs the PRD Agent (searches codebase, generates structured PRD)
+    2. Auto-runs the QA Agent (generates test plan from PRD)
+    3. Generates both documents as PDFs
+    4. Returns download URLs for both PDFs
+
+    The PRD Agent is strictly codebase-grounded — zero hallucination.
+    """
+    try:
+        logger.info(
+            "Starting PRD+QA generation pipeline",
+            requirements_length=len(request.client_requirements),
+        )
+
+        await agent_orchestrator.initialize()
+
+        result = await agent_orchestrator.generate_prd_with_qa(
+            client_requirements=request.client_requirements,
+            business_context=request.business_context or "",
+            constraints=request.constraints or "",
+            prd_format_template=request.prd_format_template or "",
+        )
+
+        if not result.get("success"):
+            return {
+                "status": "failed",
+                "error": result.get("error", "Unknown error"),
+                "errors": result.get("errors", []),
+            }
+
+        # Build download URLs
+        prd_pdf = result.get("prd_pdf_path", "")
+        qa_pdf = result.get("qa_pdf_path", "")
+
+        prd_filename = os.path.basename(prd_pdf) if prd_pdf else ""
+        qa_filename = os.path.basename(qa_pdf) if qa_pdf else ""
+
+        return {
+            "status": "success",
+            "feature_name": result.get("feature_name", ""),
+            "prd_pdf_url": f"/api/v1/chat/download-pdf/{prd_filename}" if prd_filename else None,
+            "qa_pdf_url": f"/api/v1/chat/download-pdf/{qa_filename}" if qa_filename else None,
+            "prd_data": result.get("prd_data", {}),
+            "qa_data": result.get("qa_data", {}),
+            "prd_tools_used": result.get("prd_tools_used", []),
+            "qa_tools_used": result.get("qa_tools_used", []),
+            "execution_time_seconds": result.get("execution_time_seconds", 0.0),
+        }
+
+    except ValidationException:
+        raise
+    except Exception as e:
+        logger.error(f"PRD+QA generation failed: {e}", exc_info=True)
+        raise AgentExceptionHTTP(
+            message=f"PRD generation pipeline failed: {str(e)}",
+            agent_type="prd_agent"
+        )
+
+
+@router.get("/download-pdf/{filename}")
+async def download_pdf(filename: str):
+    """Download a generated PDF document (PRD or QA Test Plan)."""
+    try:
+        from src.services.pdf_service import PDF_OUTPUT_DIR
+
+        filepath = PDF_OUTPUT_DIR / filename
+
+        if not filepath.exists():
+            raise ResourceNotFoundException("PDF", filename)
+
+        # Security: ensure the file is within the output directory
+        if not str(filepath.resolve()).startswith(str(PDF_OUTPUT_DIR.resolve())):
+            raise HTTPException(status_code=403, detail="Access denied")
+
+        return FileResponse(
+            path=str(filepath),
+            filename=filename,
+            media_type="application/pdf",
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"PDF download failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

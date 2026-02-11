@@ -1,128 +1,73 @@
-version: '3.8'
+# =============================================================================
+# Code Intelligence Platform — Docker Compose
+# =============================================================================
+#
+# Your infrastructure is ALL cloud-hosted:
+#   - Supabase Cloud   → SUPABASE_URL in .env
+#   - Neo4j Aura       → NEO4J_URI in .env
+#   - Qdrant Cloud     → QDRANT_URL in .env
+#   - Gemini API       → GEMINI_API_KEY in .env
+#
+# So this compose file only runs the API server.
+# No local database containers needed.
+#
+# Usage:
+#   docker compose up --build        (build + start)
+#   docker compose up -d             (start in background)
+#   docker compose down              (stop)
+#   docker compose logs -f api       (tail logs)
+#
+# =============================================================================
 
 services:
-  # =============================================================================
-  # API Server
-  # =============================================================================
+
+  # ===========================================================================
+  # API Server — the only container you need
+  # ===========================================================================
   api:
+    # Build from the Dockerfile in docker/ folder, using backend root as context
     build:
       context: .
       dockerfile: docker/Dockerfile
+
+    # Container name shown in Docker Desktop
     container_name: code-intel-api
-    command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
-    volumes:
-      - .:/app
-      - ./data/repos:/app/data/repos  # Repository storage
+
+    # Map port 8000 inside container → port 8000 on your Mac
+    # Access the API at http://localhost:8000
     ports:
       - "8000:8000"
-    depends_on:
-      neo4j:
-        condition: service_healthy
-      qdrant:
-        condition: service_healthy
+
+    # Load ALL environment variables from your .env file
+    # This is how the container gets your Supabase, Neo4j, Qdrant,
+    # Gemini API keys etc. without baking them into the image.
     env_file:
       - .env
+
+    # Additional env vars (override or supplement .env)
     environment:
       - PYTHONPATH=/app
-    networks:
-      - code-intel-network
+
+    # Mount local folders INTO the container so data persists
+    # even when the container is rebuilt or restarted.
+    volumes:
+      # Cloned GitLab repos persist on your Mac's disk
+      - ./data/repos:/app/data/repos
+
+      # Generated PRD/QA PDFs are saved to your Mac's disk
+      - ./generated_pdfs:/app/generated_pdfs
+
+      # Google Cloud service account file (read-only mount)
+      # Your .env references ./service.json for Vertex AI auth
+      - ./service.json:/app/service.json:ro
+
+    # Auto-restart if the container crashes (but not if you manually stop it)
+    restart: unless-stopped
+
+    # Docker Desktop shows a green/red health indicator based on this
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/admin/live"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s
-
-  # =============================================================================
-  # Neo4j Graph Database
-  # =============================================================================
-  neo4j:
-    image: neo4j:5.19-community
-    container_name: code-intel-neo4j
-    ports:
-      - "7474:7474"  # HTTP
-      - "7687:7687"  # Bolt
-    environment:
-      - NEO4J_AUTH=neo4j/your-neo4j-password
-      - NEO4J_PLUGINS=["apoc"]
-      - NEO4J_dbms_security_procedures_allowlist=apoc.*
-      - NEO4J_dbms_memory_heap_initial__size=512m
-      - NEO4J_dbms_memory_heap_max__size=2g
-      - NEO4J_dbms_memory_pagecache_size=512m
-    volumes:
-      - neo4j-data:/data
-      - neo4j-logs:/logs
-      - neo4j-plugins:/plugins
-    networks:
-      - code-intel-network
-    healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-
-  # =============================================================================
-  # Qdrant Vector Database
-  # =============================================================================
-  qdrant:
-    image: qdrant/qdrant:v1.10.1
-    container_name: code-intel-qdrant
-    ports:
-      - "6333:6333"  # HTTP
-      - "6334:6334"  # gRPC
-    environment:
-      - QDRANT__SERVICE__GRPC_PORT=6334
-      - QDRANT__SERVICE__HTTP_PORT=6333
-    volumes:
-      - qdrant-data:/qdrant/storage
-    networks:
-      - code-intel-network
-    healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:6333/"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 10s
-
-  # =============================================================================
-  # PostgreSQL (for local development without Supabase)
-  # =============================================================================
-  postgres:
-    image: postgres:16-alpine
-    container_name: code-intel-postgres
-    ports:
-      - "5432:5432"
-    environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=password
-      - POSTGRES_DB=code_intel
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-      - ./supabase/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
-    networks:
-      - code-intel-network
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    profiles:
-      - with-postgres  # Only run when explicitly requested
-
-# =============================================================================
-# Networks
-# =============================================================================
-networks:
-  code-intel-network:
-    driver: bridge
-
-# =============================================================================
-# Volumes
-# =============================================================================
-volumes:
-  neo4j-data:
-  neo4j-logs:
-  neo4j-plugins:
-  qdrant-data:
-  postgres-data:
+      start_period: 60s

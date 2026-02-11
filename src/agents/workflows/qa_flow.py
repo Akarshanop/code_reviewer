@@ -1,303 +1,140 @@
 """
-QA Test Generation Workflow using LangGraph
-Generates comprehensive testing strategies based on PRD and architectural blueprints
+QA Test Plan Generator Workflow using LangGraph (Tool-Calling Agent)
+Auto-generates comprehensive QA Test Plans from PRD output.
 
-Enhanced with:
-    - QA Projection Layer (async chains, failure surfaces, race windows)
-    - Behavioral-aware test intent generation
-    - Volatility hotspot detection
+Key principles:
+    - AUTO-GENERATED from PRD (no user interaction needed)
+    - Covers ALL 5 testing types: Unit, Integration, System, Regression, Performance
+    - Every test case maps to a real PRD requirement
+    - Uses Gemini 2.5 Pro for maximum quality
+    - References real code artifacts from the codebase
 """
-import logging
-import yaml
 import json
-from typing import Dict, Any, List
+import yaml
+from typing import Dict, Any, List, Literal
 from pathlib import Path
 from datetime import datetime
 
 from langgraph.graph import StateGraph, END
-from langchain.prompts import PromptTemplate
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+from langchain_core.tools import tool
 from litellm import acompletion
 
-from src.services.search_service import SearchService
-from src.services.graph_service import GraphService
-from src.agents.state_schema import QAState
-from src.intelligence.qa_projection import qa_projection_engine
 from config.settings import settings
+from src.agents.state_schema import QAState
 from src.core.logger import get_logger
-from src.core.exceptions import AgentException
+from src.core.exceptions import AgentException, LLMServiceException
 
 logger = get_logger(__name__)
 
-# Load prompts
-PROMPTS_PATH = Path(__file__).parent.parent.parent.parent / "config" / "qa_prompt.yaml"
+# Load ALL QA prompts from qa_prompt.yaml ONLY (fully separated from prd_prompt.yaml)
+QA_PROMPTS_PATH = Path(__file__).parent.parent.parent.parent / "config" / "qa_prompt.yaml"
+
+qa_prompts = {}
 try:
-    with open(PROMPTS_PATH, 'r') as f:
-        prompts = yaml.safe_load(f) or {}
+    with open(QA_PROMPTS_PATH, 'r') as f:
+        qa_prompts = yaml.safe_load(f) or {}
 except FileNotFoundError:
-    logger.warning(f"QA prompts file not found: {PROMPTS_PATH}")
-    prompts = {}
+    logger.warning(f"QA prompts file not found: {QA_PROMPTS_PATH}")
 
-# Default QA prompt if file not found
-DEFAULT_QA_PROMPT = """
-You are a Senior QA Engineer analyzing a feature implementation to generate comprehensive test strategies.
-
-## PRD Summary:
-{prd_text}
-
-## Architectural Blueprint:
-{design_blueprint}
-
-## Codebase Context (existing tests and patterns):
-{context}
-
-## Test Focus Areas:
-{test_focus}
-
-Generate a comprehensive testing strategy covering:
-1. Unit Tests - For individual components and functions
-2. Integration Tests - For API endpoints and service interactions
-3. E2E Tests - For complete user workflows
-4. Edge Case Tests - For boundary conditions and error handling
-5. Performance Tests - For load and stress scenarios
-6. Security Tests - For authentication, authorization, and data validation
-
-Return a JSON response with this structure:
-{{
-    "summary": {{
-        "total_test_cases": number,
-        "estimated_coverage": "percentage",
-        "priority_tests": ["list of critical tests"],
-        "risk_areas": ["areas needing extra testing"]
-    }},
-    "unit_tests": [
-        {{
-            "test_name": "string",
-            "component": "string",
-            "description": "string",
-            "test_cases": [
-                {{
-                    "name": "string",
-                    "input": "description",
-                    "expected_output": "description",
-                    "priority": "high|medium|low"
-                }}
-            ],
-            "mocking_requirements": ["list"]
-        }}
-    ],
-    "integration_tests": [
-        {{
-            "test_name": "string",
-            "endpoints_covered": ["list"],
-            "description": "string",
-            "test_scenarios": [],
-            "dependencies": ["services/databases needed"]
-        }}
-    ],
-    "e2e_tests": [
-        {{
-            "test_name": "string",
-            "user_journey": "string",
-            "steps": [],
-            "assertions": [],
-            "setup_requirements": []
-        }}
-    ],
-    "edge_case_tests": [
-        {{
-            "category": "string",
-            "test_cases": [],
-            "risk_level": "high|medium|low"
-        }}
-    ],
-    "performance_tests": [
-        {{
-            "test_name": "string",
-            "type": "load|stress|endurance|spike",
-            "metrics": [],
-            "thresholds": {{}}
-        }}
-    ],
-    "race_condition_tests": [
-        {{
-            "scenario": "string",
-            "eventbus_address": "string if applicable",
-            "test_approach": "string",
-            "potential_issues": ["list"]
-        }}
-    ],
-    "test_data_requirements": {{
-        "fixtures": [],
-        "seed_data": [],
-        "mock_services": []
-    }}
-}}
-"""
+QA_SYSTEM_PROMPT = qa_prompts.get('qa_engineer_system', "You are a Senior QA Engineer.")
+QA_JSON_FORMAT = qa_prompts.get('qa_json_output_format', "")
 
 
-async def analyze_blueprint_for_testing(state: QAState) -> QAState:
-    """Analyze the design blueprint to identify testing requirements"""
+# ---------------------------------------------------------------------------
+# QA-specific tools (graph-backed, intelligence-powered)
+# ---------------------------------------------------------------------------
+
+@tool
+async def find_existing_test_patterns() -> Dict[str, Any]:
+    """
+    Search for existing test files, test frameworks, and testing utilities in the codebase.
+    USE THIS FIRST to understand the current testing approach and adopt the same patterns.
+
+    Returns:
+        Existing test files, frameworks used, and test patterns.
+    """
     try:
-        blueprint = state.get('design_blueprint', {})
-        
-        # Extract key testing targets from blueprint
-        testing_targets = {
-            "components_to_test": [],
-            "apis_to_test": [],
-            "eventbus_flows": [],
-            "dtos_to_validate": [],
-            "breaking_changes": [],
-            "high_risk_areas": []
-        }
-        
-        # Extract affected components
-        for component in blueprint.get('affected_components', []):
-            if isinstance(component, dict):
-                testing_targets["components_to_test"].append({
-                    "name": component.get("name"),
-                    "type": component.get("type"),
-                    "change_type": component.get("change_type")
-                })
-        
-        # Extract API changes
-        dependency_graph = blueprint.get('dependency_graph', {})
-        for backend_change in dependency_graph.get('backend_changes', []):
-            if isinstance(backend_change, dict) and 'endpoint' in str(backend_change):
-                testing_targets["apis_to_test"].append(backend_change)
-        
-        # Extract EventBus flows (high priority for race condition testing)
-        for flow in dependency_graph.get('eventbus_flows', []):
-            testing_targets["eventbus_flows"].append(flow)
-        
-        # Identify breaking changes
-        risk_mitigation = blueprint.get('risk_mitigation', {})
-        testing_targets["breaking_changes"] = risk_mitigation.get('breaking_changes', [])
-        
-        # Store analysis results
-        if 'retrieved_context' not in state or state['retrieved_context'] is None:
-            state['retrieved_context'] = {}
-        
-        state['retrieved_context']['testing_targets'] = testing_targets
-        
-        logger.info(
-            "Blueprint analyzed for testing",
-            components=len(testing_targets["components_to_test"]),
-            apis=len(testing_targets["apis_to_test"]),
-            eventbus_flows=len(testing_targets["eventbus_flows"])
-        )
-        
-        return state
-        
-    except Exception as e:
-        logger.error(f"Blueprint analysis failed: {e}")
-        if 'errors' not in state:
-            state['errors'] = []
-        state['errors'].append(f"Blueprint analysis failed: {str(e)}")
-        return state
-
-
-async def retrieve_existing_tests(state: QAState) -> QAState:
-    """Retrieve existing test patterns from the codebase"""
-    try:
+        from src.services.search_service import SearchService
         search_service = SearchService()
         await search_service.initialize()
-        
-        existing_tests = {
-            "unit_test_patterns": [],
-            "integration_test_patterns": [],
-            "test_utilities": []
-        }
-        
-        # Search for existing test patterns
-        try:
-            # Search for unit tests
-            unit_test_results = await search_service.search_codebase(
-                query="unit test describe it expect mock",
-                search_type="semantic",
-                top_k=10,
-                filters={"type": "test"}
-            )
-            existing_tests["unit_test_patterns"] = unit_test_results.get("results", {}).get("combined", [])[:5]
-            
-            # Search for integration tests
-            integration_results = await search_service.search_codebase(
-                query="integration test API endpoint request response",
-                search_type="semantic",
-                top_k=10
-            )
-            existing_tests["integration_test_patterns"] = integration_results.get("results", {}).get("combined", [])[:5]
-            
-        except Exception as e:
-            logger.warning(f"Test pattern search failed: {e}")
-        
-        # Merge with existing context
-        if 'retrieved_context' not in state or state['retrieved_context'] is None:
-            state['retrieved_context'] = {}
-        
-        state['retrieved_context']['existing_tests'] = existing_tests
-        
-        logger.info(
-            "Retrieved existing test patterns",
-            unit_patterns=len(existing_tests["unit_test_patterns"]),
-            integration_patterns=len(existing_tests["integration_test_patterns"])
+
+        results = await search_service.search_codebase(
+            query="test describe it expect mock jest mocha beforeEach afterEach pytest unittest",
+            search_type="semantic",
+            top_k=15,
         )
-        
-        return state
-        
+        combined = results.get("results", {}).get("combined", [])
+
+        return {
+            "test_files": [
+                {
+                    "file": r.get("file_path", r.get("metadata", {}).get("file_path", "")),
+                    "preview": str(r.get("content", ""))[:300],
+                    "score": round(r.get("score", 0), 3),
+                }
+                for r in combined[:8]
+            ],
+            "total_test_files": len(combined),
+        }
     except Exception as e:
-        logger.error(f"Test retrieval failed: {e}")
-        if 'errors' not in state:
-            state['errors'] = []
-        state['errors'].append(f"Test retrieval failed: {str(e)}")
-        return state
+        return {"error": str(e)}
 
 
-async def enrich_with_intelligence(state: QAState) -> QAState:
+@tool
+async def get_all_api_routes() -> Dict[str, Any]:
     """
-    Enrich QA context with behavioral, domain, and security intelligence.
-    This is the key step that connects the intelligence layer to QA output.
+    List all API routes with methods and handlers. Essential for integration
+    and system testing — every route should have test coverage.
+
+    Returns:
+        Complete API route inventory.
+    """
+    try:
+        from src.database.neo4j_client import neo4j_client
+        await neo4j_client.initialize()
+
+        query = """
+        MATCH (r:VertxRoute)
+        RETURN r.path as path, r.method as method, r.handler_method as handler,
+               r.file as file
+        ORDER BY r.path
+        """
+        routes = await neo4j_client.execute_query(query)
+
+        return {
+            "routes": [
+                {"path": r["path"], "method": r.get("method", ""), "handler": r.get("handler", ""), "file": r.get("file", "")}
+                for r in (routes or [])
+            ],
+            "total_routes": len(routes or []),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+async def get_behavioral_hotspots() -> Dict[str, Any]:
+    """
+    Identify behaviorally risky areas needing extra testing: AuthCritical,
+    TransactionBoundary, SideEffecting, AsyncFanOut nodes.
+
+    Returns:
+        Risky routes with behavioral labels and specific test recommendations.
     """
     try:
         from src.database.neo4j_client import neo4j_client
         from src.intelligence.behavioral_layer import behavioral_classifier
-        from src.intelligence.domain_model import domain_engine
         await neo4j_client.initialize()
 
-        intelligence_context: Dict[str, Any] = {
-            "security_surface": {"protected_routes": 0, "unprotected_mutation_routes": []},
-            "behavioral_hotspots": [],
-            "domain_context": [],
-        }
-
-        # --- 1. Security surface: mutation routes without auth ---
-        mutation_query = """
-        MATCH (r:VertxRoute)
-        WHERE r.method IN ['POST', 'PUT', 'DELETE', 'PATCH']
-        RETURN r.path as path, r.method as method, r.handler_method as handler, r.file as file
-        """
-        mutations = await neo4j_client.execute_query(mutation_query)
-        unprotected = []
-        protected_count = 0
-        for m in (mutations or []):
-            handler = (m.get("handler") or "").lower()
-            if any(kw in handler for kw in ["auth", "middleware", "protect", "guard"]):
-                protected_count += 1
-            else:
-                unprotected.append({
-                    "method": m["method"], "path": m["path"],
-                    "handler": m.get("handler", ""), "file": m.get("file", ""),
-                })
-        intelligence_context["security_surface"]["protected_routes"] = protected_count
-        intelligence_context["security_surface"]["unprotected_mutation_routes"] = unprotected[:15]
-
-        # --- 2. Behavioral hotspots: classify routes ---
         routes_query = """
         MATCH (r:VertxRoute)
-        RETURN r.name as name, r.method as http_method, r.handler_method as handler, 
-               r.file as file, labels(r) as labels
-        LIMIT 50
+        RETURN r.name as name, r.method as http_method, r.handler_method as handler,
+               r.path as path, r.file as file, labels(r) as labels
         """
         routes = await neo4j_client.execute_query(routes_query)
+
+        hotspots = []
         for node in (routes or []):
             cls = behavioral_classifier.classify_node(
                 node_id=node.get("name", ""),
@@ -307,217 +144,683 @@ async def enrich_with_intelligence(state: QAState) -> QAState:
                 is_handler=True,
             )
             if cls.labels:
-                intelligence_context["behavioral_hotspots"].append({
-                    "name": node.get("name", ""),
-                    "handler": node.get("handler", ""),
-                    "file": node.get("file", ""),
-                    "labels": [l.value for l in cls.labels],
-                    "confidence": round(cls.confidence, 3),
+                label_values = [l.value for l in cls.labels]
+                test_recs = []
+                if "AuthCritical" in label_values:
+                    test_recs.extend(["Test valid/invalid/expired tokens", "Test RBAC", "Test CSRF"])
+                if "TransactionBoundary" in label_values:
+                    test_recs.extend(["Test rollback on failure", "Test concurrent modifications"])
+                if "SideEffecting" in label_values:
+                    test_recs.extend(["Test idempotency", "Test external service failure"])
+                if "AsyncFanOut" in label_values:
+                    test_recs.extend(["Test message ordering", "Test race conditions"])
+
+                hotspots.append({
+                    "route": node.get("path", ""),
+                    "method": node.get("http_method", ""),
+                    "labels": label_values,
+                    "test_recommendations": test_recs,
                 })
 
-        # --- 3. Domain context ---
-        prd_text = state.get("prd_text", "")
-        if prd_text:
-            domain_matches = domain_engine.resolve_query_to_domains(prd_text)
-            intelligence_context["domain_context"] = [
-                {"domain": d, "relevance": round(r, 3)} for d, r in domain_matches[:5]
-            ]
-
-        # Store in state
-        if "retrieved_context" not in state or state["retrieved_context"] is None:
-            state["retrieved_context"] = {}
-        state["retrieved_context"]["intelligence"] = intelligence_context
-
-        logger.info(
-            "Intelligence enrichment completed",
-            unprotected_routes=len(unprotected),
-            behavioral_hotspots=len(intelligence_context["behavioral_hotspots"]),
-            domains_found=len(intelligence_context["domain_context"]),
-        )
-
-        return state
-
+        return {"hotspots": hotspots, "total_risky": len(hotspots)}
     except Exception as e:
-        logger.error(f"Intelligence enrichment failed: {e}")
-        if "errors" not in state:
-            state["errors"] = []
-        state["errors"].append(f"Intelligence enrichment failed: {str(e)}")
-        return state
+        return {"error": str(e)}
 
 
-async def generate_test_strategy(state: QAState) -> QAState:
-    """Generate comprehensive test strategy using LLM"""
+@tool
+async def get_security_test_targets() -> Dict[str, Any]:
+    """
+    Find mutation routes (POST/PUT/DELETE/PATCH) lacking auth middleware.
+    These are CRITICAL priority for security testing.
+
+    Returns:
+        Unprotected mutation routes with specific test cases needed.
+    """
     try:
-        # Use custom prompt from YAML or default (key: qa_engineer_system)
-        qa_prompt = prompts.get('qa_engineer_system', prompts.get('qa_system', DEFAULT_QA_PROMPT))
-        
-        # Prepare context — includes intelligence enrichment
-        intelligence = state.get('retrieved_context', {}).get('intelligence', {})
-        context = {
-            "testing_targets": state.get('retrieved_context', {}).get('testing_targets', {}),
-            "existing_tests": state.get('retrieved_context', {}).get('existing_tests', {}),
-            "test_categories": state.get('test_categories', []),
-            "security_surface": intelligence.get("security_surface", {}),
-            "behavioral_hotspots": intelligence.get("behavioral_hotspots", [])[:10],
-            "domain_context": intelligence.get("domain_context", []),
+        from src.database.neo4j_client import neo4j_client
+        await neo4j_client.initialize()
+
+        query = """
+        MATCH (r:VertxRoute)
+        WHERE r.method IN ['POST', 'PUT', 'DELETE', 'PATCH']
+        RETURN r.path as path, r.method as method, r.handler_method as handler, r.file as file
+        """
+        routes = await neo4j_client.execute_query(query)
+
+        protected = 0
+        unprotected = []
+        for r in (routes or []):
+            handler = (r.get("handler") or "").lower()
+            if any(kw in handler for kw in ["auth", "middleware", "protect", "guard"]):
+                protected += 1
+            else:
+                unprotected.append({
+                    "path": r["path"], "method": r["method"],
+                    "handler": r.get("handler", ""), "file": r.get("file", ""),
+                })
+
+        return {
+            "total_mutation_routes": len(routes or []),
+            "protected_count": protected,
+            "unprotected_routes": unprotected[:20],
         }
-        
-        # Format the prompt
-        formatted_prompt = qa_prompt.format(
-            design_blueprint=json.dumps(state.get('design_blueprint', {}), indent=2, default=str)[:4000],
-            prd_text=state.get('prd_text', '')[:2000],
-            context=json.dumps(context, indent=2, default=str)[:3000],
-            test_focus=state.get('test_focus', 'all')
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+async def find_cross_repo_flows() -> Dict[str, Any]:
+    """
+    Find frontend-to-backend flows (React components calling API routes).
+    Essential for E2E and system testing.
+
+    Returns:
+        Cross-repository integration flows.
+    """
+    try:
+        from src.database.neo4j_client import neo4j_client
+        await neo4j_client.initialize()
+
+        query = """
+        MATCH (c:ReactComponent)-[:MAKES]->(a:ApiCall)
+        OPTIONAL MATCH (a)-[:CALLS_ROUTE]->(r:VertxRoute)
+        RETURN c.name as component, c.file as component_file,
+               a.url as api_url, a.method as api_method,
+               r.path as route_path, r.handler_method as handler
+        LIMIT 30
+        """
+        flows = await neo4j_client.execute_query(query)
+
+        return {
+            "flows": [
+                {
+                    "component": f.get("component", ""),
+                    "api_url": f.get("api_url", ""),
+                    "api_method": f.get("api_method", ""),
+                    "backend_route": f.get("route_path", ""),
+                }
+                for f in (flows or [])
+            ],
+            "total": len(flows or []),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+async def search_code_patterns(pattern: str) -> Dict[str, Any]:
+    """
+    Search for specific code patterns relevant to testing (error handling,
+    validation, middleware, etc.).
+
+    Args:
+        pattern: Code pattern or keyword (e.g., 'validation', 'error handler', 'middleware')
+
+    Returns:
+        Matching code locations with context.
+    """
+    try:
+        from src.services.search_service import SearchService
+        search_service = SearchService()
+        await search_service.initialize()
+
+        results = await search_service.search_codebase(
+            query=pattern,
+            search_type="hybrid",
+            top_k=10,
         )
-        
-        # Get LLM response using Vertex AI for Gemini models
+        combined = results.get("results", {}).get("combined", [])
+
+        return {
+            "matches": [
+                {
+                    "file": r.get("file_path", r.get("metadata", {}).get("file_path", "")),
+                    "preview": str(r.get("content", ""))[:300],
+                }
+                for r in combined[:8]
+            ],
+            "total": len(combined),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+async def get_qa_risk_projection(area: str) -> Dict[str, Any]:
+    """
+    Use the QA Projection Engine to generate risk-ranked testing scenarios.
+    Identifies async chains, failure surfaces, race windows, and untested paths.
+
+    Args:
+        area: Area to analyze for QA risks (e.g., 'auth', 'payment', 'order')
+
+    Returns:
+        QA risk scenarios with severity, test intents, and failure modes.
+    """
+    try:
+        from src.intelligence.qa_projection import qa_projection_engine, QARiskCategory, QASeverity
+        from src.database.neo4j_client import neo4j_client
+        await neo4j_client.initialize()
+
+        query = """
+        MATCH (r:VertxRoute)
+        WHERE toLower(r.path) CONTAINS toLower($area)
+           OR toLower(r.handler_method) CONTAINS toLower($area)
+        RETURN r.path as path, r.method as method, r.handler_method as handler, r.file as file
+        LIMIT 20
+        """
+        routes = await neo4j_client.execute_query(query, {"area": area})
+
+        scenarios = []
+        for route in (routes or []):
+            handler = (route.get("handler") or "").lower()
+            method = (route.get("method") or "GET").upper()
+
+            risks = []
+            if method in ("POST", "PUT", "DELETE", "PATCH"):
+                risks.append({
+                    "category": QARiskCategory.FAILURE_SURFACE.value,
+                    "severity": QASeverity.HIGH.value,
+                    "description": f"Mutation endpoint {route['path']} could fail with invalid data",
+                })
+            if "auth" in handler or "login" in handler or "token" in handler:
+                risks.append({
+                    "category": QARiskCategory.AUTH_BOUNDARY.value,
+                    "severity": QASeverity.CRITICAL.value,
+                    "description": f"Auth endpoint {route['path']} — test bypass, expired tokens, RBAC",
+                })
+            if "async" in handler or "event" in handler or "queue" in handler:
+                risks.append({
+                    "category": QARiskCategory.ASYNC_CHAIN.value,
+                    "severity": QASeverity.HIGH.value,
+                    "description": f"Async handler {route['path']} — test message loss, duplication",
+                })
+
+            if risks:
+                scenarios.append({
+                    "route": route.get("path", ""),
+                    "handler": route.get("handler", ""),
+                    "risks": risks,
+                })
+
+        return {
+            "area": area,
+            "total_scenarios": len(scenarios),
+            "risk_scenarios": scenarios,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+async def get_temporal_regression_targets() -> Dict[str, Any]:
+    """
+    Identify high-volatility code that should be priority targets for regression testing.
+    Uses Temporal Intelligence to find frequently-changing files.
+
+    Returns:
+        Files ranked by volatility score — most volatile files need most regression tests.
+    """
+    try:
+        from src.database.neo4j_client import neo4j_client
+        from src.intelligence.temporal_metadata import compute_volatility_score, classify_temporal_risk
+        await neo4j_client.initialize()
+
+        query = """
+        MATCH (f:File)
+        WHERE f.change_count IS NOT NULL AND f.change_count > 0
+        RETURN f.name as name, f.file as file,
+               f.change_count as change_count, f.total_lines as total_lines,
+               f.introduced_at as introduced_at, f.last_modified_at as last_modified_at
+        ORDER BY f.change_count DESC
+        LIMIT 30
+        """
+        files = await neo4j_client.execute_query(query)
+
+        results = []
+        for f in (files or []):
+            from datetime import datetime as dt, timezone as tz
+            last_mod = f.get("last_modified_at")
+            if isinstance(last_mod, str):
+                try:
+                    last_mod = dt.fromisoformat(last_mod)
+                except Exception:
+                    last_mod = None
+            now = dt.now(tz.utc)
+            if last_mod:
+                if last_mod.tzinfo is None:
+                    last_mod = last_mod.replace(tzinfo=tz.utc)
+                days_ago = max(0, (now - last_mod).days)
+            else:
+                days_ago = 30
+
+            vol_score, _ = compute_volatility_score(
+                last_modified_at=last_mod,
+                change_count=f.get("change_count") or 0,
+                total_lines=f.get("total_lines") or 0,
+            )
+            risk_level, risk_desc = classify_temporal_risk(vol_score, days_ago)
+            results.append({
+                "file": f.get("file", f.get("name", "")),
+                "volatility_score": round(vol_score, 3),
+                "change_count": f.get("change_count", 0),
+                "risk_level": risk_level,
+                "regression_priority": "CRITICAL" if risk_level in ("high", "critical") else "MEDIUM" if risk_level == "medium" else "LOW",
+            })
+
+        results.sort(key=lambda x: x["volatility_score"], reverse=True)
+        return {
+            "total_files": len(results),
+            "critical_regression_targets": [r for r in results if r["regression_priority"] == "CRITICAL"],
+            "all_files": results[:20],
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+async def get_domain_test_mapping(area: str) -> Dict[str, Any]:
+    """
+    Map an area to its business domain and associated code artifacts for targeted testing.
+    Uses Domain Intelligence to provide domain-aware test strategies.
+
+    Args:
+        area: Feature area or keyword to map to a domain
+
+    Returns:
+        Domain mapping with capabilities, related files, and test focus areas.
+    """
+    try:
+        from src.intelligence.domain_model import domain_engine
+        from src.database.neo4j_client import neo4j_client
+        await neo4j_client.initialize()
+
+        domain_matches = domain_engine.resolve_query_to_domains(area)
+
+        # Also get related files in the graph
+        query = """
+        MATCH (f:File)
+        WHERE toLower(f.name) CONTAINS toLower($area) OR toLower(f.file) CONTAINS toLower($area)
+        RETURN f.name as name, f.file as file
+        LIMIT 15
+        """
+        files = await neo4j_client.execute_query(query, {"area": area})
+
+        return {
+            "matched_domains": [
+                {"domain": d, "relevance": round(r, 3)} for d, r in domain_matches[:5]
+            ],
+            "primary_domain": domain_matches[0][0] if domain_matches else "unknown",
+            "related_files": [
+                {"name": f.get("name", ""), "file": f.get("file", "")}
+                for f in (files or [])
+            ],
+            "test_focus": f"Focus testing on {domain_matches[0][0] if domain_matches else area} domain boundaries, contracts, and integration points.",
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+async def get_error_handling_coverage() -> Dict[str, Any]:
+    """
+    Find error handling patterns and catch blocks across the codebase.
+    Identifies areas with weak error handling that need edge case testing.
+
+    Returns:
+        Error handling patterns found and areas lacking proper error handling.
+    """
+    try:
+        from src.services.search_service import SearchService
+        search_service = SearchService()
+        await search_service.initialize()
+
+        results = await search_service.search_codebase(
+            query="try catch error throw exception handle reject",
+            search_type="semantic",
+            top_k=15,
+        )
+        combined = results.get("results", {}).get("combined", [])
+
+        return {
+            "error_patterns": [
+                {
+                    "file": r.get("file_path", r.get("metadata", {}).get("file_path", "")),
+                    "preview": str(r.get("content", ""))[:300],
+                }
+                for r in combined[:10]
+            ],
+            "total_found": len(combined),
+            "recommendation": "Test error propagation for each pattern. Verify: correct HTTP status, proper error messages, no stack trace leakage, rollback on transaction failures.",
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# All QA tools — 10 tools for comprehensive test planning
+qa_tools = [
+    find_existing_test_patterns,
+    get_all_api_routes,
+    get_behavioral_hotspots,
+    get_security_test_targets,
+    find_cross_repo_flows,
+    search_code_patterns,
+    # Intelligence-backed tools
+    get_qa_risk_projection,
+    get_temporal_regression_targets,
+    get_domain_test_mapping,
+    get_error_handling_coverage,
+]
+
+
+# ---------------------------------------------------------------------------
+# QA Agent (LangGraph tool-calling agent — auto-generates from PRD)
+# ---------------------------------------------------------------------------
+
+def should_continue(state: QAState) -> Literal["tools", "synthesize", "end"]:
+    """Determine if we should continue to tools, synthesize, or end."""
+    messages = state.get("messages", [])
+    if not messages:
+        return "end"
+
+    tool_call_count = sum(1 for m in messages if hasattr(m, 'tool_calls') and m.tool_calls)
+    last_message = messages[-1]
+    has_tool_calls = hasattr(last_message, 'tool_calls') and last_message.tool_calls
+
+    # Max 8 tool iterations for QA
+    if tool_call_count >= 12:
+        if has_tool_calls or not (last_message.content or "").strip():
+            logger.info("QA agent hit tool iteration limit — routing to synthesize")
+            return "synthesize"
+        return "end"
+
+    if has_tool_calls:
+        return "tools"
+
+    return "end"
+
+
+def _build_qa_llm_messages(messages, system_prompt: str) -> list:
+    """Convert LangGraph messages to LiteLLM chat format."""
+    llm_messages = [{"role": "system", "content": system_prompt}]
+    for msg in messages:
+        if isinstance(msg, HumanMessage):
+            llm_messages.append({"role": "user", "content": msg.content})
+        elif isinstance(msg, AIMessage):
+            msg_dict = {"role": "assistant", "content": msg.content or ""}
+            if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                msg_dict["tool_calls"] = [
+                    {
+                        "id": tc.get("id", f"call_{i}"),
+                        "type": "function",
+                        "function": {
+                            "name": tc.get("name", ""),
+                            "arguments": json.dumps(tc.get("args", {}))
+                        }
+                    }
+                    for i, tc in enumerate(msg.tool_calls)
+                ]
+            llm_messages.append(msg_dict)
+        elif isinstance(msg, ToolMessage):
+            llm_messages.append({
+                "role": "tool",
+                "tool_call_id": msg.tool_call_id,
+                "content": msg.content
+            })
+    return llm_messages
+
+
+def _build_qa_tools() -> list:
+    """Convert qa_tools to LiteLLM tool schema."""
+    llm_tools = []
+    for t in qa_tools:
+        params = {}
+        if hasattr(t, 'args_schema') and t.args_schema:
+            try:
+                params = t.args_schema.schema()
+            except Exception:
+                params = {"type": "object", "properties": {}, "required": []}
+        llm_tools.append({
+            "type": "function",
+            "function": {
+                "name": t.name,
+                "description": t.description,
+                "parameters": params
+            }
+        })
+    return llm_tools
+
+
+async def qa_agent(state: QAState) -> Dict[str, Any]:
+    """Main QA agent — auto-generates comprehensive test plan from PRD."""
+    try:
+        messages = list(state.get('messages', []))
+        tool_descriptions = "\n".join([f"- {t.name}: {t.description}" for t in qa_tools])
+
+        system_prompt = f"""{QA_SYSTEM_PROMPT}
+
+{QA_JSON_FORMAT}
+
+## TOOLS AVAILABLE:
+{tool_descriptions}
+
+## MANDATORY WORKFLOW:
+1. Call `find_existing_test_patterns` to understand current test structure
+2. Call `get_all_api_routes` to discover all endpoints that need testing
+3. Call `get_behavioral_hotspots` to find risky high-impact areas
+4. Call `get_security_test_targets` for security-critical targets
+5. Call `find_cross_repo_flows` for end-to-end integration scenarios
+6. Call `search_code_patterns` to find error handling, validation patterns
+7. THEN produce the COMPLETE QA Test Plan JSON — every section filled, every test case detailed
+
+CRITICAL RULES:
+- Produce AT LEAST 5 test cases per testing type (Unit, Integration, System, Regression, Performance).
+- Every test case MUST map to a real PRD requirement.
+- Keep descriptions CONCISE (under 100 characters) to prevent JSON truncation.
+- Output MUST be a single valid JSON object — no markdown fences, no text before/after.
+"""
+
+        llm_messages = _build_qa_llm_messages(messages, system_prompt)
+        llm_tools = _build_qa_tools()
+
+        # Use Gemini 2.5 Pro for QA (configured in settings)
         model_name = settings.get_litellm_model("qa")
         if "gemini" in settings.QA_MODEL.lower():
             model_name = f"vertex_ai/{settings.QA_MODEL}"
-        
-        qa_kwargs = {
-            "model": model_name,
-            "messages": [
-                {"role": "system", "content": "You are a Senior QA Engineer. Generate comprehensive test strategies. Always respond with valid JSON."},
-                {"role": "user", "content": formatted_prompt}
-            ],
-            "max_tokens": settings.LLM_MAX_TOKENS,
-            "temperature": 0.3,  # Slightly higher for creative test case generation
-            "response_format": {"type": "json_object"},
-            "timeout": settings.LLM_TIMEOUT,
-            "api_key": settings.get_api_key_for_model(settings.QA_MODEL) or "vertex-ai"
-        }
-        
-        response = await acompletion(**qa_kwargs)
-        
-        # Parse response
-        test_strategy = json.loads(response.choices[0].message.content)
-        
-        # Add metadata
-        test_strategy["metadata"] = {
-            "generated_at": datetime.utcnow().isoformat(),
-            "model": settings.QA_MODEL,
-            "test_focus": state.get('test_focus', 'all'),
-            "blueprint_summary": state.get('design_blueprint', {}).get('summary', {})
-        }
-        
-        state['analysis_output'] = test_strategy
-        
-        logger.info(
-            "Test strategy generated",
-            total_tests=test_strategy.get('summary', {}).get('total_test_cases', 0),
-            unit_tests=len(test_strategy.get('unit_tests', [])),
-            integration_tests=len(test_strategy.get('integration_tests', [])),
-            e2e_tests=len(test_strategy.get('e2e_tests', []))
+
+        response = await acompletion(
+            model=model_name,
+            messages=llm_messages,
+            tools=llm_tools if llm_tools else None,
+            tool_choice="auto",
+            max_tokens=max(settings.LLM_MAX_TOKENS, 16000),
+            temperature=0.2,
+            timeout=settings.LLM_TIMEOUT,
+            api_key=settings.get_api_key_for_model(settings.QA_MODEL) or "vertex-ai"
         )
-        
-        return state
-        
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse QA response as JSON: {e}")
-        if 'errors' not in state:
-            state['errors'] = []
-        state['errors'].append(f"JSON parsing failed: {str(e)}")
-        state['analysis_output'] = {"error": "Failed to generate valid test strategy"}
-        return state
+
+        response_message = response.choices[0].message
+        ai_message_kwargs = {"content": response_message.content or ""}
+
+        if hasattr(response_message, 'tool_calls') and response_message.tool_calls:
+            ai_message_kwargs["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "name": tc.function.name,
+                    "args": json.loads(tc.function.arguments) if tc.function.arguments else {}
+                }
+                for tc in response_message.tool_calls
+            ]
+
+        return {"messages": [AIMessage(**ai_message_kwargs)]}
+
     except Exception as e:
-        logger.error(f"Test strategy generation failed: {e}")
-        if 'errors' not in state:
-            state['errors'] = []
-        state['errors'].append(f"Test strategy generation failed: {str(e)}")
-        state['analysis_output'] = {"error": str(e)}
-        return state
-
-
-async def identify_race_conditions(state: QAState) -> QAState:
-    """Specifically analyze for race conditions in async/EventBus flows"""
-    try:
-        blueprint = state.get('design_blueprint', {})
-        test_strategy = state.get('analysis_output', {})
-        
-        race_condition_analysis = []
-        
-        # Analyze EventBus flows
-        eventbus_flows = state.get('retrieved_context', {}).get('testing_targets', {}).get('eventbus_flows', [])
-        
-        for flow in eventbus_flows:
-            if isinstance(flow, dict):
-                race_condition_analysis.append({
-                    "flow": flow,
-                    "potential_issues": [
-                        "Message ordering not guaranteed",
-                        "Consumer processing overlap",
-                        "Database write conflicts"
-                    ],
-                    "recommended_tests": [
-                        "Concurrent message publishing test",
-                        "Consumer idempotency test",
-                        "Message replay handling test"
-                    ]
-                })
-        
-        # Add race condition tests to strategy if not present
-        if 'race_condition_tests' not in test_strategy:
-            test_strategy['race_condition_tests'] = []
-        
-        for analysis in race_condition_analysis:
-            test_strategy['race_condition_tests'].append({
-                "scenario": f"EventBus flow: {analysis.get('flow', {})}",
-                "potential_issues": analysis.get('potential_issues', []),
-                "test_approach": "Use concurrent test runners with shared state verification"
+        logger.error(f"QA agent failed: {e}", exc_info=True)
+        # Return error as message content so LangGraph can handle it gracefully
+        # The orchestrator will detect the error in the output
+        return {"messages": [AIMessage(
+            content=json.dumps({
+                "error": f"QA test plan generation failed: {str(e)}",
+                "error_type": "agent_error",
+                "agent": "qa"
             })
-        
-        # Initialize validation_results if not present
-        if 'validation_results' not in state or state['validation_results'] is None:
-            state['validation_results'] = []
-        
-        state['validation_results'].append({
-            "step": "race_condition_analysis",
-            "flows_analyzed": len(eventbus_flows),
-            "issues_identified": len(race_condition_analysis),
-            "timestamp": datetime.utcnow().isoformat()
-        })
-        
-        state['analysis_output'] = test_strategy
-        
-        logger.info(
-            "Race condition analysis completed",
-            flows_analyzed=len(eventbus_flows),
-            issues_found=len(race_condition_analysis)
+        )]}
+
+
+async def execute_qa_tools(state: QAState) -> Dict[str, Any]:
+    """Execute tools called by the QA agent."""
+    messages = state.get("messages", [])
+    last_message = messages[-1] if messages else None
+
+    if not last_message or not hasattr(last_message, 'tool_calls') or not last_message.tool_calls:
+        return {"messages": []}
+
+    tool_messages = []
+    for tool_call in last_message.tool_calls:
+        tool_name = tool_call.get("name", "")
+        tool_args = tool_call.get("args", {})
+        tool_id = tool_call.get("id", f"call_{tool_name}")
+
+        logger.info(f"QA tool executing: {tool_name}", args=tool_args)
+
+        tool_result = {"error": f"Tool {tool_name} not found"}
+        for t in qa_tools:
+            if t.name == tool_name:
+                try:
+                    tool_result = await t.ainvoke(tool_args)
+                except Exception as e:
+                    logger.error(f"QA tool {tool_name} failed: {e}")
+                    tool_result = {"error": str(e)}
+                break
+
+        tool_messages.append(ToolMessage(
+            content=json.dumps(tool_result, default=str),
+            tool_call_id=tool_id
+        ))
+
+    return {"messages": tool_messages}
+
+
+async def synthesize_qa(state: QAState) -> Dict[str, Any]:
+    """
+    Synthesize the final QA Test Plan when tool iteration limit is reached.
+    Uses a COMPACT summary of tool results to avoid empty LLM responses.
+    """
+    try:
+        messages = list(state.get('messages', []))
+        logger.info("Synthesizing final QA Test Plan after tool limit", message_count=len(messages))
+
+        # Extract original question (PRD content)
+        original_question = ""
+        for msg in messages:
+            if isinstance(msg, HumanMessage):
+                original_question = msg.content
+                break
+
+        # Collect and summarize tool results — keep concise to leave room for output
+        tool_findings = []
+        for msg in messages:
+            if isinstance(msg, ToolMessage):
+                try:
+                    summary = str(msg.content)
+                    if len(summary) > 2000:
+                        summary = summary[:2000] + "...(truncated)"
+                    tool_findings.append(summary)
+                except Exception:
+                    pass
+
+        codebase_context = "\n---\n".join(tool_findings[-8:])
+
+        synthesis_prompt = f"""{QA_SYSTEM_PROMPT}
+
+{QA_JSON_FORMAT}
+
+## CODEBASE INVESTIGATION RESULTS
+The following data was gathered by searching the codebase knowledge graph:
+
+{codebase_context}
+
+## YOUR TASK
+Using ONLY the codebase data above and the PRD requirements below, produce a COMPLETE
+enterprise-grade QA Test Plan as a single valid JSON document.
+
+CRITICAL FORMATTING RULES:
+1. Include AT LEAST 5 test cases per testing type (Unit, Integration, System, Regression, Performance, Security).
+2. Every test case must have: id, description, preconditions, expected_result, priority.
+3. Keep ALL descriptions CONCISE — under 100 characters each.
+4. Keep preconditions and expected_result under 80 characters.
+5. Do NOT write verbose paragraphs in test case fields.
+6. Do NOT call any tools. Do NOT ask questions.
+7. Your response must be ONLY the JSON object — no markdown fences, no explanation text.
+
+CONCISE EXAMPLE:
+{{"id": "UT-001", "description": "Validate schedule creation with daily recurrence", "preconditions": "Valid transform ID exists", "expected_result": "Schedule stored with daily pattern", "priority": "high"}}
+"""
+
+        llm_messages = [
+            {"role": "system", "content": synthesis_prompt},
+            {"role": "user", "content": original_question or "Generate the QA Test Plan."},
+        ]
+
+        model_name = settings.get_litellm_model("qa")
+        if "gemini" in settings.QA_MODEL.lower():
+            model_name = f"vertex_ai/{settings.QA_MODEL}"
+
+        # Use higher token limit for synthesis — QA JSON with 30+ test cases is large
+        synthesis_max_tokens = max(settings.LLM_MAX_TOKENS, 16000)
+
+        response = await acompletion(
+            model=model_name,
+            messages=llm_messages,
+            tools=None,
+            max_tokens=synthesis_max_tokens,
+            temperature=0.2,
+            timeout=settings.LLM_TIMEOUT,
+            api_key=settings.get_api_key_for_model(settings.QA_MODEL) or "vertex-ai"
         )
-        
-        return state
-        
+
+        content = response.choices[0].message.content or ""
+        logger.info("QA synthesis complete", response_length=len(content))
+
+        if not content.strip():
+            logger.warning("QA synthesis returned empty — using fallback")
+            content = json.dumps({
+                "feature_name": "Generated QA Plan",
+                "summary": {"total_test_cases": 0, "note": "QA synthesis produced empty output"},
+                "raw_analysis": "\n\n".join(tool_findings[-6:]),
+            })
+
+        return {"messages": [AIMessage(content=content)]}
+
     except Exception as e:
-        logger.error(f"Race condition analysis failed: {e}")
-        if 'errors' not in state:
-            state['errors'] = []
-        state['errors'].append(f"Race condition analysis failed: {str(e)}")
-        return state
+        logger.error(f"QA synthesis failed: {e}", exc_info=True)
+        # Return error as JSON so the orchestrator can detect and handle it
+        return {"messages": [AIMessage(
+            content=json.dumps({
+                "error": f"QA synthesis failed: {str(e)}",
+                "error_type": "llm_service_error",
+                "model": settings.QA_MODEL
+            })
+        )]}
 
 
 def create_qa_workflow() -> StateGraph:
-    """Create and compile the QA workflow"""
-    
-    # Build the workflow graph
+    """Create and compile the QA workflow."""
     graph = StateGraph(QAState)
-    
-    # Add nodes
-    graph.add_node("analyze_blueprint", analyze_blueprint_for_testing)
-    graph.add_node("retrieve_tests", retrieve_existing_tests)
-    graph.add_node("enrich_intelligence", enrich_with_intelligence)
-    graph.add_node("generate_strategy", generate_test_strategy)
-    graph.add_node("analyze_race_conditions", identify_race_conditions)
-    
-    # Define workflow flow:
-    #   analyze_blueprint → retrieve_tests → enrich_intelligence → generate_strategy → race_conditions → END
-    graph.set_entry_point("analyze_blueprint")
-    graph.add_edge("analyze_blueprint", "retrieve_tests")
-    graph.add_edge("retrieve_tests", "enrich_intelligence")
-    graph.add_edge("enrich_intelligence", "generate_strategy")
-    graph.add_edge("generate_strategy", "analyze_race_conditions")
-    graph.add_edge("analyze_race_conditions", END)
-    
+
+    graph.add_node("agent", qa_agent)
+    graph.add_node("tools", execute_qa_tools)
+    graph.add_node("synthesize", synthesize_qa)
+
+    graph.set_entry_point("agent")
+    graph.add_conditional_edges(
+        "agent",
+        should_continue,
+        {"tools": "tools", "synthesize": "synthesize", "end": END}
+    )
+    graph.add_edge("tools", "agent")
+    graph.add_edge("synthesize", END)
+
     return graph.compile()
 
 
