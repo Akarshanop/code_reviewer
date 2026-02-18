@@ -208,6 +208,7 @@ class ParserCoordinator:
             result.error = f"Parse error: {e}"
             logger.error(f"Failed to parse {file_path}: {e}")
         
+        result.raw_content = content[:5000] if content else None
         return result
     
     def _parse_java(self, parser: JavaParser, file_path: Path, 
@@ -290,102 +291,6 @@ class ParserCoordinator:
         
         return result
     
-    def parse_repository(self, repo_path: Path, 
-                        exclude_patterns: List[str] = None,
-                        max_files: int = None) -> RepositoryParseResult:
-        """
-        Parse all files in a repository.
-        
-        Args:
-            repo_path: Path to repository root
-            exclude_patterns: Additional patterns to exclude
-            max_files: Maximum number of files to parse (for testing)
-        
-        Returns:
-            RepositoryParseResult with all parsed files
-        """
-        import fnmatch
-        
-        exclude = list(self.DEFAULT_EXCLUDE_PATTERNS)
-        if exclude_patterns:
-            exclude.extend(exclude_patterns)
-        
-        result = RepositoryParseResult(repo_path=str(repo_path))
-        file_count = 0
-        
-        logger.info(f"Starting repository parse: {repo_path}")
-        
-        for file_path in repo_path.rglob("*"):
-            if not file_path.is_file():
-                continue
-            
-            # Check exclusions
-            rel_path = str(file_path.relative_to(repo_path))
-            if any(fnmatch.fnmatch(rel_path, p) for p in exclude):
-                continue
-            
-            result.total_files += 1
-            
-            # Check file limit
-            if max_files and file_count >= max_files:
-                break
-            
-            # Parse file
-            try:
-                parsed = self.parse_file(file_path)
-                
-                if parsed.error:
-                    result.failed_files += 1
-                    result.errors.append({
-                        "file": str(file_path),
-                        "error": parsed.error
-                    })
-                elif parsed.parser_used == "skipped":
-                    result.skipped_files += 1
-                else:
-                    result.parsed_files += 1
-                    result.files.append(parsed)
-                
-                # Update language stats
-                lang = parsed.language
-                result.languages_detected[lang] = result.languages_detected.get(lang, 0) + 1
-                
-                # Update framework stats
-                if parsed.framework != "generic":
-                    fw = parsed.framework
-                    result.frameworks_detected[fw] = result.frameworks_detected.get(fw, 0) + 1
-                
-                file_count += 1
-                
-            except Exception as e:
-                result.failed_files += 1
-                result.errors.append({
-                    "file": str(file_path),
-                    "error": str(e)
-                })
-        
-        # Determine primary language and framework
-        if result.languages_detected:
-            # Filter out non-code languages for primary
-            code_languages = {
-                k: v for k, v in result.languages_detected.items()
-                if k not in ("json", "yaml", "xml", "markdown", "unknown")
-            }
-            if code_languages:
-                result.primary_language = max(code_languages, key=code_languages.get)
-            else:
-                result.primary_language = max(result.languages_detected, key=result.languages_detected.get)
-        
-        if result.frameworks_detected:
-            result.primary_framework = max(result.frameworks_detected, key=result.frameworks_detected.get)
-        
-        logger.info(
-            f"Repository parse complete: {result.parsed_files}/{result.total_files} files parsed, "
-            f"primary language: {result.primary_language}, framework: {result.primary_framework}"
-        )
-        
-        return result
-    
     async def parse_repository_async(self, repo_path: Path,
                                      exclude_patterns: List[str] = None,
                                      max_files: int = None,
@@ -408,6 +313,8 @@ class ParserCoordinator:
         if exclude_patterns:
             exclude.extend(exclude_patterns)
         
+        logger.info(f"Starting async repository parse: {repo_path}")
+        
         # Collect all files first
         all_files = []
         for file_path in repo_path.rglob("*"):
@@ -429,7 +336,6 @@ class ParserCoordinator:
         for i in range(0, len(all_files), batch_size):
             batch = all_files[i:i + batch_size]
             
-            # Parse batch (could be parallelized further)
             for file_path in batch:
                 try:
                     parsed = self.parse_file(file_path)
@@ -454,7 +360,7 @@ class ParserCoordinator:
                     result.failed_files += 1
                     result.errors.append({"file": str(file_path), "error": str(e)})
             
-            # Yield control
+            # Yield control to the event loop between batches
             await asyncio.sleep(0)
         
         # Determine primary language/framework
@@ -463,9 +369,16 @@ class ParserCoordinator:
                          if k not in ("json", "yaml", "xml", "markdown", "unknown")}
             if code_langs:
                 result.primary_language = max(code_langs, key=code_langs.get)
+            else:
+                result.primary_language = max(result.languages_detected, key=result.languages_detected.get)
         
         if result.frameworks_detected:
             result.primary_framework = max(result.frameworks_detected, key=result.frameworks_detected.get)
+        
+        logger.info(
+            f"Repository parse complete: {result.parsed_files}/{result.total_files} files parsed, "
+            f"primary language: {result.primary_language}, framework: {result.primary_framework}"
+        )
         
         return result
     

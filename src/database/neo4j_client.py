@@ -79,35 +79,46 @@ class Neo4jClient:
             logger.warning(f"Background constraints creation failed: {e}")
     
     async def ensure_constraints(self):
-        """Create Neo4j constraints and indexes"""
+        """Create Neo4j constraints and indexes for all node types."""
         constraints = [
-            # Unique constraints
+            # ── Unique constraints (critical for MERGE performance) ──
             "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Repository) REQUIRE n.name IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (n:File) REQUIRE n.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Function) REQUIRE n.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (n:VertxRoute) REQUIRE n.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (n:ReactComponent) REQUIRE n.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (n:DTO) REQUIRE n.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (n:EventBusNode) REQUIRE n.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Service) REQUIRE n.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (n:ApiCall) REQUIRE n.id IS UNIQUE",
             
-            # Indexes for common queries
+            # ── Lookup indexes (used in MATCH / WHERE clauses) ──
+            "CREATE INDEX IF NOT EXISTS FOR (n:File) ON (n.path)",
+            "CREATE INDEX IF NOT EXISTS FOR (n:File) ON (n.relative_path)",
+            "CREATE INDEX IF NOT EXISTS FOR (n:File) ON (n.repository_hash)",
+            "CREATE INDEX IF NOT EXISTS FOR (n:Function) ON (n.name)",
+            "CREATE INDEX IF NOT EXISTS FOR (n:Function) ON (n.file)",
             "CREATE INDEX IF NOT EXISTS FOR (n:VertxRoute) ON (n.path)",
+            "CREATE INDEX IF NOT EXISTS FOR (n:VertxRoute) ON (n.file)",
             "CREATE INDEX IF NOT EXISTS FOR (n:ReactComponent) ON (n.name)",
             "CREATE INDEX IF NOT EXISTS FOR (n:ApiCall) ON (n.url)",
             "CREATE INDEX IF NOT EXISTS FOR (n:Module) ON (n.name)",
-            "CREATE INDEX IF NOT EXISTS FOR (n:File) ON (n.path)",
+            "CREATE INDEX IF NOT EXISTS FOR (n:Service) ON (n.name)",
+            "CREATE INDEX IF NOT EXISTS FOR (n:Service) ON (n.repository_hash)",
+            "CREATE INDEX IF NOT EXISTS FOR (n:Repository) ON (n.hash)",
 
-            # --- Intelligence Layer indexes ---
-            # Behavioral classification
+            # ── Intelligence Layer indexes ──
             "CREATE INDEX IF NOT EXISTS FOR (n:Function) ON (n.behavioral_labels)",
             "CREATE INDEX IF NOT EXISTS FOR (n:VertxRoute) ON (n.behavioral_labels)",
-            # Temporal metadata
             "CREATE INDEX IF NOT EXISTS FOR (n:File) ON (n.volatility_score)",
             "CREATE INDEX IF NOT EXISTS FOR (n:Function) ON (n.volatility_score)",
-            # Domain inference
             "CREATE INDEX IF NOT EXISTS FOR (n:File) ON (n.domain)",
-            # Evidence-weighted edges (composite index on confidence)
+            
+            # ── Relationship property indexes (evidence-weighted edges) ──
             "CREATE INDEX IF NOT EXISTS FOR ()-[r:CALLS_ROUTE]-() ON (r.confidence_score)",
             "CREATE INDEX IF NOT EXISTS FOR ()-[r:GUARDS]-() ON (r.confidence_score)",
-            # Domain node type
+            
+            # ── Domain/Capability/PRD unique constraints ──
             "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Domain) REQUIRE n.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Capability) REQUIRE n.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (n:PRD) REQUIRE n.id IS UNIQUE",

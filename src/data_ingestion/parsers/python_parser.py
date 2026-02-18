@@ -1,15 +1,20 @@
 """
 Python AST Parser using tree-sitter
-Extracts classes, functions, decorators, imports, and FastAPI/Django/Flask patterns
+Extracts classes, functions, decorators, imports, FastAPI/Django/Flask patterns,
+function bodies, error handling, call graphs, and control flow.
 """
 import ast
+import textwrap
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Set
 from dataclasses import dataclass, field
 
 from src.core.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Maximum characters stored for a single function/method/class body
+_MAX_BODY_CHARS = 8000
 
 
 @dataclass
@@ -101,6 +106,10 @@ class PythonParser:
                 logger.error(f"Failed to read file {file_path}: {e}")
                 return self._empty_result()
         
+        # Store source lines for body extraction
+        self._source_lines = content.splitlines(keepends=True)
+        self._source = content
+        
         # Parse AST
         try:
             tree = ast.parse(content, filename=str(path))
@@ -121,17 +130,21 @@ class PythonParser:
             "dependencies": [],
             "decorators": [],
             "constants": [],
+            "error_handling": [],
+            "control_flow": [],
             "framework": "generic",
             "metadata": {}
         }
         
         # Extract elements
         self._extract_imports(tree, result)
-        self._extract_classes(tree, str(path), result)
-        self._extract_functions(tree, str(path), result)
+        self._extract_classes(tree, str(path), result, content)
+        self._extract_functions(tree, str(path), result, content)
         self._extract_constants(tree, result)
         self._detect_framework(result)
         self._extract_routes(tree, str(path), result)
+        self._extract_error_handling(tree, str(path), result)
+        self._extract_control_flow(tree, str(path), result)
         
         return result
     
@@ -146,9 +159,24 @@ class PythonParser:
             "dependencies": [],
             "decorators": [],
             "constants": [],
+            "error_handling": [],
+            "control_flow": [],
             "framework": "generic",
             "metadata": {}
         }
+    
+    def _get_source_segment(self, node: ast.AST) -> str:
+        """Extract the source code of an AST node (function/class body)."""
+        try:
+            return ast.get_source_segment(self._source, node) or ""
+        except Exception:
+            # Fallback: use line numbers
+            try:
+                start = node.lineno - 1
+                end = getattr(node, 'end_lineno', start + 1)
+                return "".join(self._source_lines[start:end])
+            except Exception:
+                return ""
     
     def _extract_imports(self, tree: ast.Module, result: Dict[str, Any]):
         """Extract import statements"""
@@ -180,8 +208,9 @@ class PythonParser:
                         if pkg not in result["dependencies"]:
                             result["dependencies"].append(pkg)
     
-    def _extract_classes(self, tree: ast.Module, file_path: str, result: Dict[str, Any]):
-        """Extract class definitions"""
+    def _extract_classes(self, tree: ast.Module, file_path: str, result: Dict[str, Any],
+                         content: str = ""):
+        """Extract class definitions with bodies and method details"""
         for node in ast.walk(tree):
             if isinstance(node, ast.ClassDef):
                 # Get base classes
@@ -195,14 +224,29 @@ class PythonParser:
                 # Get decorators
                 decorators = self._get_decorators(node)
                 
-                # Get methods
+                # Get methods with details (not just names)
                 methods = []
                 for item in node.body:
                     if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        methods.append(item.name)
+                        method_body = self._get_source_segment(item)
+                        method_calls = self._extract_calls_from_node(item)
+                        methods.append({
+                            "name": item.name,
+                            "is_async": isinstance(item, ast.AsyncFunctionDef),
+                            "params": self._get_parameters(item),
+                            "return_type": self._get_type_annotation(item.returns) if item.returns else None,
+                            "line_number": item.lineno,
+                            "end_line": getattr(item, 'end_lineno', None),
+                            "body": method_body[:_MAX_BODY_CHARS] if method_body else "",
+                            "calls": method_calls,
+                            "docstring": ast.get_docstring(item) or "",
+                        })
                 
                 # Get docstring
                 docstring = ast.get_docstring(node)
+                
+                # Get class body
+                class_body = self._get_source_segment(node)
                 
                 # Check for special class types
                 is_dataclass = any('dataclass' in d for d in decorators)
@@ -212,10 +256,12 @@ class PythonParser:
                     "name": node.name,
                     "file_path": file_path,
                     "line_number": node.lineno,
+                    "end_line": getattr(node, 'end_lineno', None),
                     "bases": bases,
                     "decorators": decorators,
                     "methods": methods,
-                    "docstring": docstring[:200] if docstring else None,
+                    "docstring": docstring[:500] if docstring else None,
+                    "body": class_body[:_MAX_BODY_CHARS] if class_body else "",
                     "is_dataclass": is_dataclass,
                     "is_pydantic": is_pydantic,
                     "is_abstract": any('ABC' in b or 'abstract' in b.lower() for b in bases)
@@ -223,8 +269,9 @@ class PythonParser:
                 
                 result["classes"].append(class_info)
     
-    def _extract_functions(self, tree: ast.Module, file_path: str, result: Dict[str, Any]):
-        """Extract function definitions"""
+    def _extract_functions(self, tree: ast.Module, file_path: str, result: Dict[str, Any],
+                           content: str = ""):
+        """Extract function definitions with bodies, calls, and error handling"""
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 # Skip methods (handled in class extraction)
@@ -245,14 +292,27 @@ class PythonParser:
                 # Get docstring
                 docstring = ast.get_docstring(node)
                 
+                # FIX 1: Get function body
+                body = self._get_source_segment(node)
+                
+                # FIX 4: Extract function calls
+                calls = self._extract_calls_from_node(node)
+                
+                # FIX 2: Extract error handling within this function
+                error_handling = self._extract_error_handling_from_node(node)
+                
                 func_info = {
                     "name": node.name,
                     "file_path": file_path,
                     "line_number": node.lineno,
+                    "end_line": getattr(node, 'end_lineno', None),
                     "decorators": decorators,
                     "parameters": parameters,
                     "return_type": return_type,
-                    "docstring": docstring[:200] if docstring else None,
+                    "docstring": docstring[:500] if docstring else None,
+                    "body": body[:_MAX_BODY_CHARS] if body else "",
+                    "calls": calls,
+                    "error_handling": error_handling,
                     "is_async": isinstance(node, ast.AsyncFunctionDef),
                     "is_private": node.name.startswith('_'),
                     "is_dunder": node.name.startswith('__') and node.name.endswith('__')
@@ -522,6 +582,136 @@ class PythonParser:
                     if item is func_node:
                         return True
         return False
+    
+    # =========================================================================
+    # FIX 4: Call graph extraction
+    # =========================================================================
+    
+    def _extract_calls_from_node(self, node: ast.AST) -> List[str]:
+        """Extract all function/method call names within an AST node."""
+        calls: Set[str] = set()
+        for child in ast.walk(node):
+            if isinstance(child, ast.Call):
+                name = self._get_call_name(child.func)
+                if name:
+                    calls.add(name)
+        return sorted(calls)
+    
+    def _get_call_name(self, node: ast.expr) -> Optional[str]:
+        """Get the name of a function being called."""
+        if isinstance(node, ast.Name):
+            return node.id
+        elif isinstance(node, ast.Attribute):
+            return self._get_attr_chain(node)
+        return None
+    
+    # =========================================================================
+    # FIX 2: Error handling extraction
+    # =========================================================================
+    
+    def _extract_error_handling_from_node(self, node: ast.AST) -> List[Dict[str, Any]]:
+        """Extract try/except/finally patterns within a single function/method."""
+        handlers = []
+        for child in ast.walk(node):
+            if isinstance(child, ast.Try):
+                handler_info: Dict[str, Any] = {
+                    "line": child.lineno,
+                    "has_finally": len(child.finalbody) > 0,
+                    "has_else": len(child.orelse) > 0,
+                    "exceptions_caught": [],
+                }
+                for h in child.handlers:
+                    exc_type = None
+                    if h.type:
+                        exc_type = self._get_type_annotation(h.type)
+                    handler_info["exceptions_caught"].append({
+                        "type": exc_type or "Exception",
+                        "name": h.name,
+                        "line": h.lineno,
+                    })
+                handlers.append(handler_info)
+            # Also capture bare raise statements
+            elif isinstance(child, ast.Raise):
+                exc_type = None
+                if child.exc:
+                    if isinstance(child.exc, ast.Call):
+                        exc_type = self._get_call_name(child.exc.func)
+                    elif isinstance(child.exc, ast.Name):
+                        exc_type = child.exc.id
+                handlers.append({
+                    "line": child.lineno,
+                    "type": "raise",
+                    "exception": exc_type,
+                })
+        return handlers
+    
+    def _extract_error_handling(self, tree: ast.Module, file_path: str, result: Dict[str, Any]):
+        """FIX 2: Extract all error handling patterns in the file."""
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Try):
+                info: Dict[str, Any] = {
+                    "file": file_path,
+                    "line": node.lineno,
+                    "end_line": getattr(node, 'end_lineno', None),
+                    "has_finally": len(node.finalbody) > 0,
+                    "has_else": len(node.orelse) > 0,
+                    "exceptions_caught": [],
+                }
+                for h in node.handlers:
+                    exc_type = self._get_type_annotation(h.type) if h.type else "Exception"
+                    info["exceptions_caught"].append({
+                        "type": exc_type,
+                        "name": h.name,
+                        "line": h.lineno,
+                    })
+                result["error_handling"].append(info)
+    
+    # =========================================================================
+    # FIX 6: Control flow extraction
+    # =========================================================================
+    
+    def _extract_control_flow(self, tree: ast.Module, file_path: str, result: Dict[str, Any]):
+        """FIX 6: Extract control flow structures for QA edge-case generation."""
+        for node in ast.walk(tree):
+            if isinstance(node, ast.If):
+                # Count elif branches
+                branch_count = 1  # the if itself
+                current = node
+                while current.orelse and len(current.orelse) == 1 and isinstance(current.orelse[0], ast.If):
+                    branch_count += 1
+                    current = current.orelse[0]
+                if current.orelse:
+                    branch_count += 1  # final else
+                
+                result["control_flow"].append({
+                    "type": "if",
+                    "line": node.lineno,
+                    "branches": branch_count,
+                    "has_else": bool(node.orelse),
+                })
+            elif isinstance(node, ast.For):
+                result["control_flow"].append({
+                    "type": "for",
+                    "line": node.lineno,
+                    "has_else": bool(node.orelse),
+                })
+            elif isinstance(node, ast.While):
+                result["control_flow"].append({
+                    "type": "while",
+                    "line": node.lineno,
+                    "has_else": bool(node.orelse),
+                })
+            elif hasattr(ast, 'Match') and isinstance(node, ast.Match):
+                result["control_flow"].append({
+                    "type": "match",
+                    "line": node.lineno,
+                    "cases": len(node.cases),
+                })
+            elif isinstance(node, ast.Assert):
+                result["control_flow"].append({
+                    "type": "assert",
+                    "line": node.lineno,
+                })
     
     def parse_file(self, file_path: Path) -> Dict[str, Any]:
         """Parse a file (convenience method matching other parsers)"""

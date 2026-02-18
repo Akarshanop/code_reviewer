@@ -165,11 +165,28 @@ class VectorService:
         }
     
     def _create_index_text(self, artifact: Dict[str, Any]) -> str:
-        """Create text for embedding from artifact"""
+        """
+        Create text for embedding from artifact.
+        
+        FIX 6: Prefer the rich 'text' field that _generate_embeddings already
+        builds (contains type + name + key attributes).  Fall back to the
+        'code' field.  Both are concatenated with name/signature so the
+        embedding captures the same semantic content that was intended during
+        ingestion.  Code limit raised from 500→1500 chars so meaningful
+        function bodies aren't truncated to a useless prefix.
+        """
         parts = []
         
-        # Add name and type
-        parts.append(f"{artifact.get('type', 'artifact')}: {artifact.get('name', '')}")
+        # Add name and type (always first for retrieval anchoring)
+        artifact_type = artifact.get('type', 'artifact')
+        artifact_name = artifact.get('name', '')
+        parts.append(f"{artifact_type}: {artifact_name}")
+        
+        # Language / file context (helps discriminate across repos)
+        if artifact.get("language"):
+            parts.append(f"Language: {artifact['language']}")
+        if artifact.get("file"):
+            parts.append(f"File: {artifact['file']}")
         
         # Add signature if available
         if artifact.get("signature"):
@@ -179,16 +196,26 @@ class VectorService:
         if artifact.get("description"):
             parts.append(f"Description: {artifact['description']}")
         
-        # Add code snippet if available (limited length)
-        if artifact.get("code"):
-            code = artifact["code"]
-            if len(code) > 500:
-                code = code[:500] + "..."
-            parts.append(f"Code: {code}")
+        # Prefer the ingestion-built 'text' field (richer summary).
+        # Fall back to 'code' (raw snippet).
+        text_field = artifact.get("text") or ""
+        code_field = artifact.get("code") or ""
+        
+        # Use whichever is more informative; if both exist, concatenate.
+        if text_field and code_field and text_field != code_field:
+            combined = f"{text_field}\n{code_field}"
+        else:
+            combined = text_field or code_field
+        
+        if combined:
+            # FIX 1: Increase limit to 2500 chars now that we embed actual code bodies
+            if len(combined) > 2500:
+                combined = combined[:2500] + "..."
+            parts.append(combined)
         
         # Add metadata as context
-        if artifact.get("metadata"):
-            for key, value in artifact.get("metadata", {}).items():
+        if artifact.get("metadata") and isinstance(artifact["metadata"], dict):
+            for key, value in artifact["metadata"].items():
                 if isinstance(value, str) and len(value) < 100:
                     parts.append(f"{key}: {value}")
         

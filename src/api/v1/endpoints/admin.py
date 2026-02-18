@@ -13,7 +13,11 @@ from src.database.qdrant_client import qdrant_client
 from src.database.supabase_session import supabase_client
 from src.core.logger import get_logger
 from config.settings import settings
-from src.schemas.admin_schema import HealthResponse, SystemStatsResponse, GraphConnectivityResponse, ReindexRequest, CacheInvalidateRequest
+from src.schemas.admin_schema import (
+    HealthResponse, SystemStatsResponse, GraphConnectivityResponse,
+    ReindexRequest, CacheInvalidateRequest,
+    DatabaseResetRequest, DatabaseResetResponse,
+)
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -327,6 +331,119 @@ async def trigger_reindex(
         "message": "Reindex operation started",
         "repository": request.repository or "all"
     }
+
+
+# =============================================================================
+# Database Reset Endpoint
+# =============================================================================
+
+@router.post("/database/reset", response_model=DatabaseResetResponse)
+async def reset_databases(request: DatabaseResetRequest):
+    """
+    Wipe all data from Neo4j and/or Qdrant so you can run a fresh ingestion.
+
+    **WARNING** — this is destructive and irreversible.
+    You must send `"confirm": true` in the request body.
+
+    Example body:
+        { "targets": ["neo4j", "qdrant"], "confirm": true }
+    """
+    if not request.confirm:
+        raise HTTPException(
+            status_code=400,
+            detail='Safety check: set "confirm": true in the request body to proceed.',
+        )
+
+    errors: list[str] = []
+    neo4j_result: Dict[str, Any] | None = None
+    qdrant_result: Dict[str, Any] | None = None
+
+    # ------------------------------------------------------------------
+    # 1. Neo4j — delete all nodes and relationships
+    # ------------------------------------------------------------------
+    if "neo4j" in request.targets:
+        try:
+            await neo4j_client.initialize()
+
+            # Grab counts before deletion for the response
+            before = await neo4j_client.get_graph_stats()
+
+            # DETACH DELETE removes every node and its relationships.
+            # We do it in batches to avoid OOM on very large graphs.
+            deleted_total = 0
+            batch_size = 5000
+            while True:
+                result = await neo4j_client.execute_query(
+                    f"MATCH (n) WITH n LIMIT {batch_size} DETACH DELETE n RETURN count(*) AS deleted"
+                )
+                deleted = result[0]["deleted"] if result else 0
+                deleted_total += deleted
+                if deleted < batch_size:
+                    break
+
+            # Re-create constraints & indexes so the DB is ready for re-ingestion
+            await neo4j_client.ensure_constraints()
+
+            neo4j_result = {
+                "deleted_nodes": before.get("total_nodes", 0),
+                "deleted_relationships": before.get("total_relationships", 0),
+                "batches_executed": (deleted_total // batch_size) + 1,
+                "constraints_recreated": True,
+            }
+            logger.info(
+                "Neo4j database reset complete",
+                deleted_nodes=neo4j_result["deleted_nodes"],
+                deleted_relationships=neo4j_result["deleted_relationships"],
+            )
+        except Exception as e:
+            msg = f"Neo4j reset failed: {e}"
+            logger.error(msg, exc_info=True)
+            errors.append(msg)
+
+    # ------------------------------------------------------------------
+    # 2. Qdrant — drop and recreate the collection
+    # ------------------------------------------------------------------
+    if "qdrant" in request.targets:
+        try:
+            await qdrant_client.initialize()
+
+            collection_name = settings.QDRANT_COLLECTION_NAME
+
+            # Get stats before deletion
+            before_info = await qdrant_client.get_collection_info(collection_name)
+            vectors_before = before_info.get("vectors_count", 0)
+
+            # Drop the collection entirely
+            await qdrant_client.client.delete_collection(collection_name)
+            logger.info(f"Qdrant collection '{collection_name}' deleted")
+
+            # Recreate with the same schema so ingestion can write immediately
+            qdrant_client._initialized = False  # force re-init
+            await qdrant_client.initialize()
+
+            qdrant_result = {
+                "collection": collection_name,
+                "vectors_deleted": vectors_before,
+                "collection_recreated": True,
+            }
+            logger.info(
+                "Qdrant database reset complete",
+                collection=collection_name,
+                vectors_deleted=vectors_before,
+            )
+        except Exception as e:
+            msg = f"Qdrant reset failed: {e}"
+            logger.error(msg, exc_info=True)
+            errors.append(msg)
+
+    status = "success" if not errors else ("partial" if (neo4j_result or qdrant_result) else "failed")
+
+    return DatabaseResetResponse(
+        status=status,
+        neo4j=neo4j_result,
+        qdrant=qdrant_result,
+        errors=errors,
+    )
 
 
 # =============================================================================

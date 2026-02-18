@@ -376,7 +376,8 @@ async def get_repository_architecture(repo_name: str = None) -> Dict[str, Any]:
             
             # Get routes — query VertxRoute nodes (backend) using correct relationship
             routes_query = """
-            MATCH (route:VertxRoute)-[:BELONGS_TO]->(r:Repository {name: $name})
+            MATCH (f:File)-[:BELONGS_TO]->(r:Repository {name: $name})
+            MATCH (f)-[:CONTAINS]->(route:VertxRoute)
             RETURN route.method as method, route.path as path, route.handler_method as handler, route.file as file
             ORDER BY route.path
             LIMIT 40
@@ -389,7 +390,8 @@ async def get_repository_architecture(repo_name: str = None) -> Dict[str, Any]:
             
             # Get React components (frontend)
             components_query = """
-            MATCH (c:ReactComponent)-[:BELONGS_TO]->(r:Repository {name: $name})
+            MATCH (f:File)-[:BELONGS_TO]->(r:Repository {name: $name})
+            MATCH (f)-[:CONTAINS]->(c:ReactComponent)
             RETURN c.name as name, c.file as file
             ORDER BY c.name
             LIMIT 30
@@ -401,7 +403,8 @@ async def get_repository_architecture(repo_name: str = None) -> Dict[str, Any]:
             
             # Get API calls (frontend → backend connections)
             api_calls_query = """
-            MATCH (a:ApiCall)-[:BELONGS_TO]->(r:Repository {name: $name})
+            MATCH (f:File)-[:BELONGS_TO]->(r:Repository {name: $name})
+            MATCH (f)-[:CONTAINS]->(a:ApiCall)
             RETURN a.url as url, a.method as method, a.file as file
             LIMIT 20
             """
@@ -753,7 +756,8 @@ async def get_behavioral_classification(file_path: str = None, function_name: st
         MATCH (n)
         WHERE (n:Function OR n:VertxRoute OR n:ReactComponent)
         {f'AND {" AND ".join(conditions)}' if conditions else ''}
-        OPTIONAL MATCH (n)-[:BELONGS_TO]->(r:Repository)
+        OPTIONAL MATCH (f:File)-[:CONTAINS]->(n)
+        OPTIONAL MATCH (f)-[:BELONGS_TO]->(r:Repository)
         RETURN n.name as name, labels(n) as labels, n.file as file,
                n.method as http_method, n.handler_method as handler,
                n.code as code, r.name as repo
