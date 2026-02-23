@@ -106,7 +106,10 @@ class NodeFactory:
                 "repository": repository or "",
                 "repository_hash": repository_hash or "",
                 "language": parsed_data.get("language", self._detect_language(file_path)),
-                "imports_json": json.dumps(parsed_data.get("imports", [])) if parsed_data.get("imports") else "[]",
+                "imports_json": json.dumps(
+                    (parsed_data.get("imports", []) or []) +
+                    (parsed_data.get("from_imports", []) or [])
+                ) if (parsed_data.get("imports") or parsed_data.get("from_imports")) else "[]",
                 "repository_name": repository_name or "",
                 "file_name": file_name,
                 "relative_path": relative_path,
@@ -249,6 +252,46 @@ class NodeFactory:
             except Exception as e:
                 stats["errors"].append(f"Function CALLS edge error: {str(e)}")
             
+            # ── FIX 2: Store error handling patterns on File node ──
+            error_handling = parsed_data.get("error_handling", [])
+            if error_handling:
+                try:
+                    error_summary = json.dumps(error_handling[:50])  # Cap to 50 entries
+                    await session.run("""
+                        MATCH (f:File {id: $fid})
+                        SET f.error_handling = $error_json,
+                            f.error_handler_count = $count
+                    """, {
+                        "fid": file_node_id,
+                        "error_json": error_summary,
+                        "count": len(error_handling),
+                    })
+                except Exception as e:
+                    stats["errors"].append(f"Error handling storage: {str(e)}")
+            
+            # ── FIX 6: Store control flow summary on File node ──
+            control_flow = parsed_data.get("control_flow", [])
+            if control_flow:
+                try:
+                    total_branches = sum(
+                        cf.get("branches", cf.get("cases", 1))
+                        for cf in control_flow
+                    )
+                    cf_summary = json.dumps(control_flow[:50])
+                    await session.run("""
+                        MATCH (f:File {id: $fid})
+                        SET f.control_flow = $cf_json,
+                            f.total_branches = $branches,
+                            f.complexity_hint = $complexity
+                    """, {
+                        "fid": file_node_id,
+                        "cf_json": cf_summary,
+                        "branches": total_branches,
+                        "complexity": "high" if total_branches > 20 else ("medium" if total_branches > 8 else "low"),
+                    })
+                except Exception as e:
+                    stats["errors"].append(f"Control flow storage: {str(e)}")
+            
             # ── Behavioral + Domain enrichment (post-creation) ──
             try:
                 await self._enrich_file_nodes_behavioral(
@@ -383,7 +426,7 @@ class NodeFactory:
         elif isinstance(route, dict):
             path = route.get('path') or route.get('route_info', {}).get('path', '')
             method = route.get('method') or route.get('route_info', {}).get('method', 'GET')
-            handler = route.get('handler_method') or route.get('name', '')
+            handler = route.get('handler_method') or route.get('function_name') or route.get('name', '')
 
             if not handler and isinstance(route.get('handlers'), list) and route['handlers']:
                 first = route['handlers'][0]
@@ -400,6 +443,11 @@ class NodeFactory:
         
         node_id = self._generate_node_id("Route", path, method, file_path)
         
+        # FIX 1: Store code_body on route nodes
+        route_body = ""
+        if isinstance(route, dict):
+            route_body = (route.get("body") or route.get("code") or "")[:5000]
+
         query = """
         MERGE (r:VertxRoute {id: $id})
         SET r.path = $path,
@@ -407,6 +455,7 @@ class NodeFactory:
             r.handler_method = $handler_method,
             r.file = $file,
             r.file_path = $file,
+            r.code_body = $code_body,
             r.mount_target = $mount_target,
             r.mount_target_kind = $mount_target_kind,
             r.mount_target_files = $mount_target_files,
@@ -430,6 +479,7 @@ class NodeFactory:
             "handler_method": handler,
             "file": file_path,
             "file_id": file_node_id,
+            "code_body": route_body,
             "mount_target": mount_target if isinstance(route, dict) else None,
             "mount_target_kind": mount_target_kind if isinstance(route, dict) else None,
             "mount_target_files": mount_target_files if isinstance(route, dict) else [],
@@ -525,7 +575,7 @@ class NodeFactory:
 
         kind = fn.get("type") or "function"
         is_async = bool(fn.get("is_async"))
-        start_line = fn.get("start_line")
+        start_line = fn.get("start_line") or fn.get("line_number")
         end_line = fn.get("end_line")
         
         # Check if this is a handler function for backend repos
@@ -533,6 +583,13 @@ class NodeFactory:
         labels = "Function:HandlerFunction" if (repo_type == "backend" and is_handler) else "Function"
 
         node_id = self._generate_node_id("Function", repository_hash or "", file_path, name)
+
+        # FIX 1: Store code_body, params, return_type on Function nodes
+        code_body = (fn.get("body") or fn.get("code") or "")[:5000]
+        params_str = json.dumps(fn.get("params") or fn.get("parameters") or [])
+        return_type = fn.get("return_type") or ""
+        docstring = fn.get("docstring") or ""
+        calls_list = fn.get("calls") or []
 
         query = f"""
         MERGE (fn:{labels} {{id: $id}})
@@ -543,6 +600,11 @@ class NodeFactory:
             fn.end_line = $end_line,
             fn.file = $file,
             fn.file_path = $file,
+            fn.code_body = $code_body,
+            fn.params = $params,
+            fn.return_type = $return_type,
+            fn.docstring = $docstring,
+            fn.calls = $calls,
             fn.repository_hash = $repository_hash,
             fn.repository_name = $repository_name,
             fn.file_name = $file_name,
@@ -568,6 +630,11 @@ class NodeFactory:
                 "end_line": end_line,
                 "file": file_path,
                 "file_id": file_node_id,
+                "code_body": code_body,
+                "params": params_str,
+                "return_type": return_type,
+                "docstring": docstring[:500],
+                "calls": calls_list,
                 "repository_hash": repository_hash or "",
                 "repository_name": repository_name or "",
                 "file_name": file_name or "",

@@ -43,7 +43,7 @@ class CloneProgress(RemoteProgress):
                 )
                 self.last_percent = percent
 
-
+# dataclass is used to create a class that has default values for its attributes
 @dataclass
 class RepositoryState:
     """State tracking for a repository"""
@@ -94,7 +94,6 @@ class GitService:
         """Add authentication to repository URL"""
         if not url:
             return url
-        
         
         if self.git_token:
             if 'github.com' in url:
@@ -451,6 +450,89 @@ class GitService:
         except Exception as e:
             logger.error(f"Failed to get changed files: {e}", repo=repo_url)
             return []
+    
+    # =========================================================================
+    # FIX 3: Git history integration — per-file temporal metadata
+    # =========================================================================
+    
+    async def get_file_history_stats(
+        self, repo_url: str, file_paths: List[str] = None
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Get per-file temporal metadata from git log:
+          - change_count: total commits touching the file
+          - last_modified_at: timestamp of most recent commit
+          - volatility_score: normalized 0-1 (high = changed often)
+          - contributors: unique author emails
+        
+        Returns dict keyed by repo-relative file path.
+        """
+        if repo_url not in self._repositories:
+            return {}
+        
+        state = self._repositories[repo_url]
+        if not state.local_path or not state.local_path.exists():
+            return {}
+        
+        def _compute_stats() -> Dict[str, Dict[str, Any]]:
+            try:
+                repo = Repo(state.local_path)
+                stats: Dict[str, Dict[str, Any]] = {}
+                max_changes = 1
+                
+                # Use --numstat to get per-file change counts in one pass
+                log_output = repo.git.log(
+                    '--pretty=format:%H|%ae|%aI',
+                    '--name-only',
+                    '--diff-filter=AMRC',
+                    '--no-merges',
+                )
+                
+                current_commit = None
+                current_author = None
+                current_date = None
+                
+                for line in log_output.split('\n'):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if '|' in line and line.count('|') == 2:
+                        parts = line.split('|', 2)
+                        current_commit = parts[0]
+                        current_author = parts[1]
+                        current_date = parts[2]
+                    else:
+                        fpath = line
+                        if file_paths and fpath not in file_paths:
+                            continue
+                        if fpath not in stats:
+                            stats[fpath] = {
+                                'change_count': 0,
+                                'last_modified_at': current_date,
+                                'contributors': set(),
+                            }
+                        stats[fpath]['change_count'] += 1
+                        if current_author:
+                            stats[fpath]['contributors'].add(current_author)
+                        # Keep the most recent date
+                        if current_date and current_date > stats[fpath]['last_modified_at']:
+                            stats[fpath]['last_modified_at'] = current_date
+                        if stats[fpath]['change_count'] > max_changes:
+                            max_changes = stats[fpath]['change_count']
+                
+                # Normalize volatility
+                for fpath, info in stats.items():
+                    info['volatility_score'] = round(info['change_count'] / max_changes, 3)
+                    info['contributors'] = list(info['contributors'])
+                
+                return stats
+                
+            except Exception as e:
+                logger.error(f"Failed to compute file history stats: {e}", repo=repo_url)
+                return {}
+        
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self._executor, _compute_stats)
     
     async def cleanup_repository(self, repo_url: str) -> bool:
         """Remove a cloned repository"""

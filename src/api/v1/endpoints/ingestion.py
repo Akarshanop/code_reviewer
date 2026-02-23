@@ -7,9 +7,10 @@ Enhanced with:
     - Temporal metadata collection (git history analysis)
 """
 import uuid
+import asyncio
 from typing import Dict, Any, List, Optional
 from datetime import datetime
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Body
 from pydantic import BaseModel, Field
 from src.core.logger import get_logger
 from src.services.data_ingestion_service import DataIngestionService
@@ -17,7 +18,11 @@ from src.services.incremental_ingestion import incremental_engine, IncrementalDi
 from src.data_ingestion.git_service import git_service
 from src.database.neo4j_client import neo4j_client
 from config.settings import settings
-
+from src.schemas.endpoints.ingestion_schema import (
+    IngestionRequest,
+    IngestionStatus,
+    RepositoryStatus,
+)
 logger = get_logger(__name__)
 router = APIRouter()
 
@@ -25,54 +30,11 @@ router = APIRouter()
 _ingestion_jobs: Dict[str, Dict[str, Any]] = {}
 
 
-class IngestionRequest(BaseModel):
-    """Request for triggering ingestion"""
-    repositories: Optional[List[str]] = Field(
-        default=None,
-        description="Specific repositories to ingest. If None, ingest all configured repos"
-    )
-    force_refresh: Optional[bool] = Field(
-        default=False,
-        description="Force re-ingestion even if repo hasn't changed"
-    )
-    parse_only: Optional[List[str]] = Field(
-        default=None,
-        description="Only parse specific file types: java, typescript, python"
-    )
-    skip_embeddings: Optional[bool] = Field(
-        default=False,
-        description="Skip embedding generation (faster for testing)"
-    )
-
-
-class IngestionStatus(BaseModel):
-    """Status of ingestion job"""
-    job_id: str
-    status: str 
-    progress: float
-    current_step: str
-    repositories: List[str]
-    stats: Dict[str, Any]
-    errors: List[str]
-    created_at: datetime
-    updated_at: datetime
-
-
-class RepositoryStatus(BaseModel):
-    """Status of a single repository"""
-    name: str
-    url: str
-    last_commit: Optional[str]
-    last_ingestion: Optional[datetime]
-    file_count: int
-    node_count: int
-    status: str
-
 
 @router.post("/trigger")
 async def trigger_ingestion(
-    request: IngestionRequest = None,
-    background_tasks: BackgroundTasks = None
+    request: IngestionRequest = Body(default_factory=IngestionRequest),
+    background_tasks: BackgroundTasks = None,
 ):
     """
     Trigger repository ingestion pipeline.
@@ -86,7 +48,25 @@ async def trigger_ingestion(
     Returns job_id for tracking progress.
     """
     try:
-        request = request or IngestionRequest()
+        # BackgroundTasks should always be provided by FastAPI, but keep a safe fallback.
+        if background_tasks is None:
+            background_tasks = BackgroundTasks()
+
+        # Guardrails: prevent expensive/incorrect modes in production-like environments.
+        env = (getattr(settings, "ENVIRONMENT", "") or "").lower()
+        is_production = env in {"prod", "production"}
+
+        if request.force_refresh and is_production:
+            raise HTTPException(
+                status_code=400,
+                detail="force_refresh is disabled in production. Use incremental ingestion or a controlled admin operation.",
+            )
+
+        if request.skip_embeddings and is_production:
+            raise HTTPException(
+                status_code=400,
+                detail="skip_embeddings is disabled in production because embeddings power semantic extraction/search.",
+            )
         
         job_id = str(uuid.uuid4())
         
@@ -192,11 +172,24 @@ async def list_repositories():
         except Exception as e:
             logger.debug(f"Failed to fetch repository graph stats: {e}")
 
-        repo_statuses = []
-        
-        for repo in repos:
+        # Fetch git states in parallel (much faster with many repos).
+        repo_states = await asyncio.gather(
+            *[git_service.get_repository_info(repo.url) for repo in repos],
+            return_exceptions=True,
+        )
+
+        repo_statuses: List[RepositoryStatus] = []
+
+        for repo, repo_state_result in zip(repos, repo_states, strict=False):
             # Get repo stats from git service (in-memory state keyed by URL)
-            repo_state = await git_service.get_repository_info(repo.url)
+            repo_state = None if isinstance(repo_state_result, Exception) else repo_state_result
+            if isinstance(repo_state_result, Exception):
+                logger.debug(
+                    "Failed to fetch repository info from git_service",
+                    repo=repo.name,
+                    error=str(repo_state_result),
+                )
+
             graph_state = repo_graph_stats.get(repo.name, {})
 
             last_ingested = graph_state.get("last_ingested")
@@ -225,7 +218,7 @@ async def list_repositories():
         
         return {
             "status": "success",
-            "repositories": [r.dict() for r in repo_statuses],
+            "repositories": [r.model_dump() for r in repo_statuses],
             "total": len(repo_statuses)
         }
         

@@ -31,3 +31,17 @@ class ReindexRequest(BaseModel):
 
 class CacheInvalidateRequest(BaseModel):
     cache_type: str = "all"  # all, graph, vector, embedding
+
+
+class DatabaseResetRequest(BaseModel):
+    """Request body for the database reset endpoint."""
+    targets: List[str] = ["neo4j", "qdrant"]  # which databases to wipe
+    confirm: bool = False  # safety flag — must be True to proceed
+
+
+class DatabaseResetResponse(BaseModel):
+    """Response for the database reset endpoint."""
+    status: str
+    neo4j: Optional[Dict[str, Any]] = None
+    qdrant: Optional[Dict[str, Any]] = None
+    errors: List[str] = []

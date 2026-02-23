@@ -58,12 +58,14 @@ async def get_repository_overview() -> Dict[str, Any]:
         repos_query = """
         MATCH (r:Repository)
         OPTIONAL MATCH (f:File)-[:BELONGS_TO]->(r)
-        WITH r, count(DISTINCT f) as file_count
-        OPTIONAL MATCH (rt:VertxRoute)-[:BELONGS_TO]->(r)
-        WITH r, file_count, count(DISTINCT rt) as route_count
-        OPTIONAL MATCH (c:ReactComponent)-[:BELONGS_TO]->(r)
-        RETURN r.name as name, r.language as language, r.path as path,
-               file_count, route_count, count(DISTINCT c) as component_count
+        WITH r, count(DISTINCT f) AS file_count
+        OPTIONAL MATCH (f2:File)-[:BELONGS_TO]->(r)
+        OPTIONAL MATCH (f2)-[:CONTAINS]->(rt:VertxRoute)
+        WITH r, file_count, count(DISTINCT rt) AS route_count
+        OPTIONAL MATCH (f3:File)-[:BELONGS_TO]->(r)
+        OPTIONAL MATCH (f3)-[:CONTAINS]->(c:ReactComponent)
+        RETURN r.name AS name, r.language AS language, r.path AS path,
+               file_count, route_count, count(DISTINCT c) AS component_count
         """
         repos = await neo4j_client.execute_query(repos_query)
 
@@ -609,7 +611,7 @@ async def get_cross_repository_relationships(repo_name: str = "") -> Dict[str, A
         # Find cross-repo links (ApiCall nodes linking FE components to BE routes)
         cross_query = """
         MATCH (a:ApiCall)-[:CALLS_ROUTE]->(r:VertxRoute)
-        OPTIONAL MATCH (comp:ReactComponent)-[:CALLS]->(a)
+        OPTIONAL MATCH (comp:ReactComponent)-[:MAKES_API_CALL]->(a)
         RETURN comp.name as frontend_component, a.endpoint as api_endpoint,
                a.method as http_method, r.path as backend_route,
                r.handler_method as handler, r.file as handler_file
@@ -620,8 +622,8 @@ async def get_cross_repository_relationships(repo_name: str = "") -> Dict[str, A
         # Find EventBus patterns
         eventbus_query = """
         MATCH (e:EventBusNode)
-        OPTIONAL MATCH (pub)-[:PUBLISHES]->(e)
-        OPTIONAL MATCH (e)-[:CONSUMED_BY]->(sub)
+        OPTIONAL MATCH (pub)-[:PUBLISHES_TO]->(e)
+        OPTIONAL MATCH (sub)-[:CONSUMES_FROM]->(e)
         RETURN e.address as address, pub.name as publisher, sub.name as subscriber,
                e.file as file
         LIMIT 20
