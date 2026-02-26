@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any, Tuple
 
 from src.core.logger import get_logger
+from src.core.id_generator import generate_node_id, generate_repository_hash
 
 logger = get_logger(__name__)
 
@@ -275,20 +276,36 @@ class IncrementalIngestionEngine:
         if not file_paths:
             return 0
 
+        repo_hash = await self._resolve_repository_hash(neo4j_client, repository_name)
         removed = 0
         for file_path in file_paths:
             try:
-                # Delete all nodes that belong to this file
+                file_node_id = generate_node_id("File", repo_hash, file_path)
+                # Prefer deterministic file-node ID. Keep a path fallback for legacy rows.
                 query = """
-                MATCH (n)
-                WHERE n.repository_name = $repo 
-                AND (n.file_name = $file_path OR n.relative_path = $file_path)
+                MATCH (f:File)
+                WHERE (
+                    ($repo_hash <> '' AND f.id = $file_node_id)
+                    OR ($repo_hash <> '' AND f.repository_hash = $repo_hash AND f.relative_path = $file_path)
+                    OR ($repo_hash = '' AND f.repository_name = $repo AND f.relative_path = $file_path)
+                )
+                WITH collect(f) AS files
+                UNWIND files AS f
+                OPTIONAL MATCH (f)-[:CONTAINS]->(child)
+                WITH collect(DISTINCT f) + collect(DISTINCT child) AS nodes_to_delete
+                UNWIND nodes_to_delete AS n
+                WITH DISTINCT n
                 DETACH DELETE n
                 RETURN count(n) as deleted_count
                 """
                 result = await neo4j_client.execute_write_query(
                     query,
-                    {"repo": repository_name, "file_path": file_path},
+                    {
+                        "repo": repository_name,
+                        "repo_hash": repo_hash,
+                        "file_path": file_path,
+                        "file_node_id": file_node_id,
+                    },
                 )
                 if result:
                     removed += result[0].get("deleted_count", 0) if result else 0
@@ -296,6 +313,169 @@ class IncrementalIngestionEngine:
                 logger.warning(f"Failed to remove nodes for {file_path}: {e}")
 
         return removed
+
+    async def expand_relink_scope(
+        self,
+        neo4j_client: Any,
+        repository_name: str,
+        changed_files: List[str],
+        max_depth: int = 3,
+    ) -> List[str]:
+        """
+        Build dependency-aware relink scope from changed files.
+
+        Traverses reverse IMPORTS plus CALLS_FUNCTION-induced file dependencies.
+        """
+        if not changed_files:
+            return []
+
+        repo_hash = await self._resolve_repository_hash(neo4j_client, repository_name)
+        scope: Set[str] = set(changed_files)
+        frontier: Set[str] = set(changed_files)
+
+        for _ in range(max_depth):
+            if not frontier:
+                break
+
+            dependents = await self._find_direct_dependents(
+                neo4j_client=neo4j_client,
+                repo_hash=repo_hash,
+                repository_name=repository_name,
+                target_files=list(frontier),
+            )
+            next_frontier = dependents - scope
+            scope.update(next_frontier)
+            frontier = next_frontier
+
+        return sorted(scope)
+
+    async def should_promote_to_full_relink(
+        self,
+        neo4j_client: Any,
+        repository_name: str,
+        changed_files: List[str],
+        fanout_threshold: int = 100,
+    ) -> bool:
+        """Promote high fan-out incremental changes to full relink pass."""
+        if not changed_files:
+            return False
+
+        repo_hash = await self._resolve_repository_hash(neo4j_client, repository_name)
+        query = """
+        UNWIND $files AS file_path
+        MATCH (target:File)
+        WHERE (
+            ($repo_hash <> '' AND target.repository_hash = $repo_hash AND target.relative_path = file_path)
+            OR ($repo_hash = '' AND target.repository_name = $repo AND target.relative_path = file_path)
+        )
+        OPTIONAL MATCH (importer:File)-[:IMPORTS]->(target)
+        WHERE (
+            ($repo_hash <> '' AND importer.repository_hash = $repo_hash)
+            OR ($repo_hash = '' AND importer.repository_name = $repo)
+        )
+        WITH file_path, count(DISTINCT importer) AS import_fanout
+        RETURN max(import_fanout) AS max_fanout
+        """
+        rows = await neo4j_client.execute_query(
+            query,
+            {"files": changed_files, "repo_hash": repo_hash, "repo": repository_name},
+        )
+        max_fanout = int((rows or [{}])[0].get("max_fanout") or 0)
+        return max_fanout >= fanout_threshold
+
+    async def _resolve_repository_hash(self, neo4j_client: Any, repository_name: str) -> str:
+        """Resolve repository hash from graph metadata with deterministic fallback."""
+        repo_hash = ""
+        try:
+            rows = await neo4j_client.execute_query(
+                """
+                MATCH (r:Repository)
+                WHERE r.name = $repo OR r.url = $repo
+                RETURN r.hash AS hash
+                LIMIT 1
+                """,
+                {"repo": repository_name},
+            )
+            if rows:
+                repo_hash = rows[0].get("hash") or ""
+            if not repo_hash:
+                rows = await neo4j_client.execute_query(
+                    """
+                    MATCH (f:File)
+                    WHERE f.repository_name = $repo
+                    RETURN f.repository_hash AS hash
+                    LIMIT 1
+                    """,
+                    {"repo": repository_name},
+                )
+                if rows:
+                    repo_hash = rows[0].get("hash") or ""
+        except Exception:
+            repo_hash = ""
+
+        if not repo_hash:
+            repo_hash = generate_repository_hash(repository_name)
+        return repo_hash
+
+    async def _find_direct_dependents(
+        self,
+        neo4j_client: Any,
+        repo_hash: str,
+        repository_name: str,
+        target_files: List[str],
+    ) -> Set[str]:
+        """Find files that directly depend on any file in `target_files`."""
+        if not target_files:
+            return set()
+
+        params = {"files": target_files, "repo_hash": repo_hash, "repo": repository_name}
+
+        import_rows = await neo4j_client.execute_query(
+            """
+            UNWIND $files AS file_path
+            MATCH (target:File)
+            WHERE (
+                ($repo_hash <> '' AND target.repository_hash = $repo_hash AND target.relative_path = file_path)
+                OR ($repo_hash = '' AND target.repository_name = $repo AND target.relative_path = file_path)
+            )
+            MATCH (dep:File)-[:IMPORTS]->(target)
+            WHERE (
+                ($repo_hash <> '' AND dep.repository_hash = $repo_hash)
+                OR ($repo_hash = '' AND dep.repository_name = $repo)
+            )
+            RETURN DISTINCT dep.relative_path AS file_path
+            """,
+            params,
+        )
+
+        call_rows = await neo4j_client.execute_query(
+            """
+            UNWIND $files AS file_path
+            MATCH (target_file:File)
+            WHERE (
+                ($repo_hash <> '' AND target_file.repository_hash = $repo_hash AND target_file.relative_path = file_path)
+                OR ($repo_hash = '' AND target_file.repository_name = $repo AND target_file.relative_path = file_path)
+            )
+            MATCH (dep_file:File)-[:CONTAINS]->(:Function)-[:CALLS_FUNCTION]->(:Function)<-[:CONTAINS]-(target_file)
+            WHERE (
+                ($repo_hash <> '' AND dep_file.repository_hash = $repo_hash)
+                OR ($repo_hash = '' AND dep_file.repository_name = $repo)
+            )
+            RETURN DISTINCT dep_file.relative_path AS file_path
+            """,
+            params,
+        )
+
+        out: Set[str] = set()
+        for row in (import_rows or []):
+            file_path = row.get("file_path")
+            if file_path:
+                out.add(file_path)
+        for row in (call_rows or []):
+            file_path = row.get("file_path")
+            if file_path:
+                out.add(file_path)
+        return out
 
     async def remove_file_embeddings(
         self,
@@ -308,15 +488,23 @@ class IncrementalIngestionEngine:
             return 0
 
         removed = 0
+        try:
+            from qdrant_client.models import Filter, FieldCondition, MatchValue
+        except ImportError:
+            logger.warning("qdrant_client.models not available; cannot remove embeddings")
+            return 0
+
         for file_path in file_paths:
             try:
-                deleted = await qdrant_client.delete_vectors({
-                    "must": [
-                        {"key": "repository_name", "match": {"value": repository_name}},
-                        {"key": "file_name", "match": {"value": file_path}},
+                # Qdrant payload uses "repository_name" and "relative_path" (or "file")
+                filter_conditions = Filter(
+                    must=[
+                        FieldCondition(key="repository_name", match=MatchValue(value=repository_name)),
+                        FieldCondition(key="relative_path", match=MatchValue(value=file_path)),
                     ]
-                })
-                removed += deleted if isinstance(deleted, int) else 0
+                )
+                await qdrant_client.delete_vectors(filter_conditions, wait=True)
+                removed += 1
             except Exception as e:
                 logger.warning(f"Failed to remove embeddings for {file_path}: {e}")
 

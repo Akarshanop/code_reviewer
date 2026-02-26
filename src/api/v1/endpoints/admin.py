@@ -125,7 +125,7 @@ async def get_system_stats():
         total_vectors = 0
         for collection in collections:
             info = await qdrant_client.get_collection_info(collection)
-            total_vectors += info.get("vectors_count", 0)
+            total_vectors += info.get("vectors_count") or info.get("points_count") or 0
         
         return SystemStatsResponse(
             repositories=len(settings.REPOSITORIES),
@@ -307,7 +307,8 @@ async def trigger_reindex(
                 repos = settings.REPOSITORIES
             
             # Run full pipeline: parse → build graph → generate embeddings
-            parse_result = await service.parse_repositories([r.dict() for r in repos])
+            repo_dicts = [r.model_dump() if hasattr(r, 'model_dump') else r.dict() for r in repos]
+            parse_result = await service.parse_repositories(repo_dicts)
             parsed_data = parse_result.get("parsed_data", {})
             
             if parsed_data:
@@ -478,16 +479,16 @@ async def get_metrics():
         graph_stats = await neo4j_client.get_graph_stats()
         metrics.append(f'code_intel_graph_nodes_total {graph_stats.get("total_nodes", 0)}')
         metrics.append(f'code_intel_graph_relationships_total {graph_stats.get("total_relationships", 0)}')
-    except:
-        pass
+    except Exception as e:
+        logger.debug("Neo4j stats unavailable for metrics", error=str(e))
     
     try:
         collections = await qdrant_client.list_collections()
         for collection in collections:
             info = await qdrant_client.get_collection_info(collection)
             metrics.append(f'code_intel_vector_count{{collection="{collection}"}} {info.get("vectors_count", 0)}')
-    except:
-        pass
+    except Exception as e:
+        logger.debug("Qdrant stats unavailable for metrics", error=str(e))
     
     metrics.append(f'code_intel_repositories_total {len(settings.REPOSITORIES)}')
     

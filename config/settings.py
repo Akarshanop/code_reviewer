@@ -48,7 +48,8 @@ class RepositoryConfig:
         self.exclude_patterns = exclude_patterns or [
             "**/node_modules/**", "**/target/**", "**/build/**", 
             "**/.git/**", "**/dist/**", "**/__pycache__/**",
-            "**/vendor/**", "**/.gradle/**", "**/bin/**", "**/obj/**"
+            "**/vendor/**", "**/.gradle/**", "**/bin/**", "**/obj/**",
+            "**/.venv/**", "**/venv/**", "**/.env/**", "**/env/**",
         ]
         # Auto-detected fields (populated during parsing)
         self.detected_language: Optional[str] = None
@@ -205,12 +206,13 @@ class Settings(BaseSettings):
     # GitLab is the primary provider - just provide repo URLs
     # ======================
     GIT_REPOS: str = Field(default="[]")  # JSON array of repository URLs (simple list)
-    GIT_REPOS_CONFIG: str = Field(default="[]")  # JSON array with {url, branch} objects
+    GIT_REPOS_CONFIG: str = Field(default="[]")  
     GIT_PROVIDER: str = Field(default="gitlab")  # gitlab, github, bitbucket, azure_devops
     GIT_TOKEN: Optional[str] = Field(default=None)  # GitLab: Personal Access Token or OAuth token
     GIT_USERNAME: Optional[str] = Field(default=None)  # Optional username
     GIT_DEFAULT_BRANCH: str = Field(default="main")
     GIT_WORK_DIR: Path = Field(default=PROJECT_ROOT / "data" / "repos")
+    REPOS_BASE_DIR: Path = Field(default=PROJECT_ROOT / "data" / "repos")
     GIT_CLONE_DEPTH: int = Field(default=1)  # Shallow clone for faster ingestion
     GIT_TIMEOUT: int = Field(default=300)  # Timeout for git operations in seconds
     # GitLab-specific settings
@@ -283,6 +285,13 @@ class Settings(BaseSettings):
         path = Path(v) if isinstance(v, str) else v
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+    @field_validator('REPOS_BASE_DIR', mode='before')
+    @classmethod
+    def ensure_repos_base_dir_exists(cls, v) -> Path:
+        path = Path(v) if isinstance(v, str) else v
+        path.mkdir(parents=True, exist_ok=True)
+        return path
     
     @computed_field
     @property
@@ -315,16 +324,7 @@ class Settings(BaseSettings):
         return self.get_repositories()
     
     def get_repositories(self) -> List[RepositoryConfig]:
-        """
-        Parse and return list of repository configurations.
-        
-        Supports three formats:
-        1. Typed format: GIT_REPOS='[{"backend": ["url1", "url2"]}, {"frontend": ["url3"]}]'
-        2. Simple URL list: GIT_REPOS='["url1", "url2"]'
-        3. Detailed config: GIT_REPOS_CONFIG='[{"url": "...", "branch": "develop"}]'
-        
-        Language/type is auto-detected, but backend/frontend classification comes from config.
-        """
+    
         repos = []
         
         # First try detailed config
@@ -335,69 +335,14 @@ class Settings(BaseSettings):
                     repos.append(RepositoryConfig(
                         url=config.get("url", ""),
                         branch=config.get("branch", self.GIT_DEFAULT_BRANCH),
-                        name=config.get("name"),
-                        include_patterns=config.get("include_patterns"),
-                        exclude_patterns=config.get("exclude_patterns"),
+                
                         repo_type=config.get("repo_type")
                     ))
         except (json.JSONDecodeError, TypeError) as e:
             logger.debug(f"Could not parse GIT_REPOS_CONFIG: {e}")
         
         # Try typed format: [{"backend": [...]}, {"frontend": [...]}]
-        if not repos:
-            try:
-                repo_data = json.loads(self.GIT_REPOS)
-                
-                # Check if it's the typed format (list of dicts with backend/frontend keys)
-                if isinstance(repo_data, list) and repo_data and isinstance(repo_data[0], dict):
-                    is_typed_format = any(
-                        key in repo_data[0] for key in ["backend", "frontend"]
-                    )
-                    
-                    if is_typed_format:
-                        for item in repo_data:
-                            if isinstance(item, dict):
-                                for repo_type, urls in item.items():
-                                    if isinstance(urls, list):
-                                        for url in urls:
-                                            if isinstance(url, str) and url.strip():
-                                                repos.append(RepositoryConfig(
-                                                    url=url.strip(),
-                                                    branch=self.GIT_DEFAULT_BRANCH,
-                                                    repo_type=repo_type  # 'backend' or 'frontend'
-                                                ))
-                        logger.info(f"Parsed {len(repos)} repos from typed format (backend/frontend)")
-                    else:
-                        # Old format with url/branch objects
-                        for config in repo_data:
-                            if config.get("url"):
-                                repos.append(RepositoryConfig(
-                                    url=config.get("url", ""),
-                                    branch=config.get("branch", self.GIT_DEFAULT_BRANCH),
-                                    repo_type=config.get("repo_type")
-                                ))
-                
-                # Simple URL list: ["url1", "url2"]
-                elif isinstance(repo_data, list):
-                    for url in repo_data:
-                        if isinstance(url, str) and url.strip():
-                            # Auto-detect repo_type from URL
-                            url_lower = url.lower()
-                            repo_type = None
-                            if any(kw in url_lower for kw in ['backend', 'api', 'server', '-be', '_be']):
-                                repo_type = 'backend'
-                            elif any(kw in url_lower for kw in ['frontend', 'ui', 'web', 'client', '-fe', '_fe']):
-                                repo_type = 'frontend'
-                            
-                            repos.append(RepositoryConfig(
-                                url=url.strip(),
-                                branch=self.GIT_DEFAULT_BRANCH,
-                                repo_type=repo_type
-                            ))
-                            
-            except (json.JSONDecodeError, TypeError) as e:
-                logger.debug(f"Could not parse GIT_REPOS: {e}")
-        
+       
         return repos
     
     def get_api_key_for_model(self, model_name: str) -> Optional[str]:

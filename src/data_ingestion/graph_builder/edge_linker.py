@@ -34,7 +34,7 @@ class EdgeLinker:
             "behavioral_edges_created": 0,
         }
     
-    async def link_all_edges(self, session=None) -> Dict[str, Any]:
+    async def link_all_edges(self, session=None, repo_hash: str = "") -> Dict[str, Any]:
         """
         Link all types of edges between code artifacts.
         
@@ -56,9 +56,9 @@ class EdgeLinker:
         try:
             if not use_external_session:
                 async with neo4j_client.session() as session:
-                    stats = await self._link_all_edges_internal(session, stats)
+                    stats = await self._link_all_edges_internal(session, stats, repo_hash)
             else:
-                stats = await self._link_all_edges_internal(session, stats)
+                stats = await self._link_all_edges_internal(session, stats, repo_hash)
             
             logger.info(
                 "All edges linked successfully",
@@ -72,52 +72,56 @@ class EdgeLinker:
         
         return stats
     
-    async def _link_all_edges_internal(self, session, stats: Dict[str, Any]) -> Dict[str, Any]:
+    async def _link_all_edges_internal(self, session, stats: Dict[str, Any], repo_hash: str = "") -> Dict[str, Any]:
         """Internal method to link all edges with provided session"""
 
         # 1. Compose mount points (app.use) to downstream routes
-        mounts_result = await self._link_mounts_to_routes(session)
+        mounts_result = await self._link_mounts_to_routes(session, repo_hash)
         stats["relationships_created"] += mounts_result.get("created", 0)
         stats["by_type"]["MOUNTS"] = mounts_result.get("created", 0)
 
         # 2. Link API calls to Vert.x routes
-        api_result = await self._link_api_calls_to_routes(session)
+        api_result = await self._link_api_calls_to_routes(session, repo_hash)
         stats["relationships_created"] += api_result.get("created", 0)
         stats["by_type"]["CALLS_ROUTE"] = api_result.get("created", 0)
         
         # 3. Link routes to handler functions (best-effort)
-        handler_result = await self._link_routes_to_functions(session)
+        handler_result = await self._link_routes_to_functions(session, repo_hash)
         stats["relationships_created"] += handler_result.get("created", 0)
         stats["by_type"]["HANDLED_BY"] = handler_result.get("created", 0)
 
         # 4. Link EventBus producers to consumers
-        eventbus_result = await self._link_eventbus_producers_consumers(session)
+        eventbus_result = await self._link_eventbus_producers_consumers(session, repo_hash)
         stats["relationships_created"] += eventbus_result.get("created", 0)
         stats["by_type"]["PUBLISHES_TO"] = eventbus_result.get("created", 0)
         
         # 5. Link DTO usages
-        dto_result = await self._link_dto_usages(session)
+        dto_result = await self._link_dto_usages(session, repo_hash)
         stats["relationships_created"] += dto_result.get("created", 0)
         stats["by_type"]["USES_DTO"] = dto_result.get("created", 0)
         
         # 6. Link component hierarchies
-        component_result = await self._link_component_hierarchies(session)
+        component_result = await self._link_component_hierarchies(session, repo_hash)
         stats["relationships_created"] += component_result.get("created", 0)
         stats["by_type"]["RENDERS"] = component_result.get("created", 0)
         
         # 7. Link services to their dependencies
-        service_result = await self._link_service_dependencies(session)
+        service_result = await self._link_service_dependencies(session, repo_hash)
         stats["relationships_created"] += service_result.get("created", 0)
         stats["by_type"]["DEPENDS_ON"] = service_result.get("created", 0)
 
         # 8. Create behavioral edges (GUARDS, ESCALATES_FAILURE, REQUIRES_CONSISTENCY)
-        behavioral_result = await self._create_behavioral_edges(session)
+        behavioral_result = await self._create_behavioral_edges(session, repo_hash)
         stats["relationships_created"] += behavioral_result.get("created", 0)
         stats["by_type"]["BEHAVIORAL"] = behavioral_result.get("created", 0)
+
+        # 9. Calibrate edge confidence/evidence for relationships that don't set it explicitly.
+        calibration_result = await self._calibrate_edge_confidence(session, repo_hash)
+        stats["by_type"]["CALIBRATED"] = calibration_result.get("updated", 0)
         
         return stats
 
-    async def _link_mounts_to_routes(self, session) -> Dict[str, Any]:
+    async def _link_mounts_to_routes(self, session, repo_hash: str = "") -> Dict[str, Any]:
         """Link app.use('/prefix', router) mounts to routes within mounted modules and compute full_path."""
         query = """
         MATCH (mount:VertxRoute)
@@ -125,9 +129,11 @@ class EdgeLinker:
           AND mount.path IS NOT NULL AND mount.path <> ''
           AND mount.mount_target_files IS NOT NULL
           AND size(mount.mount_target_files) > 0
+          AND ($repo_hash = '' OR mount.repository_hash = $repo_hash)
         UNWIND mount.mount_target_files AS target_file
         MATCH (f:File {path: target_file})-[:CONTAINS]->(route:VertxRoute)
         WHERE route.method <> 'USE'
+          AND ($repo_hash = '' OR route.repository_hash = $repo_hash)
         MERGE (mount)-[m:MOUNTS]->(route)
         SET m.created_at = coalesce(m.created_at, datetime()),
             m.last_updated = datetime(),
@@ -141,7 +147,7 @@ class EdgeLinker:
         """
 
         try:
-            result = await session.run(query)
+            result = await session.run(query, {"repo_hash": repo_hash})
             record = await result.single()
             created = record["relationships_created"] if record else 0
             return {"created": created}
@@ -149,13 +155,15 @@ class EdgeLinker:
             logger.error("Failed to link mounts to routes", error=str(e))
             return {"created": 0, "error": str(e)}
 
-    async def _link_routes_to_functions(self, session) -> Dict[str, Any]:
+    async def _link_routes_to_functions(self, session, repo_hash: str = "") -> Dict[str, Any]:
         """Link VertxRoute nodes to Function nodes when handler_method matches function name (same file)."""
         query = """
         MATCH (route:VertxRoute)
         WHERE route.handler_method IS NOT NULL AND route.handler_method <> ''
+          AND ($repo_hash = '' OR route.repository_hash = $repo_hash)
         MATCH (fn:Function)
         WHERE fn.file = route.file
+          AND ($repo_hash = '' OR fn.repository_hash = $repo_hash)
           AND (
             route.handler_method = fn.name
             OR route.handler_method ENDS WITH '.' + fn.name
@@ -167,7 +175,7 @@ class EdgeLinker:
         """
 
         try:
-            result = await session.run(query)
+            result = await session.run(query, {"repo_hash": repo_hash})
             record = await result.single()
             created = record["relationships_created"] if record else 0
             return {"created": created}
@@ -175,15 +183,17 @@ class EdgeLinker:
             logger.error("Failed to link routes to functions", error=str(e))
             return {"created": 0, "error": str(e)}
     
-    async def _link_api_calls_to_routes(self, session) -> Dict[str, Any]:
+    async def _link_api_calls_to_routes(self, session, repo_hash: str = "") -> Dict[str, Any]:
         """Link React API calls to Vert.x routes with path normalization"""
         
         query = """
         // Find all API calls and routes
         MATCH (api:ApiCall)
         WHERE api.url IS NOT NULL AND api.url <> ''
+          AND ($repo_hash = '' OR api.repository_hash = $repo_hash)
            MATCH (route:VertxRoute)
            WHERE (route.path IS NOT NULL AND route.path <> '')
+             AND ($repo_hash = '' OR route.repository_hash = $repo_hash)
         
         // Normalize and match paths
         WITH api, route,
@@ -219,7 +229,7 @@ class EdgeLinker:
         """
         
         try:
-            result = await session.run(query)
+            result = await session.run(query, {"repo_hash": repo_hash})
             record = await result.single()
             created = record["relationships_created"] if record else 0
             
@@ -230,19 +240,21 @@ class EdgeLinker:
             logger.error("Failed to link API calls to routes", error=str(e))
             return {"created": 0, "error": str(e)}
     
-    async def _link_eventbus_producers_consumers(self, session) -> Dict[str, Any]:
+    async def _link_eventbus_producers_consumers(self, session, repo_hash: str = "") -> Dict[str, Any]:
         """Link EventBus producers to consumers by address"""
         
         query = """
         // Find all EventBus publishers
         MATCH (producer:EventBusNode)
         WHERE producer.type IN ['publish', 'send', 'request', 'producer']
+          AND ($repo_hash = '' OR producer.repository_hash = $repo_hash)
         
         // Find consumers with matching address
         MATCH (consumer:EventBusNode)
         WHERE consumer.type IN ['consume', 'consumer', 'handler']
           AND consumer.address = producer.address
           AND consumer <> producer
+          AND ($repo_hash = '' OR consumer.repository_hash = $repo_hash)
         
         // Create bidirectional relationships
         MERGE (producer)-[r1:PUBLISHES_TO]->(consumer)
@@ -257,7 +269,7 @@ class EdgeLinker:
         """
         
         try:
-            result = await session.run(query)
+            result = await session.run(query, {"repo_hash": repo_hash})
             record = await result.single()
             created = record["relationships_created"] if record else 0
             
@@ -268,18 +280,22 @@ class EdgeLinker:
             logger.error("Failed to link EventBus producers/consumers", error=str(e))
             return {"created": 0, "error": str(e)}
     
-    async def _link_dto_usages(self, session) -> Dict[str, Any]:
+    async def _link_dto_usages(self, session, repo_hash: str = "") -> Dict[str, Any]:
         """Link DTO usages across backend and frontend"""
         
         query = """
         // Find DTOs
         MATCH (dto:DTO)
         WHERE dto.name IS NOT NULL
+          AND ($repo_hash = '' OR dto.repository_hash = $repo_hash)
         
         // Find routes that might use DTOs (in file or handler)
         OPTIONAL MATCH (route:VertxRoute)
-        WHERE route.file CONTAINS dto.name 
-           OR route.handler_method CONTAINS dto.name
+        WHERE ($repo_hash = '' OR route.repository_hash = $repo_hash)
+          AND (
+            route.file CONTAINS dto.name
+            OR route.handler_method CONTAINS dto.name
+          )
         
         FOREACH (_ IN CASE WHEN route IS NOT NULL THEN [1] ELSE [] END |
             MERGE (route)-[r:USES_DTO]->(dto)
@@ -289,7 +305,8 @@ class EdgeLinker:
         // Find React components that might use DTOs (in props)
         WITH dto
         OPTIONAL MATCH (comp:ReactComponent)
-        WHERE ANY(prop IN comp.props WHERE prop CONTAINS dto.name)
+        WHERE ($repo_hash = '' OR comp.repository_hash = $repo_hash)
+          AND ANY(prop IN comp.props WHERE prop CONTAINS dto.name)
         
         FOREACH (_ IN CASE WHEN comp IS NOT NULL THEN [1] ELSE [] END |
             MERGE (comp)-[r:USES_DTO_FIELDS]->(dto)
@@ -299,7 +316,8 @@ class EdgeLinker:
         // Find services that reference DTOs
         WITH dto
         OPTIONAL MATCH (service:Service)
-        WHERE service.file CONTAINS dto.name
+        WHERE ($repo_hash = '' OR service.repository_hash = $repo_hash)
+          AND service.file CONTAINS dto.name
         
         FOREACH (_ IN CASE WHEN service IS NOT NULL THEN [1] ELSE [] END |
             MERGE (service)-[r:USES_DTO]->(dto)
@@ -311,13 +329,14 @@ class EdgeLinker:
         
         # Also run a count query
         count_query = """
-        MATCH ()-[r:USES_DTO|USES_DTO_FIELDS]->()
+        MATCH (src)-[r:USES_DTO|USES_DTO_FIELDS]->()
+        WHERE $repo_hash = '' OR src.repository_hash = $repo_hash
         RETURN count(r) as relationships_created
         """
         
         try:
-            await session.run(query)
-            count_result = await session.run(count_query)
+            await session.run(query, {"repo_hash": repo_hash})
+            count_result = await session.run(count_query, {"repo_hash": repo_hash})
             record = await count_result.single()
             created = record["relationships_created"] if record else 0
             
@@ -328,7 +347,7 @@ class EdgeLinker:
             logger.error("Failed to link DTO usages", error=str(e))
             return {"created": 0, "error": str(e)}
     
-    async def _link_component_hierarchies(self, session) -> Dict[str, Any]:
+    async def _link_component_hierarchies(self, session, repo_hash: str = "") -> Dict[str, Any]:
         """Link React component parent-child relationships"""
         
         query = """
@@ -337,6 +356,8 @@ class EdgeLinker:
         MATCH (child:ReactComponent)
         WHERE parent.name <> child.name
           AND parent.file IS NOT NULL
+          AND ($repo_hash = '' OR parent.repository_hash = $repo_hash)
+          AND ($repo_hash = '' OR child.repository_hash = $repo_hash)
         
         // Read the parent's file to check for child usage
         // (This is a simplified check - in production you'd parse JSX)
@@ -355,7 +376,7 @@ class EdgeLinker:
         """
         
         try:
-            result = await session.run(query)
+            result = await session.run(query, {"repo_hash": repo_hash})
             record = await result.single()
             created = record["relationships_created"] if record else 0
             
@@ -366,7 +387,7 @@ class EdgeLinker:
             logger.error("Failed to link component hierarchies", error=str(e))
             return {"created": 0, "error": str(e)}
     
-    async def _link_service_dependencies(self, session) -> Dict[str, Any]:
+    async def _link_service_dependencies(self, session, repo_hash: str = "") -> Dict[str, Any]:
         """Link services to their dependencies (other services, DTOs, etc.)"""
         
         query = """
@@ -375,6 +396,7 @@ class EdgeLinker:
         MATCH (service2:Service)
         WHERE service1 <> service2
           AND service1.repository_hash = service2.repository_hash
+          AND ($repo_hash = '' OR service1.repository_hash = $repo_hash)
           AND service1.file CONTAINS service2.name
         
         MERGE (service1)-[r:DEPENDS_ON]->(service2)
@@ -384,7 +406,7 @@ class EdgeLinker:
         """
         
         try:
-            result = await session.run(query)
+            result = await session.run(query, {"repo_hash": repo_hash})
             record = await result.single()
             created = record["relationships_created"] if record else 0
             
@@ -395,7 +417,7 @@ class EdgeLinker:
             logger.error("Failed to link service dependencies", error=str(e))
             return {"created": 0, "error": str(e)}
     
-    async def _create_behavioral_edges(self, session) -> Dict[str, Any]:
+    async def _create_behavioral_edges(self, session, repo_hash: str = "") -> Dict[str, Any]:
         """
         Create behavioral edges based on node behavioral_labels.
         
@@ -412,6 +434,8 @@ class EdgeLinker:
         WHERE auth.behavioral_labels IS NOT NULL
           AND 'AuthCritical' IN auth.behavioral_labels
           AND NOT type(r) = 'GUARDS'
+          AND ($repo_hash = '' OR coalesce(auth.repository_hash, '') = $repo_hash)
+          AND ($repo_hash = '' OR coalesce(target.repository_hash, '') = $repo_hash)
         MERGE (auth)-[g:GUARDS]->(target)
         SET g.created_at = coalesce(g.created_at, datetime()),
             g.confidence_score = auth.behavioral_confidence,
@@ -420,7 +444,7 @@ class EdgeLinker:
         RETURN count(g) as created
         """
         try:
-            result = await session.run(guards_query)
+            result = await session.run(guards_query, {"repo_hash": repo_hash})
             record = await result.single()
             total_created += record["created"] if record else 0
         except Exception as e:
@@ -432,6 +456,8 @@ class EdgeLinker:
         WHERE target.behavioral_labels IS NOT NULL
           AND 'AsyncFanOut' IN target.behavioral_labels
           AND type(r) IN ['CALLS', 'CALLS_FUNCTION', 'HANDLED_BY', 'CALLS_ROUTE']
+          AND ($repo_hash = '' OR coalesce(source.repository_hash, '') = $repo_hash)
+          AND ($repo_hash = '' OR coalesce(target.repository_hash, '') = $repo_hash)
         MERGE (source)-[ef:ESCALATES_FAILURE]->(target)
         SET ef.created_at = coalesce(ef.created_at, datetime()),
             ef.confidence_score = 0.75,
@@ -440,7 +466,7 @@ class EdgeLinker:
         RETURN count(ef) as created
         """
         try:
-            result = await session.run(escalates_query)
+            result = await session.run(escalates_query, {"repo_hash": repo_hash})
             record = await result.single()
             total_created += record["created"] if record else 0
         except Exception as e:
@@ -453,6 +479,8 @@ class EdgeLinker:
           AND 'TransactionBoundary' IN tx.behavioral_labels
           AND side.behavioral_labels IS NOT NULL
           AND 'SideEffecting' IN side.behavioral_labels
+          AND ($repo_hash = '' OR coalesce(tx.repository_hash, '') = $repo_hash)
+          AND ($repo_hash = '' OR coalesce(side.repository_hash, '') = $repo_hash)
         MERGE (tx)-[rc:REQUIRES_CONSISTENCY]->(side)
         SET rc.created_at = coalesce(rc.created_at, datetime()),
             rc.confidence_score = 0.80,
@@ -461,7 +489,7 @@ class EdgeLinker:
         RETURN count(rc) as created
         """
         try:
-            result = await session.run(consistency_query)
+            result = await session.run(consistency_query, {"repo_hash": repo_hash})
             record = await result.single()
             total_created += record["created"] if record else 0
         except Exception as e:
@@ -470,6 +498,48 @@ class EdgeLinker:
         self.stats["behavioral_edges_created"] = total_created
         logger.info(f"Created {total_created} behavioral edges")
         return {"created": total_created}
+
+    async def _calibrate_edge_confidence(self, session, repo_hash: str = "") -> Dict[str, Any]:
+        """
+        Ensure all operational edges have confidence/evidence metadata so
+        downstream ranking can treat graph edges consistently.
+        """
+        query = """
+        MATCH (a)-[r]->(b)
+        WHERE type(r) IN [
+            'HANDLED_BY', 'MOUNTS', 'PUBLISHES_TO', 'CONSUMES_FROM',
+            'USES_DTO', 'USES_DTO_FIELDS', 'RENDERS', 'DEPENDS_ON'
+        ]
+          AND ($repo_hash = '' OR coalesce(a.repository_hash, '') = $repo_hash)
+          AND ($repo_hash = '' OR coalesce(b.repository_hash, '') = $repo_hash)
+        SET r.last_updated = coalesce(r.last_updated, datetime()),
+            r.confidence_score = coalesce(
+                r.confidence_score,
+                CASE type(r)
+                    WHEN 'HANDLED_BY' THEN 0.88
+                    WHEN 'MOUNTS' THEN 0.82
+                    WHEN 'PUBLISHES_TO' THEN 0.84
+                    WHEN 'CONSUMES_FROM' THEN 0.84
+                    WHEN 'USES_DTO' THEN 0.68
+                    WHEN 'USES_DTO_FIELDS' THEN 0.64
+                    WHEN 'RENDERS' THEN 0.60
+                    WHEN 'DEPENDS_ON' THEN 0.66
+                    ELSE 0.60
+                END
+            ),
+            r.evidence_type = coalesce(r.evidence_type, 'heuristic_linking'),
+            r.link_origin = coalesce(r.link_origin, 'edge_linker'),
+            r.provenance_commit = coalesce(r.provenance_commit, ''),
+            r.provenance_ast_range = coalesce(r.provenance_ast_range, [0,0,0,0])
+        RETURN count(r) AS updated
+        """
+        try:
+            result = await session.run(query, {"repo_hash": repo_hash})
+            record = await result.single()
+            return {"updated": record["updated"] if record else 0}
+        except Exception as e:
+            logger.warning("Edge confidence calibration failed", error=str(e))
+            return {"updated": 0, "error": str(e)}
 
     async def find_cross_service_dependencies(self, service_name: str) -> List[Dict[str, Any]]:
         """Find all dependencies for a given service"""

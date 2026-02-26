@@ -5,7 +5,7 @@ referenced by any other code. Reports them so QA/developers can decide
 whether to remove or document them.
 
 Rules:
-- A function is "dead" if it has zero incoming CALLS / CALLS_CROSS_FILE / TESTS edges
+- A function is "dead" if it has zero incoming CALLS / CALLS_FUNCTION / TESTS edges
   AND is not a route handler, entry point, test function, or __init__/__main__.
 - A class is "dead" if none of its methods are called and it's not extended.
 - A route is "dead" if it has no incoming CALLS_API edges from any frontend component.
@@ -49,7 +49,7 @@ class DeadCodeDetector:
             # ══════════════════════════════════════════════════════════════
             dead_fn_result = await session.run("""
                 MATCH (parent_file:File {repository_hash: $repo_hash})-[:CONTAINS]->(fn:Function)
-                OPTIONAL MATCH (caller)-[r:CALLS|CALLS_CROSS_FILE|CALLS_FUNCTION]->(fn)
+                OPTIONAL MATCH (caller)-[r:CALLS|CALLS_FUNCTION]->(fn)
                 OPTIONAL MATCH (test)-[t:TESTS]->(fn)
                 WITH fn, parent_file,
                      count(r) AS incoming_calls,

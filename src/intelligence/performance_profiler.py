@@ -15,11 +15,11 @@ Detects:
 """
 import re
 import json
-import hashlib
 from typing import Dict, List, Any, Set
 from collections import defaultdict
 
 from src.core.logger import get_logger
+from src.intelligence.utils import generate_node_id
 
 logger = get_logger(__name__)
 
@@ -278,7 +278,7 @@ class PerformanceProfiler:
         self, fn_id: str, fn_name: str, file_path: str,
         category: str, message: str, severity: str, line_hint: int = 0
     ) -> Dict[str, Any]:
-        hint_id = hashlib.md5(f"perf:{fn_id}:{category}:{message[:30]}".encode()).hexdigest()[:16]
+        hint_id = generate_node_id("perf", fn_id, category, message[:30])
         return {
             "id": hint_id,
             "function_id": fn_id,

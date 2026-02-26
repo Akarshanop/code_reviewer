@@ -16,7 +16,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from config.settings import settings
 from src.core.logger import setup_logging, get_logger
-from src.api.v1.endpoints import admin, ingestion, developer, chat, prd_qa, intelligence
+from src.api.v1.endpoints import admin, ingestion, developer, chat, prd_qa, intelligence, auth
 from src.agents.orchestrator import agent_orchestrator
 from src.database.neo4j_client import neo4j_client
 from src.database.qdrant_client import qdrant_client
@@ -45,7 +45,6 @@ if settings.LLM_PROVIDER == "gemini" and settings.GOOGLE_CLOUD_SERVICE_ACCOUNT_F
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("🔄 Starting Code Intelligence Platform...")
-    # Use the global singleton orchestrator to avoid double initialization/state.
     app.state.agent_orchestrator = agent_orchestrator
     await agent_orchestrator.initialize()
     logger.info("✅ Agent orchestrator initialized")
@@ -88,52 +87,7 @@ app.add_middleware(
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
-# Validation error handler - log details for 422 errors
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    logger.error(
-        "Validation error",
-        path=request.url.path,
-        method=request.method,
-        errors=exc.errors(),
-        body=str(exc.body)[:500] if exc.body else None
-    )
-    return JSONResponse(
-        status_code=422,
-        content={"detail": exc.errors()}
-    )
-
-
-
-# @app.middleware("http")
-# async def cors_preflight_handler(request: Request, call_next):
-#     """Handle CORS preflight requests explicitly."""
-#     if request.method == "OPTIONS":
-#         origin = request.headers.get("origin", "")
-#         allowed_origins = [
-#             "http://localhost:3000",
-#             "http://localhost:5173",
-#             "http://127.0.0.1:3000",
-#             "http://127.0.0.1:5173"
-#         ]
-        
-#         if origin in allowed_origins:
-#             return Response(
-#                 status_code=200,
-#                 headers={
-#                     "Access-Control-Allow-Origin": origin,
-#                     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
-#                     "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With, Accept, Origin",
-#                     "Access-Control-Allow-Credentials": "true",
-#                     "Access-Control-Max-Age": "3600"
-#                 }
-#             )
-    
-#     response = await call_next(request)
-#     return response
-
-
-@app.middleware("http")
+# -------------------- LOCAL RUN --------------------
 async def log_requests(request: Request, call_next):
     from src.core.logger import trace_id_var
 
@@ -177,6 +131,7 @@ app.include_router(developer.router, prefix="/api/v1/developer", tags=["develope
 app.include_router(chat.router, prefix="/api/v1/chat", tags=["chat"])
 app.include_router(prd_qa.router, prefix="/api/v1/prd-qa", tags=["prd-qa"])
 app.include_router(intelligence.router, prefix="/api/v1/intelligence", tags=["intelligence"])
+app.include_router(auth.router, prefix="/api/v1/auth", tags=["authentication"])
 
 
 # -------------------- SYSTEM ENDPOINTS --------------------
@@ -190,26 +145,7 @@ async def root():
         "documentation": "/docs"
     }
 
-@app.get("/health")
-async def health():
-    return {
-        "status": "healthy",
-        "timestamp": time.time(),
-        "version": "2.0.0"
-    }
 
-@app.get("/ready")
-async def ready():
-    checks = await asyncio.gather(
-    neo4j_client.health_check(),
-    qdrant_client.health_check(),
-    supabase_client.health_check(),
-    return_exceptions=True
-    )
-    all_healthy = all(
-        check is True for check in checks
-        if not isinstance(check, Exception)
-    )
 
 
 # -------------------- LOCAL RUN --------------------

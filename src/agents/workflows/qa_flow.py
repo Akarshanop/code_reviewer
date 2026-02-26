@@ -11,6 +11,7 @@ Key principles:
 """
 import json
 import yaml
+import asyncio
 from typing import Dict, Any, List, Literal
 from pathlib import Path
 from datetime import datetime
@@ -130,21 +131,34 @@ async def get_behavioral_hotspots() -> Dict[str, Any]:
         routes_query = """
         MATCH (r:VertxRoute)
         RETURN r.name as name, r.method as http_method, r.handler_method as handler,
-               r.path as path, r.file as file, labels(r) as labels
+               r.path as path, r.file as file, labels(r) as labels,
+               r.behavioral_labels as behavioral_labels,
+               r.behavioral_confidence as behavioral_confidence
         """
         routes = await neo4j_client.execute_query(routes_query)
 
         hotspots = []
         for node in (routes or []):
-            cls = behavioral_classifier.classify_node(
-                node_id=node.get("name", ""),
-                name=node.get("handler", "") or node.get("name", ""),
-                node_labels=node.get("labels", []),
-                http_method=node.get("http_method"),
-                is_handler=True,
-            )
-            if cls.labels:
-                label_values = [l.value for l in cls.labels]
+            stored_labels = node.get("behavioral_labels")
+
+            if stored_labels:
+                if isinstance(stored_labels, str):
+                    label_values = [l.strip() for l in stored_labels.split(",") if l.strip()]
+                elif isinstance(stored_labels, list):
+                    label_values = stored_labels
+                else:
+                    label_values = []
+            else:
+                cls = behavioral_classifier.classify_node(
+                    node_id=node.get("name", ""),
+                    name=node.get("handler", "") or node.get("name", ""),
+                    node_labels=node.get("labels", []),
+                    http_method=node.get("http_method"),
+                    is_handler=True,
+                )
+                label_values = [l.value for l in cls.labels] if cls.labels else []
+
+            if label_values:
                 test_recs = []
                 if "AuthCritical" in label_values:
                     test_recs.extend(["Test valid/invalid/expired tokens", "Test RBAC", "Test CSRF"])
@@ -642,6 +656,13 @@ CRITICAL RULES:
         response_message = response.choices[0].message
         ai_message_kwargs = {"content": response_message.content or ""}
 
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            pt = getattr(usage, "prompt_tokens", None) or (usage.get("prompt_tokens", 0) if isinstance(usage, dict) else 0)
+            ct = getattr(usage, "completion_tokens", None) or (usage.get("completion_tokens", 0) if isinstance(usage, dict) else 0)
+            tt = getattr(usage, "total_tokens", None) or (usage.get("total_tokens", 0) if isinstance(usage, dict) else (pt + ct))
+            ai_message_kwargs["response_metadata"] = {"usage": {"input_tokens": pt, "output_tokens": ct, "total_tokens": tt}}
+
         if hasattr(response_message, 'tool_calls') and response_message.tool_calls:
             ai_message_kwargs["tool_calls"] = [
                 {
@@ -687,7 +708,13 @@ async def execute_qa_tools(state: QAState) -> Dict[str, Any]:
         for t in qa_tools:
             if t.name == tool_name:
                 try:
-                    tool_result = await t.ainvoke(tool_args)
+                    tool_result = await asyncio.wait_for(
+                        t.ainvoke(tool_args),
+                        timeout=30.0,
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(f"QA tool {tool_name} timed out")
+                    tool_result = {"error": f"Tool {tool_name} timed out after 30s"}
                 except Exception as e:
                     logger.error(f"QA tool {tool_name} failed: {e}")
                     tool_result = {"error": str(e)}
@@ -782,6 +809,14 @@ CONCISE EXAMPLE:
         content = response.choices[0].message.content or ""
         logger.info("QA synthesis complete", response_length=len(content))
 
+        usage = getattr(response, "usage", None)
+        usage_meta = {}
+        if usage is not None:
+            pt = getattr(usage, "prompt_tokens", None) or (usage.get("prompt_tokens", 0) if isinstance(usage, dict) else 0)
+            ct = getattr(usage, "completion_tokens", None) or (usage.get("completion_tokens", 0) if isinstance(usage, dict) else 0)
+            tt = getattr(usage, "total_tokens", None) or (usage.get("total_tokens", 0) if isinstance(usage, dict) else (pt + ct))
+            usage_meta = {"usage": {"input_tokens": pt, "output_tokens": ct, "total_tokens": tt}}
+
         if not content.strip():
             logger.warning("QA synthesis returned empty — using fallback")
             content = json.dumps({
@@ -790,7 +825,7 @@ CONCISE EXAMPLE:
                 "raw_analysis": "\n\n".join(tool_findings[-6:]),
             })
 
-        return {"messages": [AIMessage(content=content)]}
+        return {"messages": [AIMessage(content=content, response_metadata=usage_meta)]}
 
     except Exception as e:
         logger.error(f"QA synthesis failed: {e}", exc_info=True)

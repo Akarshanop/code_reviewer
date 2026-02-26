@@ -9,12 +9,12 @@ can verify they're not hardcoded in code.
 """
 import re
 import json
-import hashlib
 from pathlib import Path, PurePosixPath
 from typing import Dict, List, Any, Optional, Set
 from collections import defaultdict
 
 from src.core.logger import get_logger
+from src.intelligence.utils import generate_node_id
 
 logger = get_logger(__name__)
 
@@ -230,7 +230,7 @@ class ConfigScanner:
                 key = key.strip()
                 value = value.strip().strip('"').strip("'")
                 is_secret = self._is_secret(key, value)
-                eid = hashlib.md5(f"config:{path}:{key}".encode()).hexdigest()[:16]
+                eid = generate_node_id("config", path, key)
                 entries.append({
                     "id": eid, "key": key,
                     "value": "***REDACTED***" if is_secret else value[:200],
@@ -258,7 +258,7 @@ class ConfigScanner:
             else:
                 value_str = str(v) if v is not None else ""
                 is_secret = self._is_secret(full_key, value_str)
-                eid = hashlib.md5(f"config:{path}:{full_key}".encode()).hexdigest()[:16]
+                eid = generate_node_id("config", path, full_key)
                 entries.append({
                     "id": eid, "key": full_key,
                     "value": "***REDACTED***" if is_secret else value_str[:200],
@@ -277,7 +277,7 @@ class ConfigScanner:
                 key = key.strip()
                 value = value.strip()
                 is_secret = self._is_secret(key, value)
-                eid = hashlib.md5(f"config:{path}:{key}".encode()).hexdigest()[:16]
+                eid = generate_node_id("config", path, key)
                 entries.append({
                     "id": eid, "key": key,
                     "value": "***REDACTED***" if is_secret else value[:200],
@@ -295,7 +295,7 @@ class ConfigScanner:
                 deps = data.get(dep_type, {})
                 if isinstance(deps, dict):
                     for pkg, ver in deps.items():
-                        eid = hashlib.md5(f"config:{path}:{dep_type}.{pkg}".encode()).hexdigest()[:16]
+                        eid = generate_node_id("config", path, f"{dep_type}.{pkg}")
                         entries.append({
                             "id": eid, "key": f"{dep_type}.{pkg}",
                             "value": str(ver), "file": path, "file_id": file_id,
@@ -303,7 +303,7 @@ class ConfigScanner:
                         })
             # Scripts
             for script_name, cmd in data.get("scripts", {}).items():
-                eid = hashlib.md5(f"config:{path}:scripts.{script_name}".encode()).hexdigest()[:16]
+                eid = generate_node_id("config", path, f"scripts.{script_name}")
                 entries.append({
                     "id": eid, "key": f"scripts.{script_name}",
                     "value": str(cmd)[:200], "file": path, "file_id": file_id,
@@ -330,24 +330,25 @@ class ConfigScanner:
     async def _link_config_usage(self, session, repo_hash: str, config_keys: List[str]) -> int:
         """
         Link ConfigEntry nodes to code files that reference their keys.
-        Searches for env var usage patterns in code_body of functions.
+        Uses a single UNWIND batch instead of one query per key.
         """
-        # Build regex patterns for common env access
-        # process.env.KEY, os.environ["KEY"], os.getenv("KEY"), settings.KEY
+        keys = config_keys[:200]
+        if not keys:
+            return 0
+
+        result = await session.run("""
+            UNWIND $keys AS key
+            MATCH (c:ConfigEntry {key: key, repository_hash: $repo_hash})
+            MATCH (fn:Function)
+            WHERE fn.code_body CONTAINS key
+              AND fn.repository_hash = $repo_hash
+            MERGE (fn)-[r:USES_CONFIG]->(c)
+            ON CREATE SET r.created_at = datetime()
+            SET r.last_updated = datetime()
+            RETURN count(r) AS cnt
+        """, {"keys": keys, "repo_hash": repo_hash})
+
         count = 0
-        for key in config_keys[:200]:  # Cap to avoid explosion
-            try:
-                result = await session.run("""
-                    MATCH (c:ConfigEntry {key: $key, repository_hash: $repo_hash})
-                    MATCH (fn:Function)
-                    WHERE fn.code_body CONTAINS $key
-                      AND fn.repository_hash = $repo_hash
-                    MERGE (fn)-[r:USES_CONFIG]->(c)
-                    SET r.created_at = datetime()
-                    RETURN count(r) AS cnt
-                """, {"key": key, "repo_hash": repo_hash})
-                async for rec in result:
-                    count += rec.get("cnt", 0)
-            except Exception:
-                pass
+        async for rec in result:
+            count += rec.get("cnt", 0)
         return count

@@ -10,6 +10,7 @@ Key principles:
 """
 import json
 import yaml
+import asyncio
 from typing import Dict, Any, List, Literal
 from pathlib import Path
 from datetime import datetime
@@ -332,6 +333,106 @@ async def get_complexity_assessment(area: str = None) -> Dict[str, Any]:
         return {"error": str(e)}
 
 
+@tool
+async def find_product_capability(capability_description: str) -> Dict[str, Any]:
+    """
+    Search the codebase for evidence of a specific product capability.
+    Returns a business-language answer: whether the capability exists,
+    how it is implemented at a high level, and confidence level.
+    Use for any client question about whether a feature is supported.
+
+    Args:
+        capability_description: Description of the capability to search for (e.g., 'multi-currency payments')
+
+    Returns:
+        Whether the capability exists with confidence and summary.
+    """
+    try:
+        from src.services.search_service import SearchService
+        search = SearchService()
+        await search.initialize()
+        results = await search.search_codebase(
+            query=capability_description,
+            search_type="hybrid",
+            top_k=8,
+        )
+        combined = results.get("results", {}).get("combined", [])
+        if not combined:
+            return {
+                "capability_found": False,
+                "confidence": "low",
+                "summary": f"No implementation found for: {capability_description}",
+                "evidence_count": 0,
+            }
+        top_score = combined[0].get("score", 0)
+        return {
+            "capability_found": top_score > 0.5,
+            "confidence": "high" if top_score > 0.7 else "medium" if top_score > 0.5 else "low",
+            "evidence_count": len(combined),
+            "implementation_areas": list({
+                r.get("metadata", {}).get("file_path", "").split("/")[0]
+                for r in combined[:5]
+                if r.get("metadata", {}).get("file_path")
+            }),
+            "summary": f"Found {len(combined)} relevant code areas for '{capability_description}'",
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+async def get_system_health_summary() -> Dict[str, Any]:
+    """
+    Get a plain-English system health summary.
+    Returns counts of stable vs. at-risk code areas without any
+    technical details, file names, or code. Safe for client conversations.
+
+    Returns:
+        Overall health assessment in business language.
+    """
+    try:
+        from src.database.neo4j_client import neo4j_client
+        await neo4j_client.initialize()
+
+        volatile_query = """
+        MATCH (f:File)
+        WHERE f.change_count IS NOT NULL AND f.change_count > 5
+        RETURN count(f) as high_change_files
+        """
+        dead_query = """
+        MATCH (fn:Function)
+        WHERE fn.dead_code = true
+        RETURN count(fn) as dead_functions
+        """
+        weak_query = """
+        MATCH ()-[r:CALLS_FUNCTION]->()
+        WHERE r.confidence_score < 0.5
+        RETURN count(r) as weak_links
+        """
+        volatile = await neo4j_client.execute_query(volatile_query)
+        dead = await neo4j_client.execute_query(dead_query)
+        weak = await neo4j_client.execute_query(weak_query)
+
+        high_change = (volatile or [{}])[0].get("high_change_files", 0)
+        dead_count = (dead or [{}])[0].get("dead_functions", 0)
+        weak_count = (weak or [{}])[0].get("weak_links", 0)
+
+        health = "excellent" if weak_count < 10 else "good" if weak_count < 50 else "fair"
+        return {
+            "overall_health": health,
+            "stable_areas": "Most core functionality is stable and well-tested.",
+            "active_development_areas": high_change,
+            "unused_code_areas": dead_count,
+            "system_message": (
+                "The system is operating normally with no critical issues."
+                if health in ("excellent", "good")
+                else "Some areas are under active development and may have recent changes."
+            ),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # Tools list
 sales_tools = [
     get_product_overview,
@@ -339,6 +440,8 @@ sales_tools = [
     get_security_summary,
     get_integration_info,
     get_complexity_assessment,
+    find_product_capability,
+    get_system_health_summary,
 ]
 
 
@@ -352,9 +455,9 @@ def should_continue(state: DeveloperState) -> Literal["tools", "end"]:
     if not messages:
         return "end"
 
-    # Max 3 tool iterations for sales (keep it quick)
+    # Max 6 tool iterations for sales (enough for compound client questions)
     tool_call_count = sum(1 for m in messages if hasattr(m, 'tool_calls') and m.tool_calls)
-    if tool_call_count >= 3:
+    if tool_call_count >= 6:
         return "end"
 
     last_message = messages[-1]
@@ -487,7 +590,12 @@ async def execute_sales_tools(state: DeveloperState) -> Dict[str, Any]:
         for t in sales_tools:
             if t.name == tool_name:
                 try:
-                    tool_result = await t.ainvoke(tool_args)
+                    tool_result = await asyncio.wait_for(
+                        t.ainvoke(tool_args),
+                        timeout=30.0,
+                    )
+                except asyncio.TimeoutError:
+                    tool_result = {"error": f"Tool {tool_name} timed out after 30s"}
                 except Exception as e:
                     tool_result = {"error": str(e)}
                 break

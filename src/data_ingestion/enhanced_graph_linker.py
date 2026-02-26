@@ -13,8 +13,8 @@ and ON CREATE SET for idempotent timestamps.
 from typing import Dict, List, Any, Set, Optional
 import json
 from pathlib import Path
-import hashlib
 
+from src.core.id_generator import generate_node_id
 from src.database.neo4j_client import neo4j_client
 from src.core.logger import get_logger
 from src.data_ingestion.import_resolver import ImportResolver
@@ -46,8 +46,7 @@ class EnhancedGraphLinker:
     
     def _generate_node_id(self, node_type: str, *identifiers) -> str:
         """Generate deterministic node ID - matches NodeFactory formula exactly."""
-        combined = f"{node_type}:{'|'.join(str(i) for i in identifiers)}"
-        return hashlib.md5(combined.encode()).hexdigest()[:16]
+        return generate_node_id(node_type, *identifiers)
     
     def _to_relative_path(self, absolute_path: str) -> str:
         """Convert absolute path to repo-relative path for consistent ID generation."""
@@ -179,15 +178,25 @@ class EnhancedGraphLinker:
             MATCH (caller_file:File)-[:CONTAINS]->(caller:Function)
             WHERE caller.calls IS NOT NULL AND size(caller.calls) > 0
             UNWIND caller.calls AS callee_name
-            OPTIONAL MATCH (caller_file)-[:CONTAINS]->(same_file_target:Function {name: callee_name})
+            WITH caller_file, caller, callee_name, split(callee_name, '.')[-1] AS bare_name
+            OPTIONAL MATCH (caller_file)-[:CONTAINS]->(same_file_target:Function)
+            WHERE same_file_target.name = bare_name
+               OR same_file_target.fqn = callee_name
+               OR same_file_target.fqn ENDS WITH ('.' + callee_name)
             WHERE same_file_target <> caller
-            OPTIONAL MATCH (caller_file)-[:IMPORTS]->(imported_file:File)-[:CONTAINS]->(imported_target:Function {name: callee_name})
-            WITH caller, callee_name,
+            OPTIONAL MATCH (caller_file)-[:IMPORTS]->(imported_file:File)-[:CONTAINS]->(imported_target:Function)
+            WHERE imported_target.name = bare_name
+               OR imported_target.fqn = callee_name
+               OR imported_target.fqn ENDS WITH ('.' + callee_name)
+            WITH caller, callee_name, bare_name,
                  COALESCE(same_file_target, imported_target) AS target
             WHERE target IS NOT NULL
             MERGE (caller)-[r:CALLS_FUNCTION]->(target)
             ON CREATE SET r.created = datetime()
-            SET r.last_updated = datetime()
+            SET r.last_updated = datetime(),
+                r.match_type = 'fqn_or_scoped',
+                r.confidence_score = 0.8,
+                r.speculative = false
             RETURN count(r) as created_count
             """
             result = await session.run(query)
@@ -205,11 +214,15 @@ class EnhancedGraphLinker:
                 MATCH (caller:Function)
                 WHERE caller.calls IS NOT NULL AND size(caller.calls) > 0
                 UNWIND caller.calls AS callee_name
-                MATCH (target:Function {name: callee_name})
-                WHERE target <> caller
+                WITH caller, callee_name, split(callee_name, '.')[-1] AS bare_name
+                MATCH (target:Function)
+                WHERE target.name = bare_name
+                  AND caller.repository_hash = target.repository_hash
+                  AND target <> caller
                 MERGE (caller)-[r:CALLS_FUNCTION]->(target)
                 ON CREATE SET r.created = datetime(),
-                             r.confidence_score = 0.5,
+                             r.confidence_score = 0.4,
+                             r.speculative = true,
                              r.match_type = 'global_name'
                 SET r.last_updated = datetime()
                 RETURN count(r) as created_count
@@ -252,15 +265,17 @@ class EnhancedGraphLinker:
             extends_query = """
             MATCH (child:Class)
             WHERE child.extends IS NOT NULL AND child.extends <> ''
+              AND ($repo_hash = '' OR child.repository_hash = $repo_hash)
             WITH child, split(child.extends, ',')[0] as parent_name
             MATCH (parent:Class {name: trim(parent_name)})
-            WHERE parent <> child
+            WHERE ($repo_hash = '' OR parent.repository_hash = $repo_hash)
+              AND parent <> child
             MERGE (child)-[r:EXTENDS]->(parent)
             ON CREATE SET r.created = datetime()
             SET r.last_updated = datetime()
             RETURN count(r) as count
             """
-            result = await session.run(extends_query)
+            result = await session.run(extends_query, {"repo_hash": self.repo_hash})
             async for record in result:
                 count = record.get('count', 0)
                 stats["edges_created"] += count
@@ -270,17 +285,49 @@ class EnhancedGraphLinker:
             MATCH (s1:Service), (s2:Service)
             WHERE s1.name <> s2.name
               AND s1.repository_hash = s2.repository_hash
+              AND ($repo_hash = '' OR s1.repository_hash = $repo_hash)
               AND s1.file CONTAINS s2.name
             MERGE (s1)-[r:DEPENDS_ON_SERVICE]->(s2)
             ON CREATE SET r.created = datetime()
             SET r.last_updated = datetime()
             RETURN count(r) as count
             """
-            result = await session.run(service_query)
+            result = await session.run(service_query, {"repo_hash": self.repo_hash})
             async for record in result:
                 count = record.get('count', 0)
                 stats["edges_created"] += count
                 stats["by_type"]["DEPENDS_ON_SERVICE"] = count
+
+            # Type registry edges: Class/Function -> Type and type hierarchy links.
+            type_query = """
+            MATCH (c:Class)
+            WHERE ($repo_hash = '' OR c.repository_hash = $repo_hash)
+            MERGE (ct:Type {name: c.name, repository_hash: c.repository_hash})
+            MERGE (c)-[:IS_TYPE]->(ct)
+            WITH c, ct
+            OPTIONAL MATCH (c)-[:EXTENDS]->(p:Class)
+            WHERE p IS NOT NULL
+            MERGE (pt:Type {name: p.name, repository_hash: p.repository_hash})
+            MERGE (ct)-[:SUBTYPES_OF]->(pt)
+            RETURN count(DISTINCT ct) AS count
+            """
+            type_res = await session.run(type_query, {"repo_hash": self.repo_hash})
+            type_record = await type_res.single()
+            type_count = type_record.get("count", 0) if type_record else 0
+            stats["by_type"]["TYPE"] = type_count
+
+            returns_query = """
+            MATCH (fn:Function)
+            WHERE fn.return_type IS NOT NULL AND fn.return_type <> ''
+              AND ($repo_hash = '' OR fn.repository_hash = $repo_hash)
+            MERGE (t:Type {name: fn.return_type, repository_hash: fn.repository_hash})
+            MERGE (fn)-[:RETURNS_TYPE]->(t)
+            RETURN count(t) AS count
+            """
+            returns_res = await session.run(returns_query, {"repo_hash": self.repo_hash})
+            returns_record = await returns_res.single()
+            returns_count = returns_record.get("count", 0) if returns_record else 0
+            stats["by_type"]["RETURNS_TYPE"] = returns_count
             
             logger.info(f"Created {stats['edges_created']} type hierarchy edges")
         except Exception as e:

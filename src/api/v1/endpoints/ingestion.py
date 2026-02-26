@@ -277,10 +277,7 @@ async def refresh_repository(repo_name: str, background_tasks: BackgroundTasks):
 async def get_ingestion_stats():
     """Get overall ingestion statistics"""
     try:
-        from src.database.neo4j_client import neo4j_client
-        from src.database.qdrant_client import qdrant_client
-        
-        # Get Neo4j stats
+        # neo4j_client, qdrant_client already imported at top
         neo4j_stats = {}
         try:
             async with neo4j_client.session() as session:
@@ -583,8 +580,24 @@ async def _run_incremental_ingestion(job_id: str, diff: IncrementalDiff):
         # Step 2: Parse only changed files (reuse existing pipeline)
         from src.services.incremental_ingestion import should_parse_file
         files_to_parse = [f for f in diff.files_to_parse if should_parse_file(f)]
+        relink_scope = await incremental_engine.expand_relink_scope(
+            neo4j_client=neo4j_client,
+            repository_name=diff.repository_name,
+            changed_files=files_to_parse,
+            max_depth=3,
+        )
+        files_to_relink = [f for f in relink_scope if should_parse_file(f)]
+
+        promote_full_relink = await incremental_engine.should_promote_to_full_relink(
+            neo4j_client=neo4j_client,
+            repository_name=diff.repository_name,
+            changed_files=files_to_parse,
+            fanout_threshold=100,
+        )
 
         job["files_to_parse"] = len(files_to_parse)
+        job["files_to_relink"] = len(files_to_relink)
+        job["promote_full_relink"] = promote_full_relink
         job["status"] = "parsing"
         job["updated_at"] = datetime.utcnow()
 

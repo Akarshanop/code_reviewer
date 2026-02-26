@@ -9,18 +9,12 @@ Propagates parameter + return type annotations along CALLS edges so agents
 can trace type flow across the codebase.
 """
 import json
-import hashlib
-from typing import Dict, List, Any, Optional, Set
+from typing import Dict, List, Any, Optional, Set, Tuple
 from collections import defaultdict
 
 from src.core.logger import get_logger
 
 logger = get_logger(__name__)
-
-
-def _node_id(node_type: str, *parts) -> str:
-    combined = f"{node_type}:{'|'.join(str(p) for p in parts)}"
-    return hashlib.md5(combined.encode()).hexdigest()[:16]
 
 
 class CrossFileResolver:
@@ -29,7 +23,8 @@ class CrossFileResolver:
     1. Reads all Function.calls lists from the graph
     2. Reads all File import/from_import data
     3. Resolves `callee_name` → Function node across files
-    4. Creates CALLS_CROSS_FILE edges
+    4. Creates CALLS_FUNCTION edges (with a guard to skip edges already
+       created by EnhancedGraphLinker)
     5. Propagates type annotations along those edges (TYPE_FLOWS)
     """
 
@@ -55,53 +50,51 @@ class CrossFileResolver:
 
             func_records = [r async for r in func_result]
 
-            # ── Step 3: Build a global name→node_id index ──
-            name_index = await self._build_function_name_index(session, repo_hash)
+            # ── Step 3: Build function indexes (FQN + scoped name) ──
+            fqn_index, file_name_index, name_index = await self._build_function_indexes(session, repo_hash)
 
             # ── Step 4: Create cross-file CALLS edges ──
-            cross_pairs: list[dict] = []
+            seen_pairs: Set[Tuple[str, str]] = set()
+            cross_pairs: List[Dict[str, Any]] = []
             for rec in func_records:
                 fn_id = rec["fn_id"]
-                fn_name = rec["fn_name"]
                 file_path = rec["file_path"] or ""
                 calls = rec["calls"] or []
 
                 imported_symbols = import_map.get(file_path, {})
 
                 for callee in calls:
-                    # Skip self-calls or same-file (already handled by node_factory)
-                    bare_name = callee.split(".")[-1] if "." in callee else callee
+                    target = self._resolve_call_target(
+                        callee=callee,
+                        source_file=file_path,
+                        imported_symbols=imported_symbols,
+                        fqn_index=fqn_index,
+                        file_name_index=file_name_index,
+                        name_index=name_index,
+                    )
+                    if not target:
+                        continue
 
-                    # 1. Check if callee was imported from another file
-                    if bare_name in imported_symbols:
-                        target_file = imported_symbols[bare_name]
-                        # Look up function in target file
-                        target_key = f"{target_file}::{bare_name}"
-                        target_id = name_index.get(target_key)
-                        if target_id and target_id != fn_id:
-                            cross_pairs.append({
-                                "caller": fn_id,
-                                "callee": target_id,
-                                "callee_name": bare_name,
-                                "source_file": file_path,
-                                "target_file": target_file,
-                            })
-                    else:
-                        # 2. Try global name match (fallback) — same repo, different file
-                        for key, tid in name_index.items():
-                            if key.endswith(f"::{bare_name}") and tid != fn_id:
-                                src_file = key.split("::")[0]
-                                if src_file != file_path:
-                                    cross_pairs.append({
-                                        "caller": fn_id,
-                                        "callee": tid,
-                                        "callee_name": bare_name,
-                                        "source_file": file_path,
-                                        "target_file": src_file,
-                                    })
-                                    break  # first match only to avoid explosion
+                    target_id = target["id"]
+                    if target_id == fn_id:
+                        continue
+                    pair_key = (fn_id, target_id)
+                    if pair_key in seen_pairs:
+                        continue
+                    seen_pairs.add(pair_key)
+                    cross_pairs.append(
+                        {
+                            "caller": fn_id,
+                            "callee": target_id,
+                            "callee_name": target["bare_name"],
+                            "source_file": file_path,
+                            "target_file": target["target_file"],
+                            "match_type": target["match_type"],
+                            "confidence_score": target["confidence_score"],
+                            "speculative": target["speculative"],
+                        }
+                    )
 
-            # Batch-create edges
             if cross_pairs:
                 for chunk_start in range(0, len(cross_pairs), 500):
                     chunk = cross_pairs[chunk_start:chunk_start + 500]
@@ -109,11 +102,16 @@ class CrossFileResolver:
                         UNWIND $pairs AS p
                         MATCH (caller:Function {id: p.caller})
                         MATCH (callee:Function {id: p.callee})
-                        MERGE (caller)-[r:CALLS_CROSS_FILE]->(callee)
+                        WHERE NOT (caller)-[:CALLS_FUNCTION]->(callee)
+                        MERGE (caller)-[r:CALLS_FUNCTION]->(callee)
+                        ON CREATE SET r.created_at = datetime()
                         SET r.callee_name = p.callee_name,
                             r.source_file = p.source_file,
                             r.target_file = p.target_file,
-                            r.created_at = datetime()
+                            r.match_type = p.match_type,
+                            r.confidence_score = p.confidence_score,
+                            r.speculative = p.speculative,
+                            r.last_updated = datetime()
                     """, {"pairs": chunk})
                 stats["cross_file_calls_created"] = len(cross_pairs)
 
@@ -138,7 +136,7 @@ class CrossFileResolver:
 
     async def _build_import_map(
         self, session, repo_hash: str
-    ) -> Dict[str, Dict[str, str]]:
+    ) -> Dict[str, Dict[str, Any]]:
         """
         Returns: { file_path: { symbol_name: source_file_path } }
         Works for Python (from_imports) and JS/TS (imports with source).
@@ -149,7 +147,7 @@ class CrossFileResolver:
             RETURN f.path AS path, f.imports_json AS imports_json
         """, {"repo_hash": repo_hash})
 
-        import_map: Dict[str, Dict[str, str]] = {}
+        import_map: Dict[str, Dict[str, Any]] = {}
         records = [r async for r in result]
 
         # Also query IMPORTS edges (already created by enhanced_graph_linker)
@@ -173,6 +171,7 @@ class CrossFileResolver:
                 continue
 
             symbols: Dict[str, str] = {}
+            wildcard_modules: List[str] = []
             if isinstance(imports, list):
                 for imp in imports:
                     if isinstance(imp, str):
@@ -193,11 +192,17 @@ class CrossFileResolver:
                             # Also store the full dotted path for later matching
                             if short_name not in symbols:
                                 symbols[short_name] = clean.replace(".", "/")
+                        elif short_name == "*":
+                            wildcard_modules.append(clean.replace("/", "."))
 
                     elif isinstance(imp, dict):
                         # Python from_imports: {"module": "services.auth", "name": "AuthService"}
                         name = imp.get("name", "")
+                        alias = imp.get("alias", "")
                         module = imp.get("module", "") or imp.get("source", "")
+                        if name == "*" and module:
+                            wildcard_modules.append(module.replace("/", "."))
+                            continue
                         if name and module:
                             # Try to find the target file in known IMPORTS edges
                             for imported_file in file_imports.get(path, set()):
@@ -207,6 +212,8 @@ class CrossFileResolver:
                             # Fallback: store module path for later matching
                             if name and name not in symbols:
                                 symbols[name] = module.replace(".", "/")
+                            if alias and alias not in symbols:
+                                symbols[alias] = module.replace(".", "/")
 
                         # JS/TS imports with specifiers
                         specifiers = imp.get("specifiers", [])
@@ -220,38 +227,147 @@ class CrossFileResolver:
                         if imp.get("default"):
                             symbols[imp["default"]] = source
 
-            import_map[path] = symbols
+            import_map[path] = {
+                "symbols": symbols,
+                "wildcards": wildcard_modules,
+            }
 
         return import_map
 
-    async def _build_function_name_index(
+    async def _build_function_indexes(
         self, session, repo_hash: str
-    ) -> Dict[str, str]:
-        """Returns { "file_path::func_name": node_id }"""
+    ) -> Tuple[Dict[str, Dict[str, str]], Dict[str, str], Dict[str, List[Dict[str, str]]]]:
+        """
+        Returns:
+          - fqn_index: {fqn: {"id": ..., "file_path": ...}}
+          - file_name_index: {"file_path::func_name": node_id}
+          - name_index: {func_name: [{"id": ..., "file_path": ..., "fqn": ...}, ...]}
+        """
         result = await session.run("""
             MATCH (f:File)-[:CONTAINS]->(fn:Function)
             WHERE f.repository_hash = $repo_hash
-            RETURN fn.id AS id, fn.name AS name, f.path AS file_path
+            RETURN fn.id AS id, fn.name AS name, fn.fqn AS fqn, f.path AS file_path
         """, {"repo_hash": repo_hash})
 
-        index: Dict[str, str] = {}
+        fqn_index: Dict[str, Dict[str, str]] = {}
+        file_name_index: Dict[str, str] = {}
+        name_index: Dict[str, List[Dict[str, str]]] = defaultdict(list)
         async for rec in result:
             name = rec["name"] or ""
             fpath = rec["file_path"] or ""
+            fqn = rec["fqn"] or ""
+            node_id = rec["id"]
             if name:
-                index[f"{fpath}::{name}"] = rec["id"]
-        return index
+                file_name_index[f"{fpath}::{name}"] = node_id
+                name_index[name].append({"id": node_id, "file_path": fpath, "fqn": fqn})
+            if fqn:
+                fqn_index[fqn] = {"id": node_id, "file_path": fpath}
+        return fqn_index, file_name_index, name_index
+
+    def _resolve_call_target(
+        self,
+        callee: str,
+        source_file: str,
+        imported_symbols: Dict[str, Any],
+        fqn_index: Dict[str, Dict[str, str]],
+        file_name_index: Dict[str, str],
+        name_index: Dict[str, List[Dict[str, str]]],
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve a callee to a function target with confidence tiering."""
+        raw = (callee or "").strip()
+        if not raw:
+            return None
+
+        symbols = imported_symbols.get("symbols", {}) if isinstance(imported_symbols, dict) else {}
+        wildcards = imported_symbols.get("wildcards", []) if isinstance(imported_symbols, dict) else []
+        dotted = "." in raw
+        bare_name = raw.split(".")[-1]
+
+        # 1) Direct FQN match (highest confidence)
+        if raw in fqn_index:
+            target = fqn_index[raw]
+            return {
+                "id": target["id"],
+                "target_file": target["file_path"],
+                "bare_name": bare_name,
+                "match_type": "fqn_exact",
+                "confidence_score": 0.95,
+                "speculative": False,
+            }
+
+        # 2) Import-scoped resolution (symbol -> module path -> candidate fqn)
+        module_name = symbols.get(bare_name, "").replace("/", ".")
+        if dotted:
+            module_hint = ".".join(raw.split(".")[:-1])
+            if module_hint in symbols:
+                module_name = symbols[module_hint].replace("/", ".")
+            elif module_hint:
+                module_name = module_hint
+        if module_name:
+            candidate_fqn = f"{module_name}.{bare_name}"
+            if candidate_fqn in fqn_index:
+                target = fqn_index[candidate_fqn]
+                return {
+                    "id": target["id"],
+                    "target_file": target["file_path"],
+                    "bare_name": bare_name,
+                    "match_type": "import_scoped",
+                    "confidence_score": 0.8,
+                    "speculative": False,
+                }
+
+        # 3) File-scoped match by imported file and function name
+        imported_file = symbols.get(bare_name)
+        if imported_file:
+            file_key = f"{imported_file}::{bare_name}"
+            target_id = file_name_index.get(file_key)
+            if target_id:
+                return {
+                    "id": target_id,
+                    "target_file": imported_file,
+                    "bare_name": bare_name,
+                    "match_type": "import_file_scoped",
+                    "confidence_score": 0.8,
+                    "speculative": False,
+                }
+
+        # 4) Wildcard imports (still import-scoped but weaker)
+        for module in wildcards:
+            candidate_fqn = f"{module}.{bare_name}"
+            if candidate_fqn in fqn_index:
+                target = fqn_index[candidate_fqn]
+                return {
+                    "id": target["id"],
+                    "target_file": target["file_path"],
+                    "bare_name": bare_name,
+                    "match_type": "wildcard_import_scoped",
+                    "confidence_score": 0.7,
+                    "speculative": False,
+                }
+
+        # 5) Global fallback (speculative, low confidence)
+        candidates = name_index.get(bare_name, [])
+        for candidate in candidates:
+            if candidate["file_path"] != source_file:
+                return {
+                    "id": candidate["id"],
+                    "target_file": candidate["file_path"],
+                    "bare_name": bare_name,
+                    "match_type": "global_name_fallback",
+                    "confidence_score": 0.4,
+                    "speculative": True,
+                }
+        return None
 
     async def _propagate_type_flow(self, session, repo_hash: str) -> int:
         """
         Feature 2: Type flow analysis.
-        For every CALLS / CALLS_CROSS_FILE edge, if the caller passes typed args
+        For every CALLS / CALLS_FUNCTION edge, if the caller passes typed args
         and the callee has typed parameters, create a TYPE_FLOWS edge capturing
         the type mapping.
         """
-        # Get functions with return_type and params, scoped to this repo
         result = await session.run("""
-            MATCH (caller:Function)-[r:CALLS|CALLS_CROSS_FILE]->(callee:Function)
+            MATCH (caller:Function)-[r:CALLS|CALLS_FUNCTION]->(callee:Function)
             WHERE (caller.return_type IS NOT NULL OR callee.params IS NOT NULL)
               AND caller.repository_hash = $repo_hash
             RETURN caller.id AS cid, caller.return_type AS ret,

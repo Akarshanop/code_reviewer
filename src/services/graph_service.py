@@ -6,6 +6,7 @@ from src.database.neo4j_client import neo4j_client
 from src.core.exceptions import GraphDatabaseException
 from src.core.logger import get_logger
 from src.intelligence.domain_model import domain_engine
+from src.intelligence.confidence_engine import ConfidenceEngine, ConfidenceQueryResult, confidence_engine as _default_confidence_engine
 
 logger = get_logger(__name__)
 
@@ -29,8 +30,9 @@ class GraphService:
     EdgeLinker + EnhancedGraphLinker + NodeFactory.
     """
 
-    def __init__(self):
+    def __init__(self, confidence_engine: Optional[ConfidenceEngine] = None):
         self.neo4j = neo4j_client
+        self.confidence = confidence_engine or _default_confidence_engine
 
     # ─── Entity discovery ─────────────────────────────────────────────
 
@@ -121,6 +123,13 @@ class GraphService:
             OPTIONAL MATCH (f)-[:CONTAINS]->(component)-[:PUBLISHES_TO|CONSUMES_FROM]->(eventbus:EventBusNode)
             RETURN component, eventbus
             """,
+            "type_dependents": """
+            MATCH (f:File {path: $file_path})-[:CONTAINS]->(c:Class)-[:IS_TYPE]->(t:Type)
+            OPTIONAL MATCH (sub:Type)-[:SUBTYPES_OF]->(t)
+            OPTIONAL MATCH (fn:Function)-[:RETURNS_TYPE]->(sub)
+            OPTIONAL MATCH (ff:File)-[:CONTAINS]->(fn)
+            RETURN t.name AS type_name, count(DISTINCT sub) AS subtype_count, count(DISTINCT ff) AS impacted_files
+            """,
         }
 
         results: Dict[str, Any] = {}
@@ -136,11 +145,12 @@ class GraphService:
         total_callers = len([r for r in results.get("function_callers", []) if r.get("caller_name")])
         total_apis = len(results.get("api_calls", []))
         total_eventbus = len(results.get("eventbus_flows", []))
+        total_type_dependents = len(results.get("type_dependents", []))
 
         structural_score = min(
             100,
             (total_components * 5) + (total_imports * 8) + (total_callers * 6)
-            + (total_apis * 10) + (total_eventbus * 15),
+            + (total_apis * 10) + (total_eventbus * 15) + (total_type_dependents * 6),
         )
 
         behavioral_flags: list[str] = []
@@ -184,6 +194,7 @@ class GraphService:
                 "function_callers": total_callers,
                 "apis_affected": total_apis,
                 "eventbus_flows_affected": total_eventbus,
+                "type_dependents": total_type_dependents,
                 "behavioral_boost": behavioral_boost,
             },
             "behavioral_flags": list(set(behavioral_flags)),
@@ -532,3 +543,70 @@ class GraphService:
         except Exception as e:
             logger.warning(f"API flow trace failed: {e}")
             return {"endpoint": endpoint, "flow": [], "eventbus": []}
+
+    # ─── Confidence-scored wrappers ────────────────────────────────────
+
+    async def find_related_entities_with_confidence(
+        self,
+        entity_name: str,
+        relationship_types: List[str] = None,
+        max_depth: int = 3,
+        direction: str = "BOTH",
+    ) -> ConfidenceQueryResult:
+        """Confidence-scored variant of find_related_entities."""
+        rel_filter = ""
+        if relationship_types:
+            rel_filter = f":{('|'.join(relationship_types))}"
+        dir_symbol = {"OUTGOING": "->", "INCOMING": "<-", "BOTH": "-"}.get(direction, "-")
+
+        query = f"""
+        MATCH path = (start {{name: $entity_name}})-[*1..{max_depth}{rel_filter}]{dir_symbol}(end)
+        WHERE start <> end
+        RETURN start, end,
+               [n IN nodes(path) | labels(n)[0]] AS node_labels,
+               [r IN relationships(path) | type(r)] AS relationship_types,
+               length(path) AS path_length
+        ORDER BY path_length
+        LIMIT 150
+        """
+        return await self.confidence.graph_query(
+            self.neo4j, query, {"entity_name": entity_name},
+            description=f"Related entities for '{entity_name}' (depth={max_depth})",
+        )
+
+    async def analyze_impact_with_confidence(
+        self, file_path: str, change_type: str = "modify"
+    ) -> Dict[str, Any]:
+        """analyze_impact with per-query confidence scoring.
+
+        Returns the same dict as analyze_impact, but each sub-result
+        includes a ConfidenceQueryResult under a `_confidence` key.
+        """
+        base = await self.analyze_impact(file_path, change_type)
+
+        import_query = """
+        MATCH (f:File {path: $file_path})
+        OPTIONAL MATCH (importer:File)-[:IMPORTS]->(f)
+        RETURN importer.path AS importer_path, importer.file_name AS importer_name
+        """
+        import_conf = await self.confidence.graph_query(
+            self.neo4j, import_query, {"file_path": file_path},
+            description=f"Import dependents of {file_path}",
+        )
+
+        caller_query = """
+        MATCH (f:File {path: $file_path})-[:CONTAINS]->(fn:Function)
+        OPTIONAL MATCH (caller:Function)-[:CALLS_FUNCTION]->(fn)
+        OPTIONAL MATCH (caller_file:File)-[:CONTAINS]->(caller)
+        RETURN fn.name AS callee, caller.name AS caller_name, caller_file.path AS caller_file
+        """
+        caller_conf = await self.confidence.graph_query(
+            self.neo4j, caller_query, {"file_path": file_path},
+            description=f"Function callers of {file_path}",
+        )
+
+        base["_confidence"] = {
+            "import_dependents": import_conf.to_dict(),
+            "function_callers": caller_conf.to_dict(),
+        }
+        return base

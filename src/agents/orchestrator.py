@@ -16,6 +16,7 @@ from datetime import datetime
 import json
 import re
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 
 from langchain_core.messages import HumanMessage, AIMessage
 
@@ -69,6 +70,8 @@ class AgentOrchestrator:
     
     def __init__(self):
         self.semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_AGENTS)
+        self.pdf_semaphore = asyncio.Semaphore(2)
+        self.pdf_executor = ThreadPoolExecutor(max_workers=2)
         self._initialized = False
         self._stats = {
             "total_executions": 0,
@@ -151,7 +154,7 @@ class AgentOrchestrator:
                         "constraints": (extra_state or {}).get("constraints", ""),
                         "retrieved_context": {},
                         "prd_output": {},
-                        "repository_filter": [],
+                        "repository_filter": (extra_state or {}).get("repository_filter", []),
                         "errors": [],
                     }
                 elif agent_type == AgentType.QA:
@@ -218,7 +221,7 @@ class AgentOrchestrator:
                 if response_content:
                     self._stats["successful"] += 1
                     self._stats["by_agent_type"][agent_type.value]["success"] += 1
-
+                    token_usage = self._extract_token_usage_from_messages(final_messages)
                     return AgentResult(
                         success=True,
                         agent_type=agent_type,
@@ -226,6 +229,7 @@ class AgentOrchestrator:
                             "answer": response_content,
                             "messages_count": len(final_messages),
                             "tools_used": self._extract_tools_used(final_messages),
+                            "token_usage": token_usage,
                         },
                         errors=[],
                         metadata={"question_length": len(question)},
@@ -311,6 +315,12 @@ class AgentOrchestrator:
             agent_type=AgentType.PRD,
             question=full_prompt,
             recursion_limit=50,
+            extra_state={
+                "repository_filter": repository_filter or [],
+                "client_requirements": prd_text,
+                "business_context": "",
+                "constraints": "",
+            },
         )
 
         # Try to parse JSON from the agent's answer for backward compatibility
@@ -367,6 +377,9 @@ class AgentOrchestrator:
             agent_type=AgentType.QA,
             question=full_prompt,
             recursion_limit=50,
+            extra_state={
+                "prd_data": design_blueprint or {},
+            },
         )
 
         # Extract JSON test strategy for backward compatibility
@@ -587,6 +600,22 @@ class AgentOrchestrator:
                         tools_used.append(tool_name)
         return tools_used
 
+    def _extract_token_usage_from_messages(self, messages: List) -> Dict[str, int]:
+        """Sum input/output/total tokens from AIMessage.response_metadata.usage across all messages."""
+        total_in, total_out = 0, 0
+        for msg in messages:
+            if not hasattr(msg, "response_metadata") or not msg.response_metadata:
+                continue
+            usage = msg.response_metadata.get("usage") or {}
+            if isinstance(usage, dict):
+                total_in += int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
+                total_out += int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
+        return {
+            "input_tokens": total_in,
+            "output_tokens": total_out,
+            "total_tokens": total_in + total_out,
+        }
+
     def _extract_json_from_answer(self, answer: str) -> Optional[Dict]:
         """
         Try to extract a JSON object from the agent's answer text.
@@ -735,6 +764,13 @@ class AgentOrchestrator:
             logger.debug(f"JSON repair failed: {e}")
             return None
 
+    @staticmethod
+    def _estimate_cost_usd(input_tokens: int, output_tokens: int) -> float:
+        """Rough USD cost for Gemini 2.5 Flash (input $0.30/1M, output $2.50/1M)."""
+        if input_tokens <= 0 and output_tokens <= 0:
+            return 0.0
+        return (input_tokens / 1_000_000 * 0.30) + (output_tokens / 1_000_000 * 2.50)
+
     # ------------------------------------------------------------------
     # PRD → QA → PDF Pipeline (the main PRD generation flow)
     # ------------------------------------------------------------------
@@ -801,19 +837,37 @@ class AgentOrchestrator:
                     errors=prd_result.errors,
                     output_answer_length=len(prd_result.output.get("answer", "")),
                 )
+                prd_usage = prd_result.output.get("token_usage") or {}
                 return {
                     "success": False,
                     "error": f"PRD generation failed: {'; '.join(prd_result.errors) if prd_result.errors else 'No response generated'}",
                     "errors": prd_result.errors,
+                    "token_usage": {
+                        "prd": prd_usage,
+                        "qa": {},
+                        "total_input_tokens": prd_usage.get("input_tokens", 0),
+                        "total_output_tokens": prd_usage.get("output_tokens", 0),
+                        "total_tokens": prd_usage.get("total_tokens", 0),
+                        "estimated_cost_usd": round(
+                            self._estimate_cost_usd(
+                                prd_usage.get("input_tokens", 0),
+                                prd_usage.get("output_tokens", 0),
+                            ), 6
+                        ),
+                    },
                 }
 
             # Extract PRD JSON from agent response
             prd_raw = prd_result.output.get("answer", "")
+            prd_token_usage = prd_result.output.get("token_usage") or {}
             logger.info(
                 "PRD agent response received",
                 response_length=len(prd_raw),
                 tools_used=prd_result.output.get("tools_used", []),
                 messages_count=prd_result.output.get("messages_count", 0),
+                input_tokens=prd_token_usage.get("input_tokens", 0),
+                output_tokens=prd_token_usage.get("output_tokens", 0),
+                total_tokens=prd_token_usage.get("total_tokens", 0),
             )
             prd_data = self._extract_json_from_answer(prd_raw)
 
@@ -882,12 +936,17 @@ class AgentOrchestrator:
 
             qa_data = None
             qa_raw = ""
+            qa_token_usage = {}
             if qa_result.success:
                 qa_raw = qa_result.output.get("answer", "")
+                qa_token_usage = qa_result.output.get("token_usage") or {}
                 logger.info(
                     "QA agent response received",
                     response_length=len(qa_raw),
                     tools_used=qa_result.output.get("tools_used", []),
+                    input_tokens=qa_token_usage.get("input_tokens", 0),
+                    output_tokens=qa_token_usage.get("output_tokens", 0),
+                    total_tokens=qa_token_usage.get("total_tokens", 0),
                 )
                 qa_data = self._extract_json_from_answer(qa_raw)
             else:
@@ -916,16 +975,47 @@ class AgentOrchestrator:
             logger.info("Generating PDF documents")
             from src.services.pdf_service import generate_prd_pdf, generate_qa_pdf
 
-            prd_pdf_path = generate_prd_pdf(prd_data)
-            qa_pdf_path = generate_qa_pdf(qa_data)
+            loop = asyncio.get_running_loop()
+            async with self.pdf_semaphore:
+                prd_pdf_path = await asyncio.wait_for(
+                    loop.run_in_executor(self.pdf_executor, generate_prd_pdf, prd_data),
+                    timeout=60.0,
+                )
+                qa_pdf_path = await asyncio.wait_for(
+                    loop.run_in_executor(self.pdf_executor, generate_qa_pdf, qa_data),
+                    timeout=60.0,
+                )
 
             execution_time = (datetime.utcnow() - start_time).total_seconds()
+
+            # Aggregate token usage and cost
+            total_input = prd_token_usage.get("input_tokens", 0) + qa_token_usage.get("input_tokens", 0)
+            total_output = prd_token_usage.get("output_tokens", 0) + qa_token_usage.get("output_tokens", 0)
+            total_tokens = total_input + total_output
+            estimated_cost_usd = self._estimate_cost_usd(total_input, total_output)
+
+            token_summary = {
+                "prd": prd_token_usage,
+                "qa": qa_token_usage,
+                "total_input_tokens": total_input,
+                "total_output_tokens": total_output,
+                "total_tokens": total_tokens,
+                "estimated_cost_usd": round(estimated_cost_usd, 6),
+            }
 
             logger.info(
                 "PRD→QA→PDF pipeline completed",
                 execution_time=execution_time,
                 prd_pdf=prd_pdf_path,
                 qa_pdf=qa_pdf_path,
+                total_input_tokens=total_input,
+                total_output_tokens=total_output,
+                total_tokens=total_tokens,
+                estimated_cost_usd=token_summary["estimated_cost_usd"],
+            )
+            print(
+                f"[PRD→QA Pipeline] Tokens — input: {total_input}, output: {total_output}, total: {total_tokens} | "
+                f"Estimated cost: ${token_summary['estimated_cost_usd']:.6f} USD"
             )
 
             return {
@@ -938,6 +1028,7 @@ class AgentOrchestrator:
                 "prd_tools_used": prd_result.output.get("tools_used", []),
                 "qa_tools_used": qa_result.output.get("tools_used", []),
                 "execution_time_seconds": execution_time,
+                "token_usage": token_summary,
             }
 
         except Exception as e:

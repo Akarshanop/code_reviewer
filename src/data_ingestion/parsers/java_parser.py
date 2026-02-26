@@ -58,6 +58,15 @@ class JavaParser:
         'Get': 'GET', 'Post': 'POST', 'Put': 'PUT', 'Delete': 'DELETE',
         'Patch': 'PATCH',
     }
+
+    ROUTER_HTTP_METHOD_MAP = {
+        'get': 'GET',
+        'post': 'POST',
+        'put': 'PUT',
+        'delete': 'DELETE',
+        'patch': 'PATCH',
+        'route': 'ANY',
+    }
     
     def __init__(self):
         from tree_sitter_languages import get_language, get_parser
@@ -111,6 +120,28 @@ class JavaParser:
         
         # Walk the tree and extract patterns
         self._walk_tree(tree.root_node, code, results)
+
+        # Extract Vert.x programmatic routes like router.post("/x").handler(...)
+        detected_programmatic_routes = self._extract_vertx_programmatic_routes(tree.root_node, code)
+        if detected_programmatic_routes:
+            existing = {
+                (
+                    str(r.get('path', '')).strip(),
+                    str((r.get('method') or 'GET')).upper(),
+                    str(r.get('handler_method', '')).strip(),
+                )
+                for r in results['routes']
+                if isinstance(r, dict)
+            }
+            for route in detected_programmatic_routes:
+                route_key = (
+                    str(route.get('path', '')).strip(),
+                    str((route.get('method') or 'GET')).upper(),
+                    str(route.get('handler_method', '')).strip(),
+                )
+                if route_key not in existing:
+                    results['routes'].append(route)
+                    existing.add(route_key)
         
         logger.info(
             f"Parsed Java file: {file_path} "
@@ -140,6 +171,17 @@ class JavaParser:
         elif node.type == 'method_declaration':
             method_info = self._extract_method_info(node, code)
             if method_info:
+                package_name = results.get("package", "")
+                class_name = self._find_enclosing_class_name(node, code) or ""
+                method_info["class_name"] = class_name
+                if package_name and class_name:
+                    method_info["fqn"] = f"{package_name}.{class_name}.{method_info['name']}"
+                elif class_name:
+                    method_info["fqn"] = f"{class_name}.{method_info['name']}"
+                elif package_name:
+                    method_info["fqn"] = f"{package_name}.{method_info['name']}"
+                else:
+                    method_info["fqn"] = method_info["name"]
                 results['functions'].append(method_info)
                 if method_info.get('is_route'):
                     results['routes'].append(method_info)
@@ -313,6 +355,117 @@ class JavaParser:
                 path = bare_match.group(1)
         
         return path, method
+
+    def _extract_vertx_programmatic_routes(self, root: Node, code: str) -> List[Dict[str, Any]]:
+        """Extract Vert.x programmatic routes from method_invocation chains."""
+        routes: List[Dict[str, Any]] = []
+
+        for call_node in self._find_all(root, 'method_invocation'):
+            name_node = call_node.child_by_field_name('name')
+            if not name_node:
+                continue
+
+            call_name = self._text(name_node, code)
+            call_name_lower = call_name.lower()
+            object_node = call_node.child_by_field_name('object')
+            object_text = self._text(object_node, code) if object_node else ''
+            if 'router' not in object_text.lower():
+                continue
+
+            args_node = call_node.child_by_field_name('arguments')
+            expression_text = self._get_enclosing_expression_text(call_node, code)
+            handler_method = self._extract_handler_method_from_expression(expression_text)
+
+            if call_name_lower in self.ROUTER_HTTP_METHOD_MAP and args_node is not None:
+                path = self._extract_first_string_argument(args_node, code)
+                if not path:
+                    continue
+
+                method = self.ROUTER_HTTP_METHOD_MAP[call_name_lower]
+                if call_name_lower == 'route':
+                    explicit_method = self._extract_http_method_from_expression(expression_text)
+                    if explicit_method:
+                        method = explicit_method
+
+                routes.append({
+                    'path': path,
+                    'method': method,
+                    'handler_method': handler_method or call_name,
+                    'start_line': call_node.start_point[0] + 1,
+                    'end_line': call_node.end_point[0] + 1,
+                    'route_info': {'path': path, 'method': method},
+                    'is_route': True,
+                })
+                continue
+
+            if call_name == 'mountSubRouter' and args_node is not None:
+                prefix = self._extract_first_string_argument(args_node, code)
+                target_router = self._extract_argument_text(args_node, code, 1)
+                if not prefix:
+                    continue
+
+                routes.append({
+                    'path': prefix,
+                    'method': 'MOUNT',
+                    'handler_method': self._normalize_handler_name(target_router) or 'mountSubRouter',
+                    'start_line': call_node.start_point[0] + 1,
+                    'end_line': call_node.end_point[0] + 1,
+                    'route_info': {'path': prefix, 'method': 'MOUNT'},
+                    'is_route': True,
+                })
+
+        return routes
+
+    def _extract_first_string_argument(self, args_node: Node, code: str) -> str:
+        """Extract the first string literal argument from an argument list."""
+        args_text = self._text(args_node, code)
+        match = re.search(r'["\']([^"\']+)["\']', args_text)
+        return match.group(1).strip() if match else ''
+
+    def _extract_argument_text(self, args_node: Node, code: str, index: int) -> str:
+        """Extract nth argument text from tree-sitter argument_list node."""
+        arg_nodes = [
+            child for child in args_node.children
+            if child.type not in {',', '(', ')'}
+        ]
+        if index < 0 or index >= len(arg_nodes):
+            return ''
+        return self._text(arg_nodes[index], code).strip()
+
+    def _get_enclosing_expression_text(self, node: Node, code: str) -> str:
+        """Get containing expression text for chained calls like .handler(...)."""
+        current = node
+        while current.parent is not None:
+            current = current.parent
+            if current.type == 'expression_statement':
+                return self._text(current, code)
+        return self._text(node, code)
+
+    def _extract_http_method_from_expression(self, expression_text: str) -> str:
+        """Extract HttpMethod.X from chain expressions."""
+        match = re.search(r'\.method\s*\(\s*HttpMethod\.(\w+)\s*\)', expression_text)
+        return match.group(1).upper() if match else ''
+
+    def _extract_handler_method_from_expression(self, expression_text: str) -> str:
+        """Extract handler method from .handler(...) chain."""
+        match = re.search(r'\.handler\s*\(\s*([^)]+)\)', expression_text)
+        if not match:
+            return ''
+        return self._normalize_handler_name(match.group(1))
+
+    def _normalize_handler_name(self, handler_expr: str) -> str:
+        """Normalize handler references to a concise method-ish name."""
+        if not handler_expr:
+            return ''
+
+        expr = handler_expr.strip()
+        if '::' in expr:
+            return expr.split('::')[-1].strip()
+        if '(' in expr:
+            expr = expr.split('(')[0].strip()
+        if '.' in expr:
+            return expr.split('.')[-1].strip()
+        return expr
     
     # =========================================================================
     # FIX 7: Hardened class extraction
@@ -436,3 +589,14 @@ class JavaParser:
                 import_text = self._text(child, code)
                 imports.append(import_text.strip())
         return imports
+
+    def _find_enclosing_class_name(self, node: Node, code: str) -> str:
+        """Find class declaration name that contains this node."""
+        current = node.parent
+        while current is not None:
+            if current.type == "class_declaration":
+                class_name_node = current.child_by_field_name("name")
+                if class_name_node is not None:
+                    return self._text(class_name_node, code)
+            current = current.parent
+        return ""

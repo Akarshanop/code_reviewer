@@ -11,6 +11,7 @@ Enhanced with:
 import logging
 import yaml
 import json
+import asyncio
 from typing import Dict, Any, List, Literal
 from pathlib import Path
 from datetime import datetime
@@ -66,7 +67,7 @@ TOOL SELECTION GUIDE (PICK THE RIGHT TOOL):
 - For QA/testing/risk assessment → Use `get_qa_risk_assessment`
 
 TOOL USAGE RULES:
-- Maximum 4 tool calls per question
+- Maximum 8 tool calls per question
 - Pick the MOST SPECIFIC tool for the question
 - After getting results with code, IMMEDIATELY provide your answer
 - If first tool doesn't find results, try a more specific tool
@@ -481,7 +482,7 @@ async def read_file_content(file_path: str, max_lines: int = 200) -> Dict[str, A
             full_path = file_info.get("full_path") or file_info.get("path")
             
             # Try to find the file in the repos directory
-            base_dir = "/Users/akarshan.tyagi/Desktop/Code_reviewer/backend/data/repos"
+            base_dir = str(settings.REPOS_BASE_DIR)
             
             # Search for the file
             actual_path = None
@@ -535,7 +536,7 @@ async def search_code_pattern(pattern: str, file_extension: str = None, repo_nam
         import os
         import re
         
-        base_dir = "/Users/akarshan.tyagi/Desktop/Code_reviewer/backend/data/repos"
+        base_dir = str(settings.REPOS_BASE_DIR)
         matches = []
         
         for root, dirs, files in os.walk(base_dir):
@@ -622,7 +623,7 @@ async def list_api_routes(repo_name: str = None, include_code: bool = True) -> D
         import os
         import re
         
-        base_dir = "/Users/akarshan.tyagi/Desktop/Code_reviewer/backend/data/repos"
+        base_dir = str(settings.REPOS_BASE_DIR)
         routes = []
         
         # Patterns for different frameworks
@@ -1271,7 +1272,7 @@ tools = [
     read_file_content,
     search_code_pattern,
     list_api_routes,
-    # Intelligence-powered tools
+ 
     get_behavioral_classification,
     get_security_surface,
     get_domain_context,
@@ -1297,8 +1298,8 @@ def should_continue(state: DeveloperState) -> Literal["tools", "final_answer", "
         if isinstance(msg, ToolMessage):
             tool_result_count += 1
     
-    # Max 4 tool call iterations - then force final answer generation
-    MAX_TOOL_ITERATIONS = 4
+    # Max 8 tool call iterations - then force final answer generation
+    MAX_TOOL_ITERATIONS = 8
     if tool_call_count >= MAX_TOOL_ITERATIONS:
         logger.warning(f"Max tool iterations ({MAX_TOOL_ITERATIONS}) reached, forcing final answer")
         return "final_answer"
@@ -1559,8 +1560,12 @@ async def execute_tools(state: DeveloperState) -> Dict[str, Any]:
         for t in tools:
             if t.name == tool_name:
                 try:
-                    # Execute the async tool
-                    tool_result = await t.ainvoke(tool_args)
+                    tool_result = await asyncio.wait_for(
+                        t.ainvoke(tool_args),
+                        timeout=30.0,
+                    )
+                except asyncio.TimeoutError:
+                    tool_result = {"error": f"Tool {tool_name} timed out after 30s"}
                 except Exception as e:
                     tool_result = {"error": str(e)}
                 break

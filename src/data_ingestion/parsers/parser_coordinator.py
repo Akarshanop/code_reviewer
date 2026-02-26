@@ -77,11 +77,14 @@ class ParserCoordinator:
     # Default exclusion patterns for repository scanning
     DEFAULT_EXCLUDE_PATTERNS = [
         "**/node_modules/**",
+        "node_modules/**",
         "**/target/**",
         "**/build/**",
         "**/dist/**",
         "**/.git/**",
+        ".git/**",
         "**/__pycache__/**",
+        "__pycache__/**",
         "**/vendor/**",
         "**/.idea/**",
         "**/.vscode/**",
@@ -89,6 +92,13 @@ class ParserCoordinator:
         "**/.gradle/**",
         "**/bin/**",
         "**/obj/**",
+        "**/.venv/**",
+        ".venv/**",
+        "**/venv/**",
+        "venv/**",
+        "**/site-packages/**",
+        "**/*.pyx",
+        "**/*.pxd",
         "**/*.min.js",
         "**/*.min.css",
         "**/*.map",
@@ -218,7 +228,7 @@ class ParserCoordinator:
         
         if parsed:
             result.classes = parsed.get("classes", [])
-            result.functions = parsed.get("methods", [])
+            result.functions = parsed.get("functions", [])
             result.routes = parsed.get("routes", [])
             result.imports = parsed.get("imports", [])
             result.dependencies = parsed.get("dependencies", [])
@@ -227,6 +237,9 @@ class ParserCoordinator:
                 "eventbus": parsed.get("eventbus", []),
                 "dtos": parsed.get("dtos", []),
                 "services": parsed.get("services", []),
+                "configs": parsed.get("configs", []),
+                "error_handling": parsed.get("error_handling", []),
+                "control_flow": parsed.get("control_flow", []),
             })
         
         return result

@@ -18,6 +18,7 @@ from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel, Field
 import json
 import asyncio
+import redis.asyncio as redis
 
 from src.core.exceptions import (
     ValidationException,
@@ -52,8 +53,98 @@ class PRDGenerateRequest(BaseModel):
     constraints: Optional[str] = Field(default="", description="Performance, security, timeline constraints")
     prd_format_template: Optional[str] = Field(default="", description="Custom PRD format template")
 
-# In-memory job storage (use Redis in production)
+# Fallback in-memory store (Redis is primary for production)
 _job_store: Dict[str, Dict[str, Any]] = {}
+_redis_client: Optional[redis.Redis] = None
+
+
+def _get_redis_client() -> Optional[redis.Redis]:
+    global _redis_client
+    if _redis_client is None and settings.REDIS_URL:
+        _redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
+    return _redis_client
+
+
+def _serialize_job(job: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in (job or {}).items():
+        if isinstance(v, datetime):
+            out[k] = v.isoformat()
+        elif isinstance(v, (dict, list)):
+            out[k] = json.dumps(v, default=str)
+        elif v is None:
+            out[k] = ""
+        else:
+            out[k] = str(v)
+    return out
+
+
+def _deserialize_job(raw: Dict[str, Any]) -> Dict[str, Any]:
+    if not raw:
+        return {}
+    job: Dict[str, Any] = dict(raw)
+    for dt_field in ("created_at", "updated_at"):
+        if job.get(dt_field):
+            try:
+                job[dt_field] = datetime.fromisoformat(job[dt_field])
+            except Exception:
+                job[dt_field] = datetime.utcnow()
+        else:
+            job[dt_field] = datetime.utcnow()
+    for num_field in ("progress",):
+        try:
+            job[num_field] = float(job.get(num_field, 0.0))
+        except Exception:
+            job[num_field] = 0.0
+    if job.get("result"):
+        try:
+            job["result"] = json.loads(job["result"])
+        except Exception:
+            pass
+    return job
+
+
+async def _create_job(job_id: str, job: Dict[str, Any]) -> None:
+    redis_cli = _get_redis_client()
+    if redis_cli:
+        key = f"chat_job:{job_id}"
+        await redis_cli.hset(key, mapping=_serialize_job(job))
+        await redis_cli.expire(key, settings.REDIS_TTL)
+        await redis_cli.sadd("chat_jobs:all", job_id)
+        return
+    _job_store[job_id] = job
+
+
+async def _get_job(job_id: str) -> Optional[Dict[str, Any]]:
+    redis_cli = _get_redis_client()
+    if redis_cli:
+        key = f"chat_job:{job_id}"
+        raw = await redis_cli.hgetall(key)
+        return _deserialize_job(raw) if raw else None
+    return _job_store.get(job_id)
+
+
+async def _update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    existing = await _get_job(job_id)
+    if not existing:
+        return None
+    existing.update(updates or {})
+    existing["updated_at"] = datetime.utcnow()
+    await _create_job(job_id, existing)
+    return existing
+
+
+async def _list_jobs() -> List[Dict[str, Any]]:
+    redis_cli = _get_redis_client()
+    if redis_cli:
+        job_ids = await redis_cli.smembers("chat_jobs:all")
+        jobs: List[Dict[str, Any]] = []
+        for job_id in job_ids:
+            job = await _get_job(job_id)
+            if job:
+                jobs.append(job)
+        return jobs
+    return list(_job_store.values())
 
 @router.post("/ask", response_model=ChatResponse)
 async def chat_with_ai(request: ChatRequest):
@@ -228,14 +319,14 @@ async def analyze_prd(request: PRDRequest, background_tasks: BackgroundTasks):
         if request.async_mode:
             # Create job for background processing
             job_id = str(uuid.uuid4())
-            _job_store[job_id] = {
+            await _create_job(job_id, {
                 "status": "pending",
                 "progress": 0.0,
                 "result": None,
                 "error": None,
                 "created_at": datetime.utcnow(),
                 "updated_at": datetime.utcnow()
-            }
+            })
             
             # Add background task
             background_tasks.add_task(
@@ -409,10 +500,9 @@ async def delete_chat_session(session_id: str):
 async def get_job_status(job_id: str):
     """Get status of async job"""
     try:
-        if job_id not in _job_store:
+        job = await _get_job(job_id)
+        if not job:
             raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-        
-        job = _job_store[job_id]
         
         return JobStatus(
             job_id=job_id,
@@ -435,16 +525,14 @@ async def get_job_status(job_id: str):
 async def cancel_job(job_id: str):
     """Cancel a running job"""
     try:
-        if job_id not in _job_store:
+        job = await _get_job(job_id)
+        if not job:
             raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-        
-        job = _job_store[job_id]
         
         if job["status"] in ["completed", "failed"]:
             return {"status": "already_finished", "job_id": job_id}
         
-        job["status"] = "cancelled"
-        job["updated_at"] = datetime.utcnow()
+        await _update_job(job_id, {"status": "cancelled"})
         
         return {"status": "cancelled", "job_id": job_id}
         
@@ -552,11 +640,12 @@ async def get_orchestrator_stats():
     """Get orchestrator statistics"""
     try:
         stats = agent_orchestrator.get_stats()
+        jobs = await _list_jobs()
         return {
             "status": "success",
             "stats": stats,
-            "active_jobs": len([j for j in _job_store.values() if j["status"] == "running"]),
-            "total_jobs": len(_job_store)
+            "active_jobs": len([j for j in jobs if j.get("status") == "running"]),
+            "total_jobs": len(jobs)
         }
     except Exception as e:
         logger.error(f"Stats retrieval failed: {e}")
@@ -575,9 +664,7 @@ async def _process_prd_async(
 ):
     """Background task for PRD processing"""
     try:
-        _job_store[job_id]["status"] = "running"
-        _job_store[job_id]["progress"] = 0.1
-        _job_store[job_id]["updated_at"] = datetime.utcnow()
+        await _update_job(job_id, {"status": "running", "progress": 0.1})
         
         result = await agent_orchestrator.process_prd(
             prd_text=prd_text,
@@ -587,21 +674,20 @@ async def _process_prd_async(
             priority=priority
         )
         
-        _job_store[job_id]["status"] = "completed" if result.success else "failed"
-        _job_store[job_id]["progress"] = 1.0
-        _job_store[job_id]["result"] = {
-            "blueprint": result.output.get("blueprint", {}),
-            "validation_results": result.output.get("validation_results", []),
-            "execution_time_seconds": result.execution_time_seconds
-        }
-        _job_store[job_id]["error"] = result.errors[0] if result.errors else None
-        _job_store[job_id]["updated_at"] = datetime.utcnow()
+        await _update_job(job_id, {
+            "status": "completed" if result.success else "failed",
+            "progress": 1.0,
+            "result": {
+                "blueprint": result.output.get("blueprint", {}),
+                "validation_results": result.output.get("validation_results", []),
+                "execution_time_seconds": result.execution_time_seconds
+            },
+            "error": result.errors[0] if result.errors else None
+        })
         
     except Exception as e:
         logger.error(f"Background PRD processing failed: {e}")
-        _job_store[job_id]["status"] = "failed"
-        _job_store[job_id]["error"] = str(e)
-        _job_store[job_id]["updated_at"] = datetime.utcnow()
+        await _update_job(job_id, {"status": "failed", "error": str(e)})
 
 
 async def _store_conversation(
