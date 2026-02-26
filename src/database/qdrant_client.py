@@ -327,9 +327,12 @@ class QdrantClient:
             collection_info = await self.client.get_collection(coll_name)
             
             # Get collection statistics
+            vectors_count = getattr(collection_info, "vectors_count", None)
+            points_count = getattr(collection_info, "points_count", None)
             stats = {
                 "name": coll_name,
-                "vectors_count": collection_info.vectors_count,
+                "vectors_count": vectors_count,
+                "points_count": points_count,
                 "segments_count": collection_info.segments_count,
                 "status": str(collection_info.status),
                 "config": {

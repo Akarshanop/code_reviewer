@@ -23,6 +23,7 @@ from __future__ import annotations
 import re
 from enum import Enum
 from dataclasses import dataclass, field
+from collections import defaultdict
 from typing import Dict, List, Optional, Set, Any, Tuple
 
 from src.core.logger import get_logger
@@ -218,6 +219,7 @@ class BehavioralClassifier:
         node_id: str,
         name: str = "",
         code_body: str = "",
+        file_path: str = "",
         decorators: List[str] | None = None,
         node_labels: List[str] | None = None,
         http_method: str | None = None,
@@ -243,6 +245,7 @@ class BehavioralClassifier:
         evidence: List[str] = []
         heuristics: List[str] = []
         confidences: List[float] = []
+        transaction_pattern_hits = 0
 
         decorators = decorators or []
         node_labels = node_labels or []
@@ -255,9 +258,15 @@ class BehavioralClassifier:
                 for pat in patterns:
                     if pat.search(decorator_text):
                         labels.add(label)
-                        evidence.append(f"Decorator match: {pat.pattern!r} in {decorator_text[:80]}")
+                        match = pat.search(decorator_text)
+                        matched = match.group(0) if match else ""
+                        evidence.append(
+                            f"Decorator match ({label.value}): pattern={pat.pattern!r}, matched={matched!r}, line=1"
+                        )
                         heuristics.append(f"decorator:{label.value}")
                         confidences.append(0.9)
+                        if label == BehavioralNodeLabel.TRANSACTION_BOUNDARY:
+                            transaction_pattern_hits += 1
                         break
 
         # --- 2. Code body patterns ---
@@ -270,9 +279,15 @@ class BehavioralClassifier:
                         labels.add(label)
                         match = pat.search(code_body)
                         snippet = code_body[max(0, match.start() - 20):match.end() + 20] if match else ""
-                        evidence.append(f"Code pattern: {pat.pattern!r} near «{snippet.strip()[:60]}»")
+                        line_no = 1 + (code_body[: match.start()].count("\n") if match else 0)
+                        matched = match.group(0) if match else snippet.strip()[:40]
+                        evidence.append(
+                            f"Code pattern ({label.value}): pattern={pat.pattern!r}, matched={matched!r}, line={line_no}"
+                        )
                         heuristics.append(f"code_body:{label.value}")
                         confidences.append(0.7)
+                        if label == BehavioralNodeLabel.TRANSACTION_BOUNDARY:
+                            transaction_pattern_hits += 1
                         break
 
         # --- 3. Naming conventions ---
@@ -319,6 +334,23 @@ class BehavioralClassifier:
             labels.discard(BehavioralNodeLabel.IDEMPOTENT)
             evidence.append("Conflict: SideEffecting overrides Idempotent")
 
+        # Negative patterns: test/mock/stub files should not be side-effecting by default.
+        lowered_path = file_path.lower()
+        if lowered_path and re.search(r"(^|/)(test|tests|mock|mocks|stub|stubs)(/|$)", lowered_path):
+            if BehavioralNodeLabel.SIDE_EFFECTING in labels:
+                labels.discard(BehavioralNodeLabel.SIDE_EFFECTING)
+                evidence.append(f"Negative pattern: suppressed SideEffecting for non-prod path '{file_path}'")
+
+        # Negative auth weighting for parse/validate helpers.
+        if BehavioralNodeLabel.AUTH_CRITICAL in labels and re.match(r"^(parse|validate)", name, re.IGNORECASE):
+            confidences.append(0.6)
+            evidence.append("Negative pattern: parse*/validate* name reduced AuthCritical confidence")
+
+        # Transaction boundaries need stronger evidence (>1 hit) for high confidence.
+        if BehavioralNodeLabel.TRANSACTION_BOUNDARY in labels and transaction_pattern_hits <= 1:
+            confidences.append(0.5)
+            evidence.append("TransactionBoundary confidence capped: only one transaction pattern matched")
+
         overall_confidence = (
             max(confidences) if confidences else 0.0
         )
@@ -334,6 +366,62 @@ class BehavioralClassifier:
             heuristics_used=heuristics,
         )
 
+    def propagate_side_effecting_labels(
+        self,
+        classified_nodes: Dict[str, BehavioralClassification],
+        structural_edges: List[Dict[str, Any]],
+        max_depth: int = 3,
+    ) -> Dict[str, BehavioralClassification]:
+        """
+        Propagate SideEffecting up the call graph (callee -> caller) with lower confidence.
+        """
+        reverse_calls: Dict[str, Set[str]] = defaultdict(set)
+        for edge in structural_edges:
+            edge_type = edge.get("type", "")
+            if edge_type not in {"CALLS", "CALLS_FUNCTION"}:
+                continue
+            src = edge.get("source_id")
+            tgt = edge.get("target_id")
+            if src and tgt:
+                reverse_calls[tgt].add(src)
+
+        propagated: Dict[str, BehavioralClassification] = dict(classified_nodes)
+        queue: List[Tuple[str, int]] = []
+        for node_id, cls in classified_nodes.items():
+            if BehavioralNodeLabel.SIDE_EFFECTING in cls.labels:
+                queue.append((node_id, 0))
+
+        visited: Set[Tuple[str, int]] = set()
+        while queue:
+            callee_id, depth = queue.pop(0)
+            if depth >= max_depth:
+                continue
+            for caller_id in reverse_calls.get(callee_id, set()):
+                key = (caller_id, depth + 1)
+                if key in visited:
+                    continue
+                visited.add(key)
+                caller_cls = propagated.get(caller_id)
+                if not caller_cls:
+                    continue
+                if BehavioralNodeLabel.SIDE_EFFECTING in caller_cls.labels:
+                    continue
+                new_labels = set(caller_cls.labels)
+                new_labels.add(BehavioralNodeLabel.SIDE_EFFECTING)
+                new_evidence = list(caller_cls.evidence) + [
+                    f"Propagated SideEffecting from callee={callee_id}, propagation_depth={depth + 1}"
+                ]
+                propagated[caller_id] = BehavioralClassification(
+                    node_id=caller_cls.node_id,
+                    labels=new_labels,
+                    confidence=max(caller_cls.confidence, 0.6),
+                    evidence=new_evidence,
+                    heuristics_used=list(caller_cls.heuristics_used) + ["propagation:SideEffecting"],
+                )
+                queue.append((caller_id, depth + 1))
+
+        return propagated
+
     def infer_behavioral_edges(
         self,
         classified_nodes: Dict[str, BehavioralClassification],
@@ -348,6 +436,11 @@ class BehavioralClassifier:
             - TransactionBoundary → Y → REQUIRES_CONSISTENCY(TransactionBoundary, Y)
         """
         behavioral_edges: List[BehavioralEdge] = []
+        classified_nodes = self.propagate_side_effecting_labels(
+            classified_nodes=classified_nodes,
+            structural_edges=structural_edges,
+            max_depth=3,
+        )
 
         for edge in structural_edges:
             source_id = edge.get("source_id", "")

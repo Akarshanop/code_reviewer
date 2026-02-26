@@ -10,9 +10,11 @@ Key principles:
 """
 import json
 import yaml
+import asyncio
 from typing import Dict, Any, List, Literal
 from pathlib import Path
 from datetime import datetime
+from contextvars import ContextVar
 
 from langgraph.graph import StateGraph, END
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
@@ -25,6 +27,80 @@ from src.core.logger import get_logger
 from src.core.exceptions import AgentException, LLMServiceException
 
 logger = get_logger(__name__)
+_repository_filter_ctx: ContextVar[List[str]] = ContextVar("prd_repository_filter", default=[])
+
+
+def _set_repository_filter_from_state(state: PRDState) -> None:
+    _repository_filter_ctx.set(list(state.get("repository_filter", []) or []))
+
+
+def _get_repository_filter() -> List[str]:
+    return list(_repository_filter_ctx.get() or [])
+
+
+def _repo_filter_condition(alias: str) -> str:
+    return f"($repository_filter_empty OR {alias}.repository_name IN $repository_filter)"
+
+
+def _repo_filter_params(params: Dict[str, Any] = None) -> Dict[str, Any]:
+    repository_filter = _get_repository_filter()
+    scoped = dict(params or {})
+    scoped["repository_filter"] = repository_filter
+    scoped["repository_filter_empty"] = len(repository_filter) == 0
+    return scoped
+
+
+def _record_matches_repository_scope(record: Dict[str, Any], repository_filter: List[str]) -> bool:
+    if not repository_filter:
+        return True
+    if not isinstance(record, dict):
+        return False
+    hints = [
+        str(record.get("repository_name", "") or ""),
+        str(record.get("repo", "") or ""),
+        str(record.get("repo_name", "") or ""),
+        str(record.get("source_repo", "") or ""),
+        str(record.get("target_repo", "") or ""),
+        str(record.get("file", "") or ""),
+        str(record.get("path", "") or ""),
+    ]
+    for repo in repository_filter:
+        normalized = repo.strip().lower()
+        if not normalized:
+            continue
+        for hint in hints:
+            h = hint.lower()
+            if not h:
+                continue
+            if h == normalized or f"/{normalized}/" in h or h.startswith(f"{normalized}/"):
+                return True
+    return False
+
+
+def _scope_tool_output(data: Any) -> Any:
+    repository_filter = _get_repository_filter()
+    if not repository_filter:
+        return data
+    if isinstance(data, list):
+        scoped_list = []
+        for item in data:
+            child = _scope_tool_output(item)
+            if child is None or child == []:
+                continue
+            scoped_list.append(child)
+        return scoped_list
+    if isinstance(data, dict):
+        if any(k in data for k in ("file", "path", "repository_name", "repo", "source_repo", "target_repo")):
+            if not _record_matches_repository_scope(data, repository_filter):
+                return None
+        scoped = {}
+        for key, value in data.items():
+            child = _scope_tool_output(value)
+            if child is None:
+                continue
+            scoped[key] = child
+        return scoped
+    return data
 
 # Load prompts
 PROMPTS_PATH = Path(__file__).parent.parent.parent.parent / "config" / "prd_prompt.yaml"
@@ -57,6 +133,7 @@ async def get_repository_overview() -> Dict[str, Any]:
 
         repos_query = """
         MATCH (r:Repository)
+        WHERE """ + _repo_filter_condition("r") + """
         OPTIONAL MATCH (f:File)-[:BELONGS_TO]->(r)
         WITH r, count(DISTINCT f) AS file_count
         OPTIONAL MATCH (f2:File)-[:BELONGS_TO]->(r)
@@ -67,11 +144,15 @@ async def get_repository_overview() -> Dict[str, Any]:
         RETURN r.name AS name, r.language AS language, r.path AS path,
                file_count, route_count, count(DISTINCT c) AS component_count
         """
-        repos = await neo4j_client.execute_query(repos_query)
+        repos = await neo4j_client.execute_query(repos_query, _repo_filter_params())
 
         # Also get total function count
-        func_query = "MATCH (f:Function) RETURN count(f) as count"
-        func_result = await neo4j_client.execute_query(func_query)
+        func_query = """
+        MATCH (f:Function)
+        WHERE """ + _repo_filter_condition("f") + """
+        RETURN count(f) as count
+        """
+        func_result = await neo4j_client.execute_query(func_query, _repo_filter_params())
         func_count = func_result[0]["count"] if func_result else 0
 
         return {
@@ -108,11 +189,14 @@ async def search_existing_implementations(query: str) -> Dict[str, Any]:
         from src.services.search_service import SearchService
         search_service = SearchService()
         await search_service.initialize()
+        repository_filter = _get_repository_filter()
+        filters = {"repository": repository_filter[0]} if repository_filter else None
 
         results = await search_service.search_codebase(
             query=query,
             search_type="hybrid",
             top_k=15,
+            filters=filters,
         )
         combined = results.get("results", {}).get("combined", [])
 
@@ -150,15 +234,18 @@ async def find_api_routes_by_pattern(pattern: str) -> Dict[str, Any]:
 
         query = """
         MATCH (r:VertxRoute)
-        WHERE toLower(r.path) CONTAINS toLower($pattern)
+        WHERE (
+              toLower(r.path) CONTAINS toLower($pattern)
            OR toLower(r.name) CONTAINS toLower($pattern)
            OR toLower(r.handler_method) CONTAINS toLower($pattern)
+        )
+          AND """ + _repo_filter_condition("r") + """
         RETURN r.path as path, r.method as method, r.handler_method as handler,
                r.file as file, r.name as name
         ORDER BY r.path
         LIMIT 30
         """
-        routes = await neo4j_client.execute_query(query, {"pattern": pattern})
+        routes = await neo4j_client.execute_query(query, _repo_filter_params({"pattern": pattern}))
 
         return {
             "routes": [
@@ -191,10 +278,11 @@ async def find_components_by_name(name: str) -> Dict[str, Any]:
         MATCH (n)
         WHERE (n:ReactComponent OR n:Function OR n:File OR n:DTO)
           AND (toLower(n.name) CONTAINS toLower($name) OR toLower(n.file) CONTAINS toLower($name))
+          AND """ + _repo_filter_condition("n") + """
         RETURN labels(n)[0] as type, n.name as name, n.file as file
         LIMIT 25
         """
-        results = await neo4j_client.execute_query(query, {"name": name})
+        results = await neo4j_client.execute_query(query, _repo_filter_params({"name": name}))
 
         return {
             "matches": [
@@ -273,33 +361,54 @@ async def get_behavioral_impact(area: str) -> Dict[str, Any]:
         await neo4j_client.initialize()
 
         routes_query = """
-        MATCH (r:VertxRoute)
-        WHERE toLower(r.path) CONTAINS toLower($area)
-           OR toLower(r.handler_method) CONTAINS toLower($area)
-           OR toLower(r.name) CONTAINS toLower($area)
-        RETURN r.name as name, r.method as http_method, r.handler_method as handler,
-               r.path as path, r.file as file, labels(r) as labels
+        MATCH (n)
+        WHERE (n:VertxRoute OR n:Function)
+          AND (toLower(n.path) CONTAINS toLower($area)
+               OR toLower(n.name) CONTAINS toLower($area)
+               OR toLower(n.handler_method) CONTAINS toLower($area))
+          AND """ + _repo_filter_condition("n") + """
+        RETURN n.name as name, n.path as path, n.method as http_method,
+               n.handler_method as handler, n.file as file,
+               n.behavioral_labels as behavioral_labels,
+               n.behavioral_confidence as behavioral_confidence,
+               labels(n) as labels
         LIMIT 20
         """
-        routes = await neo4j_client.execute_query(routes_query, {"area": area})
+        routes = await neo4j_client.execute_query(routes_query, _repo_filter_params({"area": area}))
 
         classifications = []
         for node in (routes or []):
-            cls = behavioral_classifier.classify_node(
-                node_id=node.get("name", ""),
-                name=node.get("handler", "") or node.get("name", ""),
-                node_labels=node.get("labels", []),
-                http_method=node.get("http_method"),
-                is_handler=True,
-            )
-            if cls.labels:
+            stored_labels = node.get("behavioral_labels")
+            stored_confidence = node.get("behavioral_confidence")
+
+            if stored_labels:
+                if isinstance(stored_labels, str):
+                    label_values = [l.strip() for l in stored_labels.split(",") if l.strip()]
+                elif isinstance(stored_labels, list):
+                    label_values = stored_labels
+                else:
+                    label_values = []
+                confidence = float(stored_confidence) if stored_confidence else 0.7
+            else:
+                cls = behavioral_classifier.classify_node(
+                    node_id=node.get("name", ""),
+                    name=node.get("handler", "") or node.get("name", ""),
+                    node_labels=node.get("labels", []),
+                    http_method=node.get("http_method"),
+                    is_handler=True,
+                )
+                label_values = [l.value for l in cls.labels] if cls.labels else []
+                confidence = cls.confidence
+
+            if label_values:
+                risk_labels = {"AuthCritical", "TransactionBoundary", "SideEffecting"}
                 classifications.append({
                     "route": node.get("path", ""),
                     "method": node.get("http_method", ""),
                     "handler": node.get("handler", ""),
-                    "behavioral_labels": [l.value for l in cls.labels],
-                    "confidence": round(cls.confidence, 3),
-                    "risk_flags": [l.value for l in cls.labels if l.value in ("AuthCritical", "TransactionBoundary", "SideEffecting")],
+                    "behavioral_labels": label_values,
+                    "confidence": round(confidence, 3),
+                    "risk_flags": [l for l in label_values if l in risk_labels],
                 })
 
         return {
@@ -397,27 +506,52 @@ async def read_file_content(file_path: str) -> Dict[str, Any]:
         file_path: Path to the file (relative or absolute)
 
     Returns:
-        File content (first 200 lines) and metadata.
+        File content (first 300 lines) and metadata.
     """
     try:
-        from src.services.search_service import SearchService
-        search_service = SearchService()
-        await search_service.initialize()
+        import os
+        from src.database.neo4j_client import neo4j_client
+        await neo4j_client.initialize()
 
-        results = await search_service.search_codebase(
-            query=file_path,
-            search_type="hybrid",
-            top_k=5,
-            filters={"file_path": file_path},
-        )
-        combined = results.get("results", {}).get("combined", [])
+        file_query = """
+        MATCH (f:File)
+        WHERE (f.path CONTAINS $file_path OR f.name = $file_path)
+          AND """ + _repo_filter_condition("f") + """
+        RETURN f.path as path, f.name as name, f.repository_name as repo, f.full_path as full_path
+        LIMIT 5
+        """
+        files = await neo4j_client.execute_query(file_query, _repo_filter_params({"file_path": file_path}))
 
-        if combined:
-            return {
-                "file": file_path,
-                "content": str(combined[0].get("content", ""))[:5000],
-                "found": True,
-            }
+        if not files:
+            return {"file": file_path, "content": "", "found": False,
+                    "suggestion": "Try a partial filename like 'PaymentHandler.java'"}
+
+        base_dir = str(settings.REPOS_BASE_DIR)
+
+        for file_info in (files or []):
+            actual_path = None
+            for root, dirs, filenames in os.walk(base_dir):
+                dirs[:] = [d for d in dirs if d not in ['node_modules', '.git', '__pycache__', 'dist', 'build']]
+                for filename in filenames:
+                    if filename == file_info.get("name") or file_path in os.path.join(root, filename):
+                        potential_path = os.path.join(root, filename)
+                        if os.path.exists(potential_path):
+                            actual_path = potential_path
+                            break
+                if actual_path:
+                    break
+
+            if actual_path and os.path.exists(actual_path):
+                with open(actual_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    lines = f.readlines()[:300]
+                    content = ''.join(lines)
+                    return {
+                        "file": file_info.get("path", file_path),
+                        "content": content,
+                        "lines_read": len(lines),
+                        "found": True,
+                    }
+
         return {"file": file_path, "content": "", "found": False}
     except Exception as e:
         return {"error": str(e)}
@@ -866,6 +1000,7 @@ def _build_llm_tools() -> list:
 async def prd_agent(state: PRDState) -> Dict[str, Any]:
     """Main PRD agent node — codebase-grounded, zero hallucination."""
     try:
+        _set_repository_filter_from_state(state)
         messages = list(state.get('messages', []))
 
         tool_descriptions = "\n".join([f"- {t.name}: {t.description}" for t in prd_tools])
@@ -903,6 +1038,13 @@ Do NOT summarize or skip sections — fill every section with real codebase data
         response_message = response.choices[0].message
         ai_message_kwargs = {"content": response_message.content or ""}
 
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            pt = getattr(usage, "prompt_tokens", None) or (usage.get("prompt_tokens", 0) if isinstance(usage, dict) else 0)
+            ct = getattr(usage, "completion_tokens", None) or (usage.get("completion_tokens", 0) if isinstance(usage, dict) else 0)
+            tt = getattr(usage, "total_tokens", None) or (usage.get("total_tokens", 0) if isinstance(usage, dict) else (pt + ct))
+            ai_message_kwargs["response_metadata"] = {"usage": {"input_tokens": pt, "output_tokens": ct, "total_tokens": tt}}
+
         if hasattr(response_message, 'tool_calls') and response_message.tool_calls:
             ai_message_kwargs["tool_calls"] = [
                 {
@@ -929,6 +1071,7 @@ Do NOT summarize or skip sections — fill every section with real codebase data
 
 async def execute_prd_tools(state: PRDState) -> Dict[str, Any]:
     """Execute tools called by the PRD agent."""
+    _set_repository_filter_from_state(state)
     messages = state.get("messages", [])
     last_message = messages[-1] if messages else None
 
@@ -947,7 +1090,16 @@ async def execute_prd_tools(state: PRDState) -> Dict[str, Any]:
         for t in prd_tools:
             if t.name == tool_name:
                 try:
-                    tool_result = await t.ainvoke(tool_args)
+                    tool_result = await asyncio.wait_for(
+                        t.ainvoke(tool_args),
+                        timeout=30.0,
+                    )
+                    tool_result = _scope_tool_output(tool_result)
+                    if tool_result is None:
+                        tool_result = {}
+                except asyncio.TimeoutError:
+                    logger.error(f"PRD tool {tool_name} timed out")
+                    tool_result = {"error": f"Tool {tool_name} timed out after 30s"}
                 except Exception as e:
                     logger.error(f"PRD tool {tool_name} failed: {e}")
                     tool_result = {"error": str(e)}
@@ -978,22 +1130,67 @@ async def synthesize_prd(state: PRDState) -> Dict[str, Any]:
                 original_question = msg.content
                 break
 
-        # Collect and summarize tool results into a compact context
-        tool_findings = []
+        # Build tool_call_id -> tool_name mapping from AIMessages
+        call_id_to_name = {}
+        for msg in messages:
+            if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    tc_id = tc.get("id", "")
+                    tc_name = tc.get("name", "")
+                    if tc_id and tc_name:
+                        call_id_to_name[tc_id] = tc_name
+
+        never_truncate = {
+            "find_api_routes_by_pattern", "get_database_schemas",
+            "get_dependency_graph", "get_repository_overview",
+        }
+        low_limit = {"get_behavioral_impact", "get_temporal_volatility"}
+
+        tool_results_by_priority = {"critical": [], "normal": [], "low": []}
+
         for msg in messages:
             if isinstance(msg, ToolMessage):
                 try:
                     data = json.loads(msg.content) if msg.content else {}
-                    # Truncate each tool result to keep context manageable
                     summary = json.dumps(data, default=str)
-                    if len(summary) > 3000:
-                        summary = summary[:3000] + "...(truncated)"
-                    tool_findings.append(summary)
-                except (json.JSONDecodeError, TypeError):
-                    tool_findings.append(str(msg.content)[:2000])
+                    tool_name = call_id_to_name.get(msg.tool_call_id, "")
 
-        # Build a compact codebase context from tool results
-        codebase_context = "\n---\n".join(tool_findings[-12:])  # Last 12 results max
+                    if tool_name in never_truncate:
+                        priority = "critical"
+                    elif tool_name in low_limit:
+                        if len(summary) > 1500:
+                            summary = summary[:1500] + "...(truncated)"
+                        priority = "low"
+                    elif tool_name == "read_file_content":
+                        if len(summary) > 2000:
+                            summary = summary[:2000] + "...(truncated)"
+                        priority = "low"
+                    else:
+                        if len(summary) > 3000:
+                            summary = summary[:3000] + "...(truncated)"
+                        priority = "normal"
+
+                    label = f"[{tool_name}] " if tool_name else ""
+                    tool_results_by_priority[priority].append(label + summary)
+                except (json.JSONDecodeError, TypeError):
+                    tool_results_by_priority["normal"].append(str(msg.content)[:2000])
+
+        MAX_CONTEXT = 40000
+        ordered_findings = (
+            tool_results_by_priority["critical"]
+            + tool_results_by_priority["normal"]
+            + tool_results_by_priority["low"]
+        )
+
+        tool_findings = []
+        total_len = 0
+        for finding in ordered_findings:
+            if total_len + len(finding) > MAX_CONTEXT:
+                break
+            tool_findings.append(finding)
+            total_len += len(finding)
+
+        codebase_context = "\n---\n".join(tool_findings)
 
         synthesis_prompt = f"""{PRD_SYSTEM_PROMPT}
 
@@ -1040,6 +1237,14 @@ CRITICAL FORMATTING RULES:
         content = response.choices[0].message.content or ""
         logger.info("PRD synthesis complete", response_length=len(content))
 
+        usage = getattr(response, "usage", None)
+        usage_meta = {}
+        if usage is not None:
+            pt = getattr(usage, "prompt_tokens", None) or (usage.get("prompt_tokens", 0) if isinstance(usage, dict) else 0)
+            ct = getattr(usage, "completion_tokens", None) or (usage.get("completion_tokens", 0) if isinstance(usage, dict) else 0)
+            tt = getattr(usage, "total_tokens", None) or (usage.get("total_tokens", 0) if isinstance(usage, dict) else (pt + ct))
+            usage_meta = {"usage": {"input_tokens": pt, "output_tokens": ct, "total_tokens": tt}}
+
         if not content.strip():
             logger.warning("PRD synthesis returned empty — using fallback")
             content = json.dumps({
@@ -1051,7 +1256,7 @@ CRITICAL FORMATTING RULES:
                 "raw_analysis": "\n\n".join(tool_findings[-6:]),
             })
 
-        return {"messages": [AIMessage(content=content)]}
+        return {"messages": [AIMessage(content=content, response_metadata=usage_meta)]}
 
     except Exception as e:
         logger.error(f"PRD synthesis failed: {e}", exc_info=True)

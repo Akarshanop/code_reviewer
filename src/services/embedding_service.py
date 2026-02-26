@@ -278,7 +278,18 @@ class EmbeddingService:
         # Create points with metadata
         points = []
         for i, (text, embedding, metadata) in enumerate(zip(texts, embeddings, metadata_list)):
-            point_id = self.generate_id(text, metadata.get("type", "embed"))
+            point_identity = "|".join([
+                str(metadata.get("repository_hash", "")),
+                str(metadata.get("relative_path", metadata.get("file", ""))),
+                str(metadata.get("type", "embed")),
+                str(metadata.get("name", "")),
+                str(metadata.get("signature", "")),
+                str(metadata.get("line", 0)),
+                str(metadata.get("graph_node_id", "")),
+            ])
+            if not point_identity.strip("|"):
+                point_identity = text
+            point_id = self.generate_id(point_identity, "artifact")
             
             point = {
                 "id": point_id,
@@ -288,8 +299,18 @@ class EmbeddingService:
                     "type": metadata.get("type", "unknown"),
                     "language": metadata.get("language", "unknown"),
                     "repository": metadata.get("repository", "unknown"),
+                    "repository_hash": metadata.get("repository_hash", ""),
+                    "repository_name": metadata.get("repository_name", ""),
                     "file": metadata.get("file", ""),
+                    "relative_path": metadata.get("relative_path", ""),
+                    "file_name": metadata.get("file_name", ""),
                     "line": metadata.get("line", 0),
+                    "name": metadata.get("name", ""),
+                    "signature": metadata.get("signature", ""),
+                    "description": metadata.get("description", ""),
+                    "entry_file": metadata.get("entry_file", ""),
+                    "repo_type": metadata.get("repo_type", ""),
+                    "graph_node_id": metadata.get("graph_node_id", ""),
                     "metadata": metadata.get("metadata", {}),
                     "created_at": metadata.get("created_at")
                 }

@@ -1,8 +1,7 @@
 import logging
 from typing import List, Dict, Any, Optional
 from datetime import datetime
-from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue
-import asyncio
+from qdrant_client.models import Filter, FieldCondition, MatchValue
 
 from src.database.qdrant_client import qdrant_client
 from src.services.embedding_service import embedding_service
@@ -23,204 +22,6 @@ class VectorService:
         await self.qdrant.initialize()
         await self.embedding.initialize()
     
-    async def index_code_artifacts(
-        self,
-        artifacts: List[Dict[str, Any]],
-        batch_size: int = 100
-    ) -> Dict[str, Any]:
-        """Index code artifacts (classes, methods, components, etc.)"""
-        if not artifacts:
-            logger.warning("No artifacts to index")
-            return {"indexed": 0, "errors": []}
-        
-        total_indexed = 0
-        errors = []
-        
-        logger.info(
-            "Starting artifact indexing",
-            total_artifacts=len(artifacts),
-            batch_size=batch_size
-        )
-        
-        for i in range(0, len(artifacts), batch_size):
-            batch = artifacts[i:i + batch_size]
-            batch_num = (i // batch_size) + 1
-            
-            try:
-                # Extract texts for embedding
-                texts = []
-                metadata_list = []
-                artifact_names = []
-                
-                for artifact in batch:
-                    text = self._create_index_text(artifact)
-                    
-                    # ✅ Validate: ensure we have content to embed
-                    if not text or len(text.strip()) < 5:
-                        logger.warning(
-                            f"Artifact has minimal content",
-                            artifact_type=artifact.get("type"),
-                            artifact_name=artifact.get("name"),
-                            text_length=len(text) if text else 0
-                        )
-                    
-                    texts.append(text)
-                    artifact_names.append(artifact.get("name", "unknown"))
-                    
-                    # Extract file_name and relative_path from file path
-                    file_path = artifact.get("file", "")
-                    file_name = file_path.split('/')[-1] if file_path else ""
-                    
-                    # REQUIRED metadata fields per spec
-                    metadata = {
-                        "type": artifact.get("type", "unknown"),
-                        "language": artifact.get("language", "unknown"),
-                        "repository": artifact.get("repository", "unknown"),
-                        "file": file_path,
-                        "line": artifact.get("line", 0),
-                        "name": artifact.get("name", ""),
-                        "signature": artifact.get("signature", ""),
-                        "description": artifact.get("description", ""),
-                        "metadata": artifact.get("metadata", {}),
-                        "created_at": datetime.utcnow().isoformat(),
-                        # REQUIRED FIELDS for enterprise-grade system
-                        "repository_name": artifact.get("repository_name", ""),
-                        "file_name": file_name,
-                        "relative_path": file_path,
-                        "entry_file": artifact.get("entry_file", ""),
-                        "repo_type": artifact.get("repo_type", ""),
-                    }
-                    metadata_list.append(metadata)
-                
-                # Generate embeddings
-                logger.debug(
-                    f"Generating embeddings for batch {batch_num}",
-                    batch_size=len(batch),
-                    text_samples=artifact_names[:3]
-                )
-                
-                points_data = await self.embedding.batch_generate_with_ids(texts, metadata_list)
-                
-                if not points_data:
-                    error_msg = f"Batch {batch_num}: Failed to generate embeddings (empty result)"
-                    logger.error(error_msg, batch_index=batch_num)
-                    errors.append(error_msg)
-                    continue
-                
-                # Convert to Qdrant PointStruct
-                points = []
-                for point_data in points_data:
-                    point = PointStruct(
-                        id=point_data["id"],
-                        vector=point_data["vector"],
-                        payload=point_data["payload"]
-                    )
-                    points.append(point)
-                
-                # ✅ Validate embeddings before upsert
-                if not points:
-                    error_msg = f"Batch {batch_num}: No valid points to upsert"
-                    logger.error(error_msg)
-                    errors.append(error_msg)
-                    continue
-                
-                # Upsert to Qdrant
-                logger.debug(
-                    f"Upserting batch {batch_num} to Qdrant",
-                    point_count=len(points)
-                )
-                
-                await self.qdrant.upsert_vectors(points)
-                
-                total_indexed += len(batch)
-                logger.info(
-                    f"Indexed batch {batch_num} successfully",
-                    batch_size=len(batch),
-                    total_indexed=total_indexed,
-                    batch_artifacts=artifact_names[:3]
-                )
-                
-            except Exception as e:
-                error_msg = f"Batch {batch_num} failed: {str(e)}"
-                logger.error(
-                    f"Failed to index batch {batch_num}",
-                    error=str(e),
-                    batch_index=batch_num,
-                    exc_info=True
-                )
-                errors.append(error_msg)
-        
-        logger.info(
-            "Artifact indexing completed",
-            total_indexed=total_indexed,
-            total_artifacts=len(artifacts),
-            error_count=len(errors),
-            success_rate=f"{(total_indexed/len(artifacts)*100):.1f}%" if artifacts else "N/A"
-        )
-        
-        return {
-            "indexed": total_indexed,
-            "errors": errors,
-            "success": len(errors) == 0 and total_indexed > 0
-        }
-    
-    def _create_index_text(self, artifact: Dict[str, Any]) -> str:
-        """
-        Create text for embedding from artifact.
-        
-        FIX 6: Prefer the rich 'text' field that _generate_embeddings already
-        builds (contains type + name + key attributes).  Fall back to the
-        'code' field.  Both are concatenated with name/signature so the
-        embedding captures the same semantic content that was intended during
-        ingestion.  Code limit raised from 500→1500 chars so meaningful
-        function bodies aren't truncated to a useless prefix.
-        """
-        parts = []
-        
-        # Add name and type (always first for retrieval anchoring)
-        artifact_type = artifact.get('type', 'artifact')
-        artifact_name = artifact.get('name', '')
-        parts.append(f"{artifact_type}: {artifact_name}")
-        
-        # Language / file context (helps discriminate across repos)
-        if artifact.get("language"):
-            parts.append(f"Language: {artifact['language']}")
-        if artifact.get("file"):
-            parts.append(f"File: {artifact['file']}")
-        
-        # Add signature if available
-        if artifact.get("signature"):
-            parts.append(f"Signature: {artifact['signature']}")
-        
-        # Add description if available
-        if artifact.get("description"):
-            parts.append(f"Description: {artifact['description']}")
-        
-        # Prefer the ingestion-built 'text' field (richer summary).
-        # Fall back to 'code' (raw snippet).
-        text_field = artifact.get("text") or ""
-        code_field = artifact.get("code") or ""
-        
-        # Use whichever is more informative; if both exist, concatenate.
-        if text_field and code_field and text_field != code_field:
-            combined = f"{text_field}\n{code_field}"
-        else:
-            combined = text_field or code_field
-        
-        if combined:
-            # FIX 1: Increase limit to 2500 chars now that we embed actual code bodies
-            if len(combined) > 2500:
-                combined = combined[:2500] + "..."
-            parts.append(combined)
-        
-        # Add metadata as context
-        if artifact.get("metadata") and isinstance(artifact["metadata"], dict):
-            for key, value in artifact["metadata"].items():
-                if isinstance(value, str) and len(value) < 100:
-                    parts.append(f"{key}: {value}")
-        
-        return "\n".join(parts)
-    
     async def semantic_search(
         self,
         query: str,
@@ -228,9 +29,15 @@ class VectorService:
         filter_type: Optional[str] = None,
         filter_repository: Optional[str] = None,
         filter_language: Optional[str] = None,
-        score_threshold: float = 0.5
+        score_threshold: float = 0.5,
+        filters: Optional[Dict[str, Any]] = None
     ) -> List[Dict[str, Any]]:
         """Perform semantic search on indexed code artifacts"""
+        if filters:
+            filter_type = filter_type or filters.get("type")
+            filter_repository = filter_repository or filters.get("repository")
+            filter_language = filter_language or filters.get("language")
+
         # Generate query embedding
         query_embedding = await self.embedding.generate_embedding(query)
         
@@ -251,16 +58,22 @@ class VectorService:
         # Format results
         formatted_results = []
         for result in results:
+            payload = result["payload"]
+            graph_node_id = payload.get("graph_node_id")
             formatted_results.append({
-                "id": result["id"],
+                "id": graph_node_id or result["id"],
+                "vector_id": result["id"],
                 "score": result["score"],
-                "text": result["payload"].get("text", ""),
-                "type": result["payload"].get("type", "unknown"),
-                "name": result["payload"].get("name", ""),
-                "repository": result["payload"].get("repository", "unknown"),
-                "file": result["payload"].get("file", ""),
-                "line": result["payload"].get("line", 0),
-                "metadata": result["payload"].get("metadata", {})
+                "text": payload.get("text", ""),
+                "type": payload.get("type", "unknown"),
+                "name": payload.get("name", ""),
+                "repository": payload.get("repository", "unknown"),
+                "repository_hash": payload.get("repository_hash", ""),
+                "file": payload.get("file", ""),
+                "relative_path": payload.get("relative_path", ""),
+                "line": payload.get("line", 0),
+                "graph_node_id": graph_node_id,
+                "metadata": payload.get("metadata", {})
             })
         
         logger.debug(

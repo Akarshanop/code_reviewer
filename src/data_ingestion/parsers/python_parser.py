@@ -83,6 +83,7 @@ class PythonParser:
     
     def __init__(self):
         self._cache: Dict[str, Dict[str, Any]] = {}
+        self._method_nodes: Set[ast.AST] = set()
     
     def parse(self, file_path: str, content: str = None) -> Dict[str, Any]:
         """
@@ -109,6 +110,7 @@ class PythonParser:
         # Store source lines for body extraction
         self._source_lines = content.splitlines(keepends=True)
         self._source = content
+        self._method_nodes.clear()
         
         # Parse AST
         try:
@@ -228,10 +230,13 @@ class PythonParser:
                 methods = []
                 for item in node.body:
                     if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        self._method_nodes.add(item)
                         method_body = self._get_source_segment(item)
                         method_calls = self._extract_calls_from_node(item)
+                        method_fqn = self._python_function_fqn(file_path, item.name, node.name)
                         methods.append({
                             "name": item.name,
+                            "fqn": method_fqn,
                             "is_async": isinstance(item, ast.AsyncFunctionDef),
                             "params": self._get_parameters(item),
                             "return_type": self._get_type_annotation(item.returns) if item.returns else None,
@@ -275,7 +280,7 @@ class PythonParser:
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 # Skip methods (handled in class extraction)
-                if self._is_method(node, tree):
+                if self._is_method(node):
                     continue
                 
                 # Get decorators
@@ -303,6 +308,7 @@ class PythonParser:
                 
                 func_info = {
                     "name": node.name,
+                    "fqn": self._python_function_fqn(file_path, node.name),
                     "file_path": file_path,
                     "line_number": node.lineno,
                     "end_line": getattr(node, 'end_lineno', None),
@@ -320,6 +326,26 @@ class PythonParser:
                 
                 result["functions"].append(func_info)
                 result["decorators"].extend(decorators)
+
+    def _python_function_fqn(
+        self,
+        file_path: str,
+        function_name: str,
+        class_name: Optional[str] = None,
+    ) -> str:
+        """Build a stable Python FQN from file/module + symbol name."""
+        module = self._python_module_from_path(file_path)
+        base = f"{module}.{class_name}" if class_name else module
+        return f"{base}.{function_name}" if base else function_name
+
+    def _python_module_from_path(self, file_path: str) -> str:
+        """Best-effort module name derivation from a .py file path."""
+        path = Path(file_path)
+        if path.name == "__init__.py":
+            module_path = path.parent
+        else:
+            module_path = path.with_suffix("")
+        return ".".join([part for part in module_path.parts if part and part not in (".", "..")])
     
     def _extract_constants(self, tree: ast.Module, result: Dict[str, Any]):
         """Extract module-level constants"""
@@ -574,14 +600,9 @@ class PythonParser:
             }
         return None
     
-    def _is_method(self, func_node: ast.AST, tree: ast.Module) -> bool:
+    def _is_method(self, func_node: ast.AST) -> bool:
         """Check if a function is a method (inside a class)"""
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ClassDef):
-                for item in node.body:
-                    if item is func_node:
-                        return True
-        return False
+        return func_node in self._method_nodes
     
     # =========================================================================
     # FIX 4: Call graph extraction

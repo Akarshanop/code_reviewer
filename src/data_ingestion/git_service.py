@@ -6,7 +6,6 @@ import logging
 import os
 import shutil
 import asyncio
-import hashlib
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
@@ -20,6 +19,7 @@ from git.remote import RemoteProgress
 from config.settings import settings, RepositoryConfig
 from src.core.logger import get_logger
 from src.core.exceptions import CodeAnalysisException
+from src.core.id_generator import generate_repository_hash
 
 logger = get_logger(__name__)
 
@@ -60,7 +60,7 @@ class RepositoryState:
     
     @property
     def hash(self) -> str:
-        return hashlib.md5(self.url.encode()).hexdigest()[:12]
+        return generate_repository_hash(self.url)
 
 
 class GitService:
@@ -69,6 +69,7 @@ class GitService:
     Supports parallel cloning, incremental updates, and caching.
     """
     
+    #__init__ is a initializer or a function that is called when the class is instantiated.
     def __init__(self):
         self.git_token = settings.GIT_TOKEN
         self.git_username = settings.GIT_USERNAME
@@ -89,7 +90,7 @@ class GitService:
             work_dir=str(self.work_dir),
             max_workers=4
         )
-    
+    #this function adds the git token to the url kind of like a vip ticket to the repo url for security reasons.
     def _get_auth_url(self, url: str) -> str:
         """Add authentication to repository URL"""
         if not url:
@@ -117,7 +118,7 @@ class GitService:
     
     def _get_repo_path(self, repo_config: RepositoryConfig) -> Path:
         """Get local path for repository"""
-        repo_hash = hashlib.md5(repo_config.url.encode()).hexdigest()[:12]
+        repo_hash = generate_repository_hash(repo_config.url)
         return self.work_dir / f"{repo_config.name}_{repo_hash}"
     
     def _clone_repository_sync(self, repo_config: RepositoryConfig, 
@@ -188,7 +189,9 @@ class GitService:
             
             if self.clone_depth > 0:
                 clone_kwargs["depth"] = self.clone_depth
-            
+                
+            #(**kwargs is a keyword augumentation of a dictionary where we can pass any number of auguments to a function)
+            #this is the main function that clones the repo (Repo.clone_from = git clone command)
             repo = Repo.clone_from(auth_url, repo_path, **clone_kwargs)
             
             result["status"] = "cloned"

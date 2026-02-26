@@ -441,9 +441,16 @@ class LanguageDetector:
             Dictionary with repository analysis
         """
         exclude_patterns = exclude_patterns or [
-            "**/node_modules/**", "**/target/**", "**/build/**",
-            "**/.git/**", "**/dist/**", "**/__pycache__/**",
-            "**/vendor/**", "**/.idea/**", "**/.vscode/**"
+            "**/node_modules/**", "node_modules/**",
+            "**/target/**", "**/build/**",
+            "**/.git/**", ".git/**",
+            "**/dist/**",
+            "**/__pycache__/**", "__pycache__/**",
+            "**/vendor/**", "**/.idea/**", "**/.vscode/**",
+            "**/.venv/**", ".venv/**",
+            "**/venv/**", "venv/**",
+            "**/site-packages/**",
+            "**/*.pyx", "**/*.pxd",
         ]
         
         stats = {

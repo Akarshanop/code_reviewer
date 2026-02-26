@@ -3,8 +3,9 @@ import hmac
 import secrets
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
+import base64
+import bcrypt
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 from fastapi import HTTPException, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import redis.asyncio as redis
@@ -13,8 +14,16 @@ from src.core.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Password hashing context
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+PASSWORD_HASH_PREFIX = "bcrypt_sha256$"
+
+
+def _password_digest(password: str) -> bytes:
+    """
+    Pre-hash password to fixed-length bytes before bcrypt.
+    This avoids bcrypt's 72-byte limit while preserving security properties.
+    """
+    digest = hashlib.sha256(password.encode("utf-8")).digest()
+    return base64.b64encode(digest)
 
 # JWT Configuration
 ALGORITHM = "HS256"
@@ -52,11 +61,29 @@ class TokenBlacklist:
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verify password against hash"""
-    return pwd_context.verify(plain_password, hashed_password)
+    if not hashed_password:
+        return False
+
+    try:
+        if hashed_password.startswith(PASSWORD_HASH_PREFIX):
+            raw_hash = hashed_password[len(PASSWORD_HASH_PREFIX):].encode("utf-8")
+            return bcrypt.checkpw(_password_digest(plain_password), raw_hash)
+
+        # Backward-compatibility for existing raw bcrypt hashes ("$2a/$2b/$2y").
+        if hashed_password.startswith("$2"):
+            return bcrypt.checkpw(
+                plain_password.encode("utf-8"),
+                hashed_password.encode("utf-8"),
+            )
+    except Exception:
+        return False
+
+    return False
 
 def get_password_hash(password: str) -> str:
     """Generate password hash"""
-    return pwd_context.hash(password)
+    hashed = bcrypt.hashpw(_password_digest(password), bcrypt.gensalt())
+    return f"{PASSWORD_HASH_PREFIX}{hashed.decode('utf-8')}"
 
 def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta] = None) -> str:
     """Create JWT access token"""
@@ -73,15 +100,8 @@ def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta]
     return encoded_jwt
 
 def decode_access_token(token: str) -> Optional[Dict[str, Any]]:
-    """Decode and validate JWT token"""
+    """Decode and validate JWT token (does not check blacklist; use verify_token_async for that)."""
     try:
-        # Check blacklist first
-        if TokenBlacklist.is_blacklisted(token):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Token has been revoked"
-            )
-        
         payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[ALGORITHM])
         return payload
     except JWTError:
@@ -160,8 +180,13 @@ class JWTBearer(HTTPBearer):
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Invalid authentication scheme"
                 )
-            
-            token_data = decode_access_token(credentials.credentials)
+            token = credentials.credentials
+            if await TokenBlacklist.is_blacklisted(token):
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Token has been revoked"
+                )
+            token_data = decode_access_token(token)
             if not token_data:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
@@ -210,6 +235,11 @@ def require_role(*roles: str):
                 )
             
             token = auth_header.replace("Bearer ", "")
+            if await TokenBlacklist.is_blacklisted(token):
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Token has been revoked"
+                )
             token_data = decode_access_token(token)
             
             if not token_data:

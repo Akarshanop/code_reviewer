@@ -677,9 +677,8 @@ class TsReactParser:
             if child.type == 'identifier':
                 name = self._get_node_text(child, content)
             elif child.type == 'arrow_function':
-                # Check if it returns JSX
-                func_text = self._get_node_text(child, content)
-                has_jsx = bool(re.search(r'<[A-Z][a-zA-Z]*|<[a-z]+\s|<[a-z]+>', func_text))
+                # AST-based JSX check
+                has_jsx = self._contains_jsx(child)
                 
                 # Extract props from parameters
                 for subchild in child.children:
@@ -704,9 +703,8 @@ class TsReactParser:
         name = None
         props = []
         hooks = []
-        
-        func_text = self._get_node_text(node, content)
-        has_jsx = bool(re.search(r'<[A-Z][a-zA-Z]*|<[a-z]+\s|<[a-z]+>', func_text))
+
+        has_jsx = self._contains_jsx(node)
         
         if not has_jsx:
             return None
@@ -782,15 +780,21 @@ class TsReactParser:
 
     def _find_hooks_in_node(self, node, content: str) -> list[str]:
         """Find React hooks used within a node."""
-        hooks = []
-        text = self._get_node_text(node, content)
-        
-        # Common hooks pattern
-        hook_pattern = r'\buse[A-Z][a-zA-Z]*\b'
-        matches = re.findall(hook_pattern, text)
-        hooks = list(set(matches))
-        
-        return hooks
+        hooks: set[str] = set()
+        for call in self._find_nodes_by_type(node, 'call_expression'):
+            callee = call.child_by_field_name('function') if hasattr(call, 'child_by_field_name') else None
+            if callee is None:
+                continue
+            if callee.type == "identifier":
+                name = self._get_node_text(callee, content).strip()
+            elif callee.type == "member_expression":
+                prop = callee.child_by_field_name('property') if hasattr(callee, 'child_by_field_name') else None
+                name = self._get_node_text(prop, content).strip() if prop else ""
+            else:
+                name = ""
+            if name.startswith("use") and len(name) > 3 and name[3:4].isupper():
+                hooks.add(name)
+        return sorted(hooks)
 
     # =========================================================================
     # Express.js Route Extraction
@@ -1159,10 +1163,15 @@ class TsReactParser:
 
     def _parse_middleware_use(self, node, content: str) -> Optional[dict]:
         """Parse app.use() middleware calls."""
-        text = self._get_node_text(node, content)
-        
-        # Check for app.use or router.use
-        if not re.search(r'\b(app|router|Router)\.use\s*\(', text):
+        callee = node.child_by_field_name('function') if hasattr(node, 'child_by_field_name') else None
+        if callee is None or callee.type != 'member_expression':
+            return None
+
+        obj_node = callee.child_by_field_name('object') if hasattr(callee, 'child_by_field_name') else None
+        prop_node = callee.child_by_field_name('property') if hasattr(callee, 'child_by_field_name') else None
+        prop = (self._get_node_text(prop_node, content) if prop_node else '').lower()
+        obj_text = (self._get_node_text(obj_node, content) if obj_node else '').strip()
+        if prop != 'use' or obj_text not in ('app', 'router', 'Router'):
             return None
         
         path = None
@@ -1187,6 +1196,18 @@ class TsReactParser:
                 **self._get_node_location(node),
             }
         return None
+
+    def _contains_jsx(self, node) -> bool:
+        """AST-level JSX presence check (JSX/TSX)."""
+        jsx_nodes = (
+            'jsx_element',
+            'jsx_self_closing_element',
+            'jsx_fragment',
+        )
+        for jsx_type in jsx_nodes:
+            if self._find_nodes_by_type(node, jsx_type):
+                return True
+        return False
 
     # =========================================================================
     # MongoDB/Mongoose Model Extraction

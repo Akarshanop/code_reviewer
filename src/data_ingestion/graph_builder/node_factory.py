@@ -10,11 +10,11 @@ Enhanced with:
 import logging
 from typing import Dict, List, Any, Optional
 from datetime import datetime
-import hashlib
 import json
 
 from src.database.neo4j_client import neo4j_client
 from src.core.logger import get_logger
+from src.core.id_generator import generate_node_id
 from src.intelligence.behavioral_layer import behavioral_classifier, BehavioralNodeLabel
 from src.intelligence.domain_model import domain_engine
 
@@ -40,8 +40,7 @@ class NodeFactory:
     
     def _generate_node_id(self, node_type: str, *identifiers) -> str:
         """Generate a unique, deterministic node ID"""
-        combined = f"{node_type}:{'|'.join(str(i) for i in identifiers)}"
-        return hashlib.md5(combined.encode()).hexdigest()[:16]
+        return generate_node_id(node_type, *identifiers)
     
     async def create_nodes(self, session, parsed_data: Dict[str, Any], 
                           file_path: str, repository: str = None,
@@ -77,7 +76,7 @@ class NodeFactory:
         
         try:
             # Create File node first with REQUIRED metadata
-            file_node_id = self._generate_node_id("File", file_path)
+            file_node_id = self._generate_node_id("File", repository_hash or "", file_path)
             
             # Detect if this is an entry file
             is_entry_file = self._is_entry_file(file_path, repo_type)
@@ -175,6 +174,20 @@ class NodeFactory:
                     stats["by_type"]["Service"] = stats["by_type"].get("Service", 0) + 1
                 except Exception as e:
                     stats["errors"].append(f"Service error: {str(e)}")
+
+            # Create Class nodes
+            classes = parsed_data.get('classes', [])
+            for cls in classes:
+                try:
+                    class_result = await self._create_class_node(
+                        session, cls, file_path, file_node_id, repository_hash,
+                        repo_type=repo_type, repository_name=repository_name,
+                        entry_file=entry_file, file_name=file_name, relative_path=relative_path
+                    )
+                    stats["created"] += class_result.get("created", 0)
+                    stats["by_type"]["Class"] = stats["by_type"].get("Class", 0) + class_result.get("created", 0)
+                except Exception as e:
+                    stats["errors"].append(f"Class error: {str(e)}")
             
             # Create React Component nodes
             components = parsed_data.get('components', [])
@@ -295,7 +308,7 @@ class NodeFactory:
             # ── Behavioral + Domain enrichment (post-creation) ──
             try:
                 await self._enrich_file_nodes_behavioral(
-                    session, file_path, parsed_data, repo_type, repository_name
+                    session, file_path, parsed_data, repository_hash, repo_type, repository_name
                 )
             except Exception as e:
                 logger.debug(f"Behavioral enrichment skipped for {file_path}: {e}")
@@ -317,6 +330,7 @@ class NodeFactory:
         session,
         file_path: str,
         parsed_data: Dict[str, Any],
+        repository_hash: str = None,
         repo_type: str = None,
         repository_name: str = None,
     ) -> None:
@@ -334,7 +348,7 @@ class NodeFactory:
             name = fn.get("name", "")
             if not name:
                 continue
-            node_id = self._generate_node_id("Function", (parsed_data.get("repository_hash") or ""), file_path, name)
+            node_id = self._generate_node_id("Function", repository_hash or "", file_path, name)
             fn_body = fn.get("body", fn.get("code", ""))[:1000]
             fn_decorators = fn.get("decorators", [])
 
@@ -369,7 +383,7 @@ class NodeFactory:
                 continue
             path = route.get("path", "")
             method = route.get("method", "GET")
-            node_id = self._generate_node_id("Route", path, method, file_path)
+            node_id = self._generate_node_id("Route", repository_hash or "", path, method, file_path)
             classification = behavioral_classifier.classify_node(
                 node_id=node_id,
                 name=route.get("handler_method", route.get("name", "")),
@@ -398,7 +412,7 @@ class NodeFactory:
         )
         if domains:
             top_domain, confidence, evidence = domains[0]
-            file_node_id = self._generate_node_id("File", file_path)
+            file_node_id = self._generate_node_id("File", repository_hash or "", file_path)
             await session.run(
                 """
                 MATCH (n:File {id: $id})
@@ -441,7 +455,7 @@ class NodeFactory:
         else:
             return {"created": 0}
         
-        node_id = self._generate_node_id("Route", path, method, file_path)
+        node_id = self._generate_node_id("Route", repository_hash or "", path, method, file_path)
         
         # FIX 1: Store code_body on route nodes
         route_body = ""
@@ -514,7 +528,7 @@ class NodeFactory:
         else:
             return {"created": 0}
         
-        node_id = self._generate_node_id("EventBus", address, eb_type, file_path)
+        node_id = self._generate_node_id("EventBus", repository_hash or "", address, eb_type, file_path)
         
         query = """
         MERGE (e:EventBusNode {id: $id})
@@ -590,6 +604,7 @@ class NodeFactory:
         return_type = fn.get("return_type") or ""
         docstring = fn.get("docstring") or ""
         calls_list = fn.get("calls") or []
+        function_fqn = (fn.get("fqn") or "").strip()
 
         query = f"""
         MERGE (fn:{labels} {{id: $id}})
@@ -605,6 +620,7 @@ class NodeFactory:
             fn.return_type = $return_type,
             fn.docstring = $docstring,
             fn.calls = $calls,
+            fn.fqn = $fqn,
             fn.repository_hash = $repository_hash,
             fn.repository_name = $repository_name,
             fn.file_name = $file_name,
@@ -635,6 +651,7 @@ class NodeFactory:
                 "return_type": return_type,
                 "docstring": docstring[:500],
                 "calls": calls_list,
+                "fqn": function_fqn,
                 "repository_hash": repository_hash or "",
                 "repository_name": repository_name or "",
                 "file_name": file_name or "",
@@ -675,7 +692,7 @@ class NodeFactory:
             for f in fields
         ]
         
-        node_id = self._generate_node_id("DTO", name, file_path)
+        node_id = self._generate_node_id("DTO", repository_hash or "", name, file_path)
         
         query = """
         MERGE (d:DTO {id: $id})
@@ -734,7 +751,7 @@ class NodeFactory:
         elif 'Handler' in name:
             service_type = 'Handler'
         
-        node_id = self._generate_node_id("Service", name, file_path)
+        node_id = self._generate_node_id("Service", repository_hash or "", name, file_path)
         
         query = """
         MERGE (s:Service {id: $id})
@@ -798,7 +815,7 @@ class NodeFactory:
             for p in props
         ]
         
-        node_id = self._generate_node_id("Component", name, file_path)
+        node_id = self._generate_node_id("Component", repository_hash or "", name, file_path)
         
         query = """
         MERGE (c:ReactComponent {id: $id})
@@ -859,7 +876,7 @@ class NodeFactory:
         else:
             return {"created": 0}
         
-        node_id = self._generate_node_id("ApiCall", url, method, file_path)
+        node_id = self._generate_node_id("ApiCall", repository_hash or "", url, method, file_path)
         
         query = """
         MERGE (a:ApiCall {id: $id})
@@ -905,6 +922,70 @@ class NodeFactory:
             "repo_type": repo_type or ""
         })
         
+        return {"created": 1}
+
+    async def _create_class_node(self, session, cls: Dict[str, Any],
+                                 file_path: str, file_node_id: str,
+                                 repository_hash: str,
+                                 repo_type: str = None,
+                                 repository_name: str = None,
+                                 entry_file: str = None,
+                                 file_name: str = None,
+                                 relative_path: str = None) -> Dict[str, Any]:
+        """Create a Class node with REQUIRED metadata."""
+        if not isinstance(cls, dict):
+            return {"created": 0}
+
+        name = (cls.get("name") or "").strip()
+        if not name:
+            return {"created": 0}
+
+        extends = cls.get("extends") or cls.get("superclass") or ""
+        implements = cls.get("implements") or []
+        methods = cls.get("methods") or []
+        code_body = (cls.get("body") or cls.get("code") or "")[:5000]
+
+        node_id = self._generate_node_id("Class", repository_hash or "", name, file_path)
+
+        query = """
+        MERGE (c:Class {id: $id})
+        SET c.name = $name,
+            c.extends = $extends,
+            c.implements = $implements,
+            c.methods = $methods,
+            c.file = $file,
+            c.file_path = $file,
+            c.code_body = $code_body,
+            c.repository_hash = $repository_hash,
+            c.repository_name = $repository_name,
+            c.file_name = $file_name,
+            c.relative_path = $relative_path,
+            c.entry_file = $entry_file,
+            c.repo_type = $repo_type,
+            c.last_updated = datetime()
+        WITH c
+        MATCH (f:File {id: $file_id})
+        MERGE (f)-[:CONTAINS]->(c)
+        RETURN c
+        """
+
+        await session.run(query, {
+            "id": node_id,
+            "name": name,
+            "extends": extends,
+            "implements": implements if isinstance(implements, list) else [],
+            "methods": [m.get("name", "") if isinstance(m, dict) else str(m) for m in methods][:100],
+            "file": file_path,
+            "file_id": file_node_id,
+            "code_body": code_body,
+            "repository_hash": repository_hash or "",
+            "repository_name": repository_name or "",
+            "file_name": file_name or "",
+            "relative_path": relative_path or "",
+            "entry_file": entry_file or "",
+            "repo_type": repo_type or "",
+        })
+
         return {"created": 1}
     
     def _detect_language(self, file_path: str) -> str:

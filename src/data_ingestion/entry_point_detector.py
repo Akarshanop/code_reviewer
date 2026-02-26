@@ -49,7 +49,6 @@ class EntryPointDetector:
             ('src/server.js', 'server', 0.95),
             # Express specific
             ('bin/www', 'server', 0.8),
-            # React/Frontend patterns
             ('src/index.jsx', 'frontend', 0.9),
             ('src/main.jsx', 'frontend', 0.9),
             ('src/App.jsx', 'app', 0.85),

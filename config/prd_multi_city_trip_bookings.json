@@ -1,0 +1,210 @@
+{
+  "feature_name": "Multi-City and Multi-Leg Trip Bookings",
+  "executive_summary": {
+    "problem_statement": "Currently, the product only supports single-city trip bookings (origin-destination or single-city stay). Users are unable to plan and book complex journeys involving multiple cities or legs within a single transaction, leading to fragmented booking experiences and potential loss of business for multi-destination travelers.",
+    "objective": "Enable users to plan and book complex journeys involving multiple cities or legs (flights, hotels, and other services) in a single trip and single transaction flow, reusing existing trip and booking infrastructure where possible.",
+    "goals": [
+      "Support multi-city trip creation with multiple legs (cities/stays) in one transaction",
+      "Persist and use multi-city itinerary in trip–booking linkage (today cities from CreateTripRequest are not persisted in createTripDraft)",
+      "Complete multi-city flight booking flow (hold, order/da, order/pg) — MultiCityFlightMount currently has hold/order endpoints commented out",
+      "Support multi-city hotel search and booking tied to trip legs",
+      "Unify trip-finding logic so hotel bookings can be matched to trip legs (findTripForHotel currently returns null)"
+    ],
+    "non_goals": [
+      "Changing the file_bb746bb82b1b repo (file upload/scanner service — not travel)",
+      "Rebuilding flight/hotel provider APIs; use existing DomesticFlight/PersonalDomesticFlight multiCity endpoints",
+      "Supporting multi-city for Bus/Train/Visa in initial scope unless already present in codebase"
+    ]
+  },
+  "user_personas": [
+    {
+      "persona": "Employee (Traveler)",
+      "responsibilities": "Creates trips, adds flight/hotel requests, submits for approval",
+      "key_need": "Create one trip with multiple cities/legs and add all flights and stays to that trip without creating separate trips per leg"
+    },
+    {
+      "persona": "Travel Desk (Implant)",
+      "responsibilities": "Creates trips on behalf of employees/guests, holds and confirms bookings",
+      "key_need": "Search and book multi-city flights and multi-city stays in one flow and attach all to a single trip"
+    },
+    {
+      "persona": "Approver",
+      "responsibilities": "Approves trips and bookings",
+      "key_need": "See one coherent multi-city itinerary and approve the full journey"
+    }
+  ],
+  "functional_requirements": [
+    {
+      "section_number": "3.1",
+      "title": "Multi-City Trip Creation and Persistence",
+      "description": "Trip draft creation must persist the cities/itinerary from the request so that subsequent booking and trip-finding logic can use it.",
+      "business_rules": [
+        "CreateTripRequest already defines List<City> cities (models/jsons/CreateTrip/CreateTripRequest.java). createTripDraft in BookingQueries must map request.getCities() into Trips (e.g. citiesMap attrs and/or TripItinerary list) so that findTripFor* and UI can rely on it.",
+        "Trip type is already set as MULTI in createTripDraft (attrs type = MULTI); ensure itinerary structure matches TripItinerary (city, startTime, endTime, travel) and TripCitiesConfig (models/jsons/Trip/TripCitiesConfig.java)."
+      ],
+      "system_behavior": [
+        "On createTripDraft: persist cities from CreateTripRequest into Trips.cities (List<TripItinerary>) or attrs citiesMap (TripCitiesConfig) as done in Trips.addCity() in models/sql/Trips.java.",
+        "TravelDesk CreateTripController (travel/Trips/TravelDesk/CreateTripController.java) does not accept cities; extend to accept optional cities/itinerary for multi-city trips."
+      ],
+      "validations": [
+        "Reuse existing tripFixedDuration and start/end date validation in BookingQueries.createTripDraft; ensure multi-city date ranges fall within trip startDate/endDate.",
+        "Validate city IDs against Cities/CityQueries where applicable."
+      ]
+    },
+    {
+      "section_number": "3.2",
+      "title": "Multi-City Flight Booking Flow",
+      "description": "Enable hold and order (DA/PG) for multi-city flight searches so that a multi-leg flight can be booked in one transaction.",
+      "business_rules": [
+        "Flight multi-city search already exists: travel/Flight/MultiCity/InitSearchController.java, MultiCitySearchRequest (models/travel/MultiCitySearchRequest.java), FlightProvider.multiCitySearch, DomesticFlight.multiCitySearch (apis/meta/flight/DomesticFlight.java). MultiCityFlightMount (travel/Flight/MultiCity/MultiCityFlightMount.java) currently has hold, order/da, order/pg, and flightChoices commented out.",
+        "Reuse patterns from one-way and round-trip: travel/Flight/HoldFlightController, CreateDaOrderController, CreatePgOrderController, and travel/Flight/Round/* equivalents."
+      ],
+      "system_behavior": [
+        "Implement or wire MultiCity hold and order controllers (e.g. MultiCity/HoldFlightController, CreateDaOrderController, CreatePgOrderController) that accept MultiCitySearchRequest/MultiCityReviewRequest and call FlightProvider.multiCityReview, then existing order/DA/PG flows where provider supports it.",
+        "Cache and session handling should follow ApiCache.QUERIES.save/forImplant pattern used in InitSearchController and one-way flow."
+      ],
+      "validations": [
+        "Reuse origin/destination/date validation from InitSearchController (MultiCity) and ensure sector sequence matches trip itinerary when tripId is present.",
+        "Reuse findTripForFlight-style logic for multi-city: match trip by iterating trip.getCities() (TripItinerary) for each sector origin/destination/date (see BookingQueries.findTripForFlight and findTripForRoundFlight)."
+      ]
+    },
+    {
+      "section_number": "3.3",
+      "title": "Trip–Booking Linkage for Hotels (Multi-Leg)",
+      "description": "Hotel bookings must be linkable to a specific leg/city of a trip. Today findTripForHotel returns null; tripId is passed manually in HoldHotelController.",
+      "business_rules": [
+        "StaySearch and StayRequest (models/travel/StaySearch.java, StayRequest.java) are single-city (city, checkIn, checkOut). For multi-city trips, hotel search can remain per-city but must be associable with a trip and optionally a leg (city) of that trip.",
+        "HoldHotelController (travel/Hotel/HoldHotelController.java) already accepts tripId and validates trip when tripRequiredForImplant; extend to optionally validate that the stay city/dates align with a leg of the trip."
+      ],
+      "system_behavior": [
+        "Implement findTripForHotel in BookingQueries (models/queries/BookingQueries.java): given employee and StayRequest (city, checkIn, checkOut), find a trip whose itinerary (getCities() or citiesMap) includes that city and date range.",
+        "When tripId is provided, optionally auto-fill or validate that the stay matches one of the trip's cities/legs."
+      ],
+      "validations": [
+        "Reuse existing hotel validations (session, hotelId, roomId, travellers). If tripId present and findTripForHotel is implemented, validate stay city/dates overlap with trip leg."
+      ]
+    },
+    {
+      "section_number": "3.4",
+      "title": "Single-Transaction and UX Consistency",
+      "description": "User can add multiple legs (flights and stays) to one trip and submit for approval as one journey.",
+      "business_rules": [
+        "Trip remains the single unit for approval and reporting (existing status flow: DRAFT → PENDING → APPROVED/DECLINED; BookingStatus.TRIPAPPROVAL etc. in utils/data/enums/BookingStatus.java).",
+        "Existing plugins (tripRestrict, tripFixedDuration, tripRequiredForImplant, tripDraftEmail, etc.) in utils/data/jsons/Plugins.java and CompanyPlugins.java apply to multi-city trips without change unless specified."
+      ],
+      "system_behavior": [
+        "Trip details and booking lists already key by trip_id (e.g. travel/Trips/TripDetailsController.java). Ensure multi-city itinerary is returned in trip details (cities(), getCities(), citiesMap).",
+        "Reports that aggregate by trip (e.g. reports/Impl/Travel/Common/TripsReport.java) should continue to treat one trip as one unit; multi-leg data available via existing Trips.cities / TripItinerary."
+      ],
+      "validations": [
+        "Policy and budget checks remain per-trip; no new validation rule required for multi-city beyond date range and city consistency."
+      ]
+    }
+  ],
+  "non_functional_requirements": {
+    "performance": [
+      "Multi-city flight search already uses async CompletableFuture in InitSearchController; hold/order flows should avoid blocking on multiple provider calls where possible."
+    ],
+    "security": [
+      "Reuse ImplantAccessMiddleware and EmployeeAccessMiddleWare; no new auth model. Trip–employee association and tripId validation already enforced in CreateTripDraftController, HoldHotelController, and flight flows."
+    ],
+    "scalability": [
+      "No new storage model; use existing fintrip_ooo_trips table and attrs/cities. Cache keys for multi-city search already use diceId (ObjectId) in ApiCache."
+    ],
+    "observability": [
+      "Use existing Logger and error handling (e.g. RoutingError, ResponseHelper.handleError) in new controllers."
+    ]
+  },
+  "existing_codebase_analysis": {
+    "relevant_files": [
+      {"file": "backend/data/repos/server_f26f1ce8bc35/models/src/main/java/models/jsons/CreateTrip/CreateTripRequest.java", "purpose": "Request DTO with List<City> cities; must be persisted in createTripDraft"},
+      {"file": "backend/data/repos/server_f26f1ce8bc35/models/src/main/java/models/sql/Trips.java", "purpose": "Trip entity with cities(), addCity(), TripItinerary list, citiesMap attrs"},
+      {"file": "backend/data/repos/server_f26f1ce8bc35/models/src/main/java/models/jsons/Trip/TripCitiesConfig.java", "purpose": "Config for list of City; used in Trips.addCity and cities()"},
+      {"file": "backend/data/repos/server_f26f1ce8bc35/models/src/main/java/models/jsons/TripItinerary.java", "purpose": "Single leg: city, lastCity, startTime, endTime, travel, stays"},
+      {"file": "backend/data/repos/server_f26f1ce8bc35/models/src/main/java/models/queries/BookingQueries.java", "purpose": "createTripDraft (persist cities), findTripForFlight, findTripForRoundFlight, findTripForHotel (currently null)"},
+      {"file": "backend/data/repos/server_f26f1ce8bc35/travel/src/main/java/travel/Flight/MultiCity/InitSearchController.java", "purpose": "Multi-city flight search; accepts routes with origin, destination, date per sector"},
+      {"file": "backend/data/repos/server_f26f1ce8bc35/models/src/main/java/models/travel/MultiCitySearchRequest.java", "purpose": "Sectors map and SectorInfo (origin, destination, date) for multi-city flight"},
+      {"file": "backend/data/repos/server_f26f1ce8bc35/models/src/main/java/models/travel/StaySearch.java", "purpose": "Single-city hotel search (city, checkIn, checkOut)"},
+      {"file": "backend/data/repos/server_f26f1ce8bc35/travel/src/main/java/travel/Hotel/HoldHotelController.java", "purpose": "Hotel hold accepts tripId; findTripForHotel not used"},
+      {"file": "backend/data/repos/server_f26f1ce8bc35/apis/src/main/java/apis/meta/flight/DomesticFlight.java", "purpose": "Provider: multiCity/search, review, rules, map — used for multi-city flight"}
+    ],
+    "relevant_services": [
+      {"service": "BookingQueries", "usage": "createTripDraft to persist cities; implement findTripForHotel; reuse findTripForFlight pattern for multi-city sector matching"},
+      {"service": "FlightProvider", "usage": "multiCitySearch, multiCityReview, multiCityFareRules, multiCitySeatMap already exist; add hold/order flow calling review then existing order logic"},
+      {"service": "ApiCache", "usage": "Cache MultiCitySearchRequest by diceId; same pattern as one-way/round"},
+      {"service": "CityQueries", "usage": "Validate origin/destination airport codes and city IDs"}
+    ],
+    "relevant_apis": [
+      {"endpoint": "POST /flight/init", "method": "POST", "purpose": "One-way flight search (single origin–destination)"},
+      {"endpoint": "POST /flight/multiCity/init", "method": "POST", "purpose": "Multi-city flight search (list of routes)"},
+      {"endpoint": "GET /flight/multiCity/polling", "method": "GET", "purpose": "Poll multi-city search result"},
+      {"endpoint": "POST /flight/multiCity/review", "method": "POST", "purpose": "Multi-city review"},
+      {"endpoint": "POST /trips (employee)", "method": "POST", "purpose": "Create trip draft (CreateTripDraftController); body includes cities"},
+      {"endpoint": "POST /hotel/hold", "method": "POST", "purpose": "Hold hotel; accepts tripId"}
+    ],
+    "reusable_components": [
+      {"component": "TripItinerary + Trip.City", "reuse_strategy": "Extend — already support multi-leg; ensure CreateTripRequest cities map to this structure"},
+      {"component": "One-way / Round flight hold and order controllers", "reuse_strategy": "Extend — add MultiCity variants that use MultiCitySearchRequest and FlightProvider.multiCityReview then same DA/PG flow"},
+      {"component": "TripDetailsController / TripMount", "reuse_strategy": "Reuse as-is — ensure response includes cities/itinerary from Trips.cities() and attrs citiesMap"}
+    ]
+  },
+  "proposed_technical_design": {
+    "architecture_approach": "Keep existing trip and booking models; add persistence of cities in createTripDraft, implement findTripForHotel, and enable multi-city flight hold/order by implementing the MultiCityFlightMount handlers reusing one-way/round patterns.",
+    "files_to_create": [
+      {"path": "travel/src/main/java/travel/Flight/MultiCity/HoldFlightController.java", "purpose": "Hold multi-city flight after review; mirror Round/HoldFlightController using MultiCityReviewRequest"},
+      {"path": "travel/src/main/java/travel/Flight/MultiCity/CreateDaOrderController.java", "purpose": "Create DA order for multi-city; mirror Round CreateDaOrderController"},
+      {"path": "travel/src/main/java/travel/Flight/MultiCity/CreatePgOrderController.java", "purpose": "Create PG order for multi-city; mirror Round CreatePgOrderController"}
+    ],
+    "files_to_modify": [
+      {"path": "models/src/main/java/models/queries/BookingQueries.java", "changes": "In createTripDraft: map request.getCities() to Trips (citiesMap and/or TripItinerary list). Implement findTripForHotel(Employee, StayRequest): find trip where getCities() or citiesMap contains a leg with matching city and overlapping checkIn/checkOut."},
+      {"path": "travel/src/main/java/travel/Flight/MultiCity/MultiCityFlightMount.java", "changes": "Wire hold, order/da, order/pg (and flightChoices if needed); add handlers for HoldFlightController, CreateDaOrderController, CreatePgOrderController."},
+      {"path": "travel/src/main/java/travel/Trips/TravelDesk/CreateTripController.java", "changes": "Optionally accept cities/itinerary in request body and persist via Trips.addCity() or attrs citiesMap for multi-city travel-desk-created trips."}
+    ],
+    "api_contracts": [
+      {"method": "POST", "path": "/flight/multiCity/hold", "request": "{ sessionId/diceId, sector selections, tripId?, travellers }", "response": "{ id, amount, ... }"},
+      {"method": "POST", "path": "/flight/multiCity/order/da", "request": "{ holdId, tripId?, ... }", "response": "Existing DA order response"},
+      {"method": "POST", "path": "/flight/multiCity/order/pg", "request": "{ holdId, tripId?, ... }", "response": "Existing PG order response"}
+    ],
+    "data_flow": "1) Employee/TravelDesk creates trip with cities → createTripDraft persists cities to Trips. 2) Multi-city flight: init → polling → review → hold → order/da or order/pg; tripId attached. 3) Hotel: search per city; hold with tripId; findTripForHotel can validate stay against trip leg. 4) Trip details and approvals unchanged; all bookings linked to same trip_id."
+  },
+  "user_stories": [
+    "As an employee, I want to create one trip with multiple cities and dates so that I can add all my flights and hotels to a single trip.",
+    "As an employee, I want to add a multi-city flight (e.g. A→B→C) to my trip in one booking so that I don't have to create separate trips per leg.",
+    "As an employee, I want to add hotels in different cities to the same trip so that my whole journey is under one approval.",
+    "As travel desk, I want to search and book multi-city flights and attach them to a trip so that the traveler gets one itinerary.",
+    "As an approver, I want to see one trip with multiple legs and approve or decline the entire journey."
+  ],
+  "failure_scenarios": [
+    {"scenario": "Multi-city flight provider returns partial or failed results", "impact": "User cannot complete booking", "mitigation": "Reuse existing status (ONGOING/COMPLETED/FAILED) and error handling in InitSearchController and ApiCache; surface message to client; allow retry."},
+    {"scenario": "User adds hotel in a city not in trip itinerary", "impact": "Possible policy or reporting inconsistency", "mitigation": "When findTripForHotel is implemented, optionally warn or reject if city/dates do not match any trip leg."},
+    {"scenario": "Trip dates fixed (tripFixedDuration) but user adds leg outside range", "impact": "Validation error", "mitigation": "Reuse tripFixedDuration and date checks in createTripDraft; ensure sector/stay dates within trip startDate–endDate where plugin enabled."}
+  ],
+  "backward_compatibility": "Existing one-way and round-trip flows remain unchanged. Trips without cities (existing drafts) continue to work; cities() returns empty or from existing attrs. New multi-city hold/order live under /flight/multiCity/*. Frontend can continue to use /flight/init and /flight/round for single-origin-destination; multi-city is additive.",
+  "rollout_plan": [
+    {"phase": 1, "description": "Persist multi-city itinerary in trip creation", "tasks": ["Map CreateTripRequest.cities to Trips in createTripDraft (citiesMap and/or TripItinerary)", "Ensure TripDetailsController returns cities", "Optionally extend TravelDesk CreateTripController for cities"]},
+    {"phase": 2, "description": "Enable multi-city flight hold and order", "tasks": ["Implement MultiCity HoldFlightController", "Implement MultiCity CreateDaOrderController and CreatePgOrderController", "Wire MultiCityFlightMount routes", "Extend findTripForFlight logic for multi-sector match when tripId present"]},
+    {"phase": 3, "description": "Trip–hotel linkage for multi-leg", "tasks": ["Implement findTripForHotel in BookingQueries", "Optionally validate stay city/dates against trip legs in HoldHotelController"]}
+  ],
+  "assumptions_constraints": {
+    "assumptions": [
+      "Provider APIs (DomesticFlight/PersonalDomesticFlight) support multi-city hold and order; if not, backend may need to perform multiple one-way/round calls and aggregate.",
+      "Frontend will send CreateTripRequest with cities array populated for multi-city; existing clients sending no cities retain current behavior.",
+      "Trip itinerary uses city IDs (Cities) and timestamps; hotel StayRequest uses city (Long) and checkIn/checkOut strings — date format alignment assumed."
+    ],
+    "constraints": [
+      "Only server_f26f1ce8bc35 (travel backend) is in scope; file_bb746bb82b1b is a file service and not modified.",
+      "No schema change to fintrip_ooo_trips; use existing attrs and DbJsonB columns (cities, citiesMap)."
+    ]
+  },
+  "open_questions_risks": [
+    {"question": "Does the flight provider support single-call multi-city hold/order or multiple one-way calls?", "risk_level": "high", "owner": "Backend + Provider integration"},
+    {"question": "Should findTripForHotel be strict (reject if no matching leg) or best-effort (suggest trip by date overlap)?", "risk_level": "medium", "owner": "Product"},
+    {"question": "UI for building multi-city itinerary (cities + dates) — existing employee/travel-desk flows or new screens?", "risk_level": "medium", "owner": "Frontend"}
+  ],
+  "summary_matrix": [
+    {"area": "Trip creation", "scenario": "Employee creates trip with multiple cities", "impact": "Trip saved with itinerary; used for booking linkage", "validation": "Trip details API returns cities; add flight/hotel with tripId succeeds"},
+    {"area": "Multi-city flight", "scenario": "User searches and books A→B→C", "impact": "One booking with multiple sectors attached to trip", "validation": "Hold and order return success; booking appears under trip"},
+    {"area": "Hotel + trip", "scenario": "User adds hotel in city that is a trip leg", "impact": "Hotel linked to trip; optional leg validation", "validation": "findTripForHotel returns trip when city/dates match; hold accepts tripId"},
+    {"area": "Approval", "scenario": "Approver views multi-city trip", "impact": "Single trip with multiple legs and bookings", "validation": "Existing approval flow; trip status applies to all linked bookings"}
+  ]
+}

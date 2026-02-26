@@ -8,6 +8,7 @@ from src.services.vector_service import VectorService
 from src.core.logger import get_logger
 from src.core.exceptions import InternalServerException
 from src.intelligence.domain_model import domain_engine
+from src.intelligence.subgraph_compression import SubgraphCompressionEngine
 
 logger = get_logger(__name__)
 
@@ -23,7 +24,14 @@ class SearchService:
     def __init__(self):
         self.graph_service = GraphService()
         self.vector_service = VectorService()
-        self.hybrid_alpha = 0.7  # Weight for vector search vs graph search
+        self.subgraph_compression = SubgraphCompressionEngine()
+        self.hybrid_alpha = 0.7  # Backward compatibility default
+        self.intent_alpha = {
+            "structural": 0.1,
+            "semantic": 0.8,
+            "impact": 0.0,
+            "temporal": 0.0,
+        }
     
     async def initialize(self):
         """Initialize search service"""
@@ -42,57 +50,22 @@ class SearchService:
         filters = filters or {}
         
         try:
-            results = {}
-            
-            # Always perform semantic search
-            if search_type in ["hybrid", "semantic"]:
-                semantic_results = await self.vector_service.semantic_search(
-                    query=query,
-                    top_k=top_k * 2,
-                    filter_type=filters.get("type"),
-                    filter_repository=filters.get("repository"),
-                    filter_language=filters.get("language"),
-                    score_threshold=0.3
-                )
-                results["semantic"] = semantic_results
-            
-            # Perform graph search if needed
-            graph_results = []
-            if search_type in ["hybrid", "graph"]:
-                # Extract potential entity names from query
-                entities = self._extract_entities(query)
-                
-                # Search for each entity in graph
-                for entity in entities[:3]:  # Limit to top 3 entities
-                    try:
-                        entity_results = await self.graph_service.find_related_entities(
-                            entity_name=entity,
-                            max_depth=2
-                        )
-                        if entity_results.get("relationships"):
-                            graph_results.append(entity_results)
-                    except Exception as e:
-                        logger.debug(f"Graph search failed for entity {entity}", error=str(e))
-                
-                results["graph"] = graph_results
-            
-            # Combine results for hybrid search
-            if search_type == "hybrid" and results.get("semantic") and results.get("graph"):
-                combined = await self.vector_service.hybrid_search(
-                    query=query,
-                    graph_results=graph_results,
-                    top_k=top_k,
-                    alpha=self.hybrid_alpha
-                )
-                results["combined"] = combined
-            elif results.get("semantic"):
-                results["combined"] = results["semantic"][:top_k]
+            intent = self._detect_query_intent(query, search_type)
+            if intent == "structural":
+                results = await self._run_structural_query(query=query, top_k=top_k, filters=filters)
+            elif intent == "impact":
+                results = await self._run_impact_query(query=query, top_k=top_k)
+            elif intent == "temporal":
+                results = await self._run_temporal_query(query=query, top_k=top_k)
+            else:
+                results = await self._run_semantic_query(query=query, top_k=top_k, filters=filters)
             
             duration = (datetime.utcnow() - start_time).total_seconds() * 1000
             
             return {
                 "query": query,
                 "search_type": search_type,
+                "intent": intent,
                 "filters": filters,
                 "duration_ms": round(duration, 2),
                 "results": results,
@@ -107,30 +80,266 @@ class SearchService:
         except Exception as e:
             logger.error("Search failed", query=query, search_type=search_type, error=str(e))
             raise InternalServerException(f"Search failed: {str(e)}")
+
+    def _detect_query_intent(self, query: str, search_type: str) -> str:
+        """Route user query to structural / semantic / impact / temporal path."""
+        if search_type == "graph":
+            return "structural"
+        if search_type == "semantic":
+            return "semantic"
+        q = (query or "").lower()
+        temporal_terms = ("last week", "last month", "recently", "changed in", "timeline", "history")
+        impact_terms = ("impact", "blast radius", "what breaks", "affected", "dependents")
+        structural_terms = ("connected", "dependency graph", "call graph", "path between", "how is")
+        if any(term in q for term in temporal_terms):
+            return "temporal"
+        if any(term in q for term in impact_terms):
+            return "impact"
+        if any(term in q for term in structural_terms):
+            return "structural"
+        return "semantic"
+
+    async def _run_semantic_query(
+        self, query: str, top_k: int, filters: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        semantic_results = await self.vector_service.semantic_search(
+            query=query,
+            top_k=top_k * 2,
+            filter_type=filters.get("type"),
+            filter_repository=filters.get("repository"),
+            filter_language=filters.get("language"),
+            score_threshold=0.3,
+        )
+        graph_results, graph_candidates = await self._collect_graph_candidates(query, max_entities=3)
+        alpha = self.intent_alpha["semantic"]
+        if semantic_results and graph_candidates:
+            combined = await self.vector_service.hybrid_search(
+                query=query,
+                graph_results=graph_candidates,
+                top_k=top_k,
+                alpha=alpha,
+            )
+        else:
+            combined = semantic_results[:top_k]
+        compressed = self.subgraph_compression.compress(
+            graph_results=graph_results,
+            graph_candidates=graph_candidates,
+            max_nodes=min(50, top_k * 5),
+        )
+        return {
+            "semantic": semantic_results,
+            "graph": graph_results,
+            "graph_candidates": graph_candidates,
+            "combined": combined,
+            "compressed_subgraph": compressed,
+            "intent_alpha": alpha,
+        }
+
+    async def _run_structural_query(
+        self, query: str, top_k: int, filters: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        graph_results, graph_candidates = await self._collect_graph_candidates(query, max_entities=5)
+        semantic_results = await self.vector_service.semantic_search(
+            query=query,
+            top_k=max(5, top_k),
+            filter_type=filters.get("type"),
+            filter_repository=filters.get("repository"),
+            filter_language=filters.get("language"),
+            score_threshold=0.35,
+        )
+        alpha = self.intent_alpha["structural"]
+        combined = await self.vector_service.hybrid_search(
+            query=query,
+            graph_results=graph_candidates,
+            top_k=top_k,
+            alpha=alpha,
+        ) if graph_candidates else semantic_results[:top_k]
+        compressed = self.subgraph_compression.compress(
+            graph_results=graph_results,
+            graph_candidates=graph_candidates,
+            max_nodes=min(50, top_k * 5),
+        )
+        return {
+            "semantic": semantic_results,
+            "graph": graph_results,
+            "graph_candidates": graph_candidates,
+            "combined": combined,
+            "compressed_subgraph": compressed,
+            "intent_alpha": alpha,
+        }
+
+    async def _run_impact_query(self, query: str, top_k: int) -> Dict[str, Any]:
+        entities = await self._extract_entities(query)
+        target = entities[0] if entities else query.strip()
+        impacts: List[Dict[str, Any]] = []
+        try:
+            impact = await self.graph_service.analyze_impact(file_path=target, change_type="modify")
+            impacts.append(impact)
+        except Exception:
+            for entity in entities[:top_k]:
+                try:
+                    impacts.append(await self.graph_service.analyze_impact(file_path=entity, change_type="modify"))
+                except Exception:
+                    continue
+        return {
+            "semantic": [],
+            "graph": impacts,
+            "graph_candidates": [],
+            "combined": impacts[:top_k],
+            "intent_alpha": self.intent_alpha["impact"],
+        }
+
+    async def _run_temporal_query(self, query: str, top_k: int) -> Dict[str, Any]:
+        temporal_query = """
+        MATCH (c:ChangeEvent)
+        WHERE c.timestamp IS NOT NULL
+        RETURN c
+        ORDER BY c.timestamp DESC
+        LIMIT $top_k
+        """
+        rows = await self.graph_service.neo4j.execute_query(temporal_query, {"top_k": top_k})
+        events = [dict(r.get("c", {})) for r in rows] if rows else []
+        return {
+            "semantic": [],
+            "graph": events,
+            "graph_candidates": [],
+            "combined": events,
+            "intent_alpha": self.intent_alpha["temporal"],
+            "query_template": "temporal_change_event",
+        }
+
+    async def _collect_graph_candidates(self, query: str, max_entities: int = 3) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        graph_results: List[Dict[str, Any]] = []
+        graph_candidates: List[Dict[str, Any]] = []
+        entities = await self._extract_entities(query)
+        for entity in entities[:max_entities]:
+            try:
+                entity_results = await self.graph_service.find_related_entities(
+                    entity_name=entity,
+                    max_depth=2,
+                )
+                if entity_results.get("relationships"):
+                    graph_results.append(entity_results)
+                    graph_candidates.extend(self._flatten_graph_results(entity_results))
+            except Exception as e:
+                logger.debug(f"Graph search failed for entity {entity}", error=str(e))
+        return graph_results, graph_candidates
     
-    def _extract_entities(self, query: str) -> List[str]:
-        """Extract potential entity names from query"""
-        # Simple extraction: words that start with capital letter or are in quotes
+    async def _extract_entities(self, query: str) -> List[str]:
+        """Extract entity names using vocabulary lookup against the graph, falling back to CamelCase regex."""
         import re
-        
+
+        found = await self._extract_entities_from_vocab(query)
+        if found:
+            return found
+        return self._extract_entities_camelcase(query)
+
+    async def _extract_entities_from_vocab(self, query: str) -> List[str]:
+        """Match query tokens against known graph node names via Neo4j."""
+        import re
+
+        words = re.findall(r'\b\w+\b', query)
+        if not words:
+            return []
+
+        stop_words = {
+            "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+            "have", "has", "had", "do", "does", "did", "will", "would", "could",
+            "should", "may", "might", "shall", "can", "need", "must", "ought",
+            "i", "me", "my", "we", "our", "you", "your", "he", "she", "it",
+            "they", "them", "their", "this", "that", "these", "those", "what",
+            "which", "who", "whom", "how", "when", "where", "why", "if", "then",
+            "and", "but", "or", "nor", "not", "no", "so", "for", "yet", "both",
+            "from", "to", "in", "on", "at", "by", "with", "about", "of", "as",
+            "into", "like", "through", "after", "before", "between", "out", "up",
+            "all", "each", "every", "any", "some", "add", "get", "set", "show",
+            "find", "search", "list", "create", "update", "delete", "remove",
+            "new", "old", "make", "use", "see", "tell", "give", "take",
+        }
+
+        filtered = [w for w in words if w.lower() not in stop_words and len(w) > 2]
+        if not filtered:
+            return []
+
+        candidates = []
+        for length in range(min(3, len(filtered)), 0, -1):
+            for i in range(len(filtered) - length + 1):
+                candidates.append(" ".join(filtered[i:i + length]))
+
+        try:
+            from src.database.neo4j_client import neo4j_client
+            if not neo4j_client._initialized:
+                await neo4j_client.initialize()
+
+            query_str = """
+            UNWIND $phrases AS phrase
+            MATCH (n)
+            WHERE toLower(n.name) = toLower(phrase)
+            RETURN DISTINCT n.name AS name
+            LIMIT 10
+            """
+            results = await neo4j_client.execute_query(query_str, {"phrases": candidates[:30]})
+            return [r["name"] for r in (results or []) if r.get("name")]
+        except Exception as e:
+            logger.debug(f"Vocab entity lookup failed: {e}")
+            return []
+
+    def _extract_entities_camelcase(self, query: str) -> List[str]:
+        """Extract potential entity names from query using CamelCase regex and heuristics."""
+        import re
+
         entities = []
-        
-        # Extract quoted strings
+
         quoted = re.findall(r'"([^"]*)"', query) + re.findall(r"'([^']*)'", query)
         entities.extend(quoted)
-        
-        # Extract CamelCase words
+
         camel_case = re.findall(r'[A-Z][a-z]+(?:[A-Z][a-z]+)+', query)
         entities.extend(camel_case)
-        
-        # Extract words that might be class/component names
+
         words = query.split()
         for word in words:
-            if (word[0].isupper() and len(word) > 2) or word.endswith(("Service", "Component", "DTO", "Handler")):
+            if len(word) > 2 and (word[0].isupper() or word.endswith(("Service", "Component", "DTO", "Handler"))):
                 entities.append(word)
-        
-        # Remove duplicates
+
         return list(dict.fromkeys(entities))
+
+    def _flatten_graph_results(self, entity_results: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Convert GraphService grouped result into entity-level candidates
+        for hybrid fusion.
+        """
+        flattened: List[Dict[str, Any]] = []
+        relationships = entity_results.get("relationships", {}) or {}
+
+        for rel_type, targets in relationships.items():
+            for item in targets:
+                target = item.get("target", {}) if isinstance(item, dict) else {}
+                if not isinstance(target, dict) or not target:
+                    continue
+                target_id = target.get("id")
+                if not target_id:
+                    continue
+
+                path_length = item.get("path_length", 1) if isinstance(item, dict) else 1
+                try:
+                    path_len_val = max(1, int(path_length))
+                except Exception:
+                    path_len_val = 1
+
+                flattened.append({
+                    "id": target_id,
+                    "score": 1.0 / path_len_val,
+                    "name": target.get("name", ""),
+                    "type": target.get("type", "graph_node"),
+                    "repository": target.get("repository", target.get("repository_name", "")),
+                    "file": target.get("file", ""),
+                    "metadata": {
+                        "relationship_type": rel_type,
+                        "path_length": path_len_val,
+                    },
+                })
+
+        return flattened
     
     async def search_by_component(
         self,

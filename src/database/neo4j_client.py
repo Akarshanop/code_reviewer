@@ -80,9 +80,13 @@ class Neo4jClient:
     
     async def ensure_constraints(self):
         """Create Neo4j constraints and indexes for all node types."""
+        async with self.session() as session:
+            await self._drop_legacy_repository_name_constraints(session)
+
         constraints = [
             # ── Unique constraints (critical for MERGE performance) ──
-            "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Repository) REQUIRE n.name IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Repository) REQUIRE n.hash IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Repository) REQUIRE n.url IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (n:File) REQUIRE n.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Function) REQUIRE n.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (n:VertxRoute) REQUIRE n.id IS UNIQUE",
@@ -106,6 +110,7 @@ class Neo4jClient:
             "CREATE INDEX IF NOT EXISTS FOR (n:Service) ON (n.name)",
             "CREATE INDEX IF NOT EXISTS FOR (n:Service) ON (n.repository_hash)",
             "CREATE INDEX IF NOT EXISTS FOR (n:Repository) ON (n.hash)",
+            "CREATE INDEX IF NOT EXISTS FOR (n:Repository) ON (n.name)",
 
             # ── Intelligence Layer indexes ──
             "CREATE INDEX IF NOT EXISTS FOR (n:Function) ON (n.behavioral_labels)",
@@ -134,7 +139,7 @@ class Neo4jClient:
                     await session.run(constraint)
                 except Exception as e:
                     logger.warning(f"Failed to create constraint/index: {constraint[:50]}...", error=str(e))
-            
+
             # Try fulltext index separately with timeout
             try:
                 logger.info("Creating fulltext search index (may take a moment)...")
@@ -144,6 +149,34 @@ class Neo4jClient:
                 logger.warning("Fulltext index creation timed out - will be created in background")
             except Exception as e:
                 logger.warning(f"Failed to create fulltext index: {e}")
+
+    async def _drop_legacy_repository_name_constraints(self, session: AsyncSession):
+        """
+        Drop old Repository(name) uniqueness constraints so repos from different
+        organizations can share the same name safely.
+        """
+        try:
+            result = await session.run(
+                """
+                SHOW CONSTRAINTS YIELD name, labelsOrTypes, properties, type
+                WHERE type = 'UNIQUENESS'
+                  AND size(labelsOrTypes) = 1
+                  AND labelsOrTypes[0] = 'Repository'
+                  AND size(properties) = 1
+                  AND properties[0] = 'name'
+                RETURN name
+                """
+            )
+            records = await result.data()
+            for rec in records:
+                cname = rec.get("name")
+                if not cname:
+                    continue
+                safe_name = str(cname).replace("`", "")
+                await session.run(f"DROP CONSTRAINT `{safe_name}` IF EXISTS")
+                logger.info("Dropped legacy Repository(name) unique constraint", constraint_name=safe_name)
+        except Exception as e:
+            logger.warning("Legacy Repository(name) constraint cleanup skipped", error=str(e))
     
     @asynccontextmanager
     async def session(self, database: str = None, access_mode: str = "write"):

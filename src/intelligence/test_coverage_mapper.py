@@ -11,19 +11,14 @@ Heuristics:
 - JUnit: *Test.java, @Test annotation
 """
 import re
-import hashlib
 import json
 from typing import Dict, List, Any, Optional
 from collections import defaultdict
 
 from src.core.logger import get_logger
+from src.intelligence.utils import generate_node_id
 
 logger = get_logger(__name__)
-
-
-def _node_id(node_type: str, *parts) -> str:
-    combined = f"{node_type}:{'|'.join(str(p) for p in parts)}"
-    return hashlib.md5(combined.encode()).hexdigest()[:16]
 
 
 class TestCoverageMapper:

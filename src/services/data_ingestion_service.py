@@ -12,7 +12,6 @@ from pathlib import Path
 import tempfile
 import shutil
 from collections import defaultdict
-import hashlib
 import json
 
 from src.data_ingestion.git_service import GitService
@@ -25,11 +24,14 @@ from src.data_ingestion.parsers.language_detector import (
 from src.data_ingestion.graph_builder.node_factory import NodeFactory
 from src.data_ingestion.graph_builder.edge_linker import EdgeLinker
 from src.services.search_service import SearchService
-from src.services.vector_service import VectorService
+from src.data_ingestion.vector_builder.vector_embedding_ingestion_builder import (
+    VectorEmbeddingIngestionBuilder,
+)
 from src.database.neo4j_client import neo4j_client
 from src.database.supabase_session import supabase_client
 from src.core.exceptions import CodeAnalysisException, InternalServerException
 from src.core.logger import get_logger
+from src.core.id_generator import generate_node_id, generate_repository_hash
 
 # Intelligence modules (post-ingestion passes)
 from src.intelligence.cross_file_resolver import CrossFileResolver
@@ -37,6 +39,8 @@ from src.intelligence.test_coverage_mapper import TestCoverageMapper
 from src.intelligence.config_scanner import ConfigScanner
 from src.intelligence.dead_code_detector import DeadCodeDetector
 from src.intelligence.performance_profiler import PerformanceProfiler
+from src.intelligence.temporal_metadata import compute_volatility_score
+from src.intelligence.type_registry import TypeRegistry
 
 logger = get_logger(__name__)
 
@@ -60,7 +64,7 @@ class DataIngestionService:
         self.node_factory = NodeFactory()
         self.edge_linker = EdgeLinker()
         self.search_service = SearchService()
-        self.vector_service = VectorService()
+        self.vector_ingestion_builder = VectorEmbeddingIngestionBuilder()
         
         # Intelligence modules (post-ingestion analysis)
         self.cross_file_resolver = CrossFileResolver()
@@ -68,6 +72,7 @@ class DataIngestionService:
         self.config_scanner = ConfigScanner()
         self.dead_code_detector = DeadCodeDetector()
         self.performance_profiler = PerformanceProfiler()
+        self.type_registry = TypeRegistry()
         
         # Initialize individual parsers from coordinator for direct access
         self.java_parser = self.parser_coordinator.get_parser("java")
@@ -100,7 +105,7 @@ class DataIngestionService:
     async def initialize(self):
         """Initialize all services"""
         await self.search_service.initialize()
-        await self.vector_service.initialize()
+        await self.vector_ingestion_builder.initialize()
         await neo4j_client.initialize()
         await supabase_client.initialize()
         logger.info("Data ingestion service initialized")
@@ -123,7 +128,7 @@ class DataIngestionService:
             Comprehensive ingestion results including auto-detected language/framework
         """
         start_time = datetime.utcnow()
-        repo_hash = hashlib.md5(repo_url.encode()).hexdigest()[:12]
+        repo_hash = generate_repository_hash(repo_url)
         
         # Auto-detect repo_type if not provided
         if not repo_type:
@@ -146,6 +151,7 @@ class DataIngestionService:
             
             # 3. Convert to internal format for knowledge graph
             parsed_data = self._convert_parse_result(parse_result)
+            self.type_registry.register_from_parsed_data(repo_hash, parsed_data)
             
             # 3.5 FIX 3: Collect git history stats for temporal metadata
             git_file_stats = {}
@@ -174,6 +180,14 @@ class DataIngestionService:
             
             # 6.5 Intelligence passes (cross-file resolution, test mapping, etc.)
             intelligence_results = await self._run_intelligence_passes(repo_hash, repo_url)
+
+            # 6.8 Ingestion quality KPI checks (graph/vector health)
+            quality_kpis = await self._run_ingestion_quality_kpis(
+                repo_hash=repo_hash,
+                artifact_count=sum(vector_results.get("statistics", {}).get("by_artifact_type", {}).values()),
+                embeddings_created=vector_results.get("statistics", {}).get("embeddings_created", 0),
+            )
+            vector_results.setdefault("statistics", {})["quality_kpis"] = quality_kpis
             
             # 7. Store metadata and results
             await self._store_ingestion_metadata(
@@ -205,6 +219,7 @@ class DataIngestionService:
                 },
                 "graph_statistics": graph_results["statistics"],
                 "vector_statistics": vector_results["statistics"],
+                "quality_kpis": quality_kpis,
                 "cross_repository_links": cross_repo_links,
                 "intelligence": intelligence_results,
                 "timestamp": datetime.utcnow().isoformat()
@@ -274,7 +289,7 @@ class DataIngestionService:
             repo_path=repo_path,
             batch_size=50
         )
-    
+    #detechts they type of repo is it of forntend on backend
     def _detect_repo_type(self, repo_url: str) -> str:
         """
         Auto-detect repository type (backend or frontend) from URL patterns.
@@ -388,14 +403,15 @@ class DataIngestionService:
                 parsed_data["other"].append(file_data)
         
         return parsed_data
-    
+    # cloning the repo and updating the repo
     async def _clone_or_update_repo(self, repo_url: str, branch: str, 
                                    incremental: bool) -> Path:
         """Clone or update repository with smart caching"""
         # Check if we have existing data
-        repo_hash = hashlib.md5(repo_url.encode()).hexdigest()[:12]
+        repo_hash = generate_repository_hash(repo_url)
         cache_key = f"repo_{repo_hash}"
         
+        #Not being used as of now
         if incremental and repo_url in self.repositories:
             logger.debug(f"Performing incremental update for: {repo_url}")
             # Get last commit hash and fetch updates
@@ -611,7 +627,7 @@ class DataIngestionService:
                     logger.info(f"Batch linked {len(all_file_paths)} files to repository")
 
                 # Link edges between nodes
-                edge_results = await self.edge_linker.link_all_edges(session)
+                edge_results = await self.edge_linker.link_all_edges(session, repo_hash=repo_hash)
                 statistics["edges_created"] = edge_results.get("relationships_created", 0)
 
                 # Enhanced graph linking (IMPORTS, CALLS_FUNCTION, CALLS_API, type hierarchy)
@@ -638,18 +654,40 @@ class DataIngestionService:
                     logger.warning(f"Module node creation skipped: {e}")
 
                 # FIX 3: Enrich File nodes with git temporal metadata
+                # Uses compute_volatility_score from temporal_metadata for
+                # a proper weighted formula (recency + frequency + churn).
                 if git_file_stats:
                     try:
+                        from datetime import datetime, timezone
                         batch_params = []
                         for fpath, fstats in git_file_stats.items():
+                            change_count = fstats.get("change_count", 0)
+                            last_mod_str = fstats.get("last_modified_at", "")
+                            change_event_id = generate_node_id("ChangeEvent", repo_hash, fpath, last_mod_str or "unknown")
+
+                            last_mod_dt = None
+                            if last_mod_str:
+                                try:
+                                    last_mod_dt = datetime.fromisoformat(
+                                        last_mod_str.replace("Z", "+00:00")
+                                    )
+                                except (ValueError, TypeError):
+                                    pass
+
+                            vol_score, _ = compute_volatility_score(
+                                last_modified_at=last_mod_dt,
+                                change_count=change_count,
+                            )
+
                             batch_params.append({
                                 "path": fpath,
-                                "change_count": fstats.get("change_count", 0),
-                                "last_modified_at": fstats.get("last_modified_at", ""),
-                                "volatility_score": fstats.get("volatility_score", 0.0),
+                                "change_count": change_count,
+                                "last_modified_at": last_mod_str,
+                                "volatility_score": round(vol_score, 4),
                                 "contributors": fstats.get("contributors", []),
+                                "change_event_id": change_event_id,
                             })
-                        # Batch update in chunks
+
                         for chunk_start in range(0, len(batch_params), 500):
                             chunk = batch_params[chunk_start:chunk_start + 500]
                             await session.run("""
@@ -660,7 +698,26 @@ class DataIngestionService:
                                 SET f.change_count = s.change_count,
                                     f.last_modified_at = s.last_modified_at,
                                     f.volatility_score = s.volatility_score,
-                                    f.contributors = s.contributors
+                                    f.contributors = s.contributors,
+                                    f.first_seen_commit = coalesce(f.first_seen_commit, s.last_modified_at),
+                                    f.last_seen_commit = s.last_modified_at
+                            """, {"stats": chunk, "repo_hash": repo_hash})
+
+                            await session.run("""
+                                UNWIND $stats AS s
+                                MATCH (f:File {repository_hash: $repo_hash})
+                                WHERE f.path = s.path OR f.relative_path = s.path
+                                MATCH (r:Repository {hash: $repo_hash})
+                                MERGE (c:ChangeEvent {id: s.change_event_id})
+                                SET c.event_type = 'file_ingested',
+                                    c.file_path = s.path,
+                                    c.timestamp = s.last_modified_at,
+                                    c.provenance_commit = coalesce(c.provenance_commit, ''),
+                                    c.provenance_ast_range = coalesce(c.provenance_ast_range, [0,0,0,0]),
+                                    c.repository_hash = $repo_hash,
+                                    c.last_updated = datetime()
+                                MERGE (c)-[:AFFECTS]->(f)
+                                MERGE (c)-[:BELONGS_TO]->(r)
                             """, {"stats": chunk, "repo_hash": repo_hash})
                         statistics["git_stats_enriched"] = len(batch_params)
                         logger.info(f"Enriched {len(batch_params)} File nodes with git temporal metadata")
@@ -868,434 +925,19 @@ class DataIngestionService:
             "by_artifact_type": defaultdict(int),
             "errors": []
         }
-        
-        # Extract repository_name for metadata
-        repo_name = repo_url.split("/")[-1].replace(".git", "")
-        
-        try:
-            artifacts = []
-            
-            # Extract artifacts from Java files (use .get() to avoid KeyError)
-            for java_file in parsed_data.get("java", []):
-                file_data = java_file.get("data", {})
-                file_path = java_file.get("file", "")
-                file_name = file_path.split('/')[-1] if file_path else ""
-                
-                # Routes (FIX 1: embed actual route body code)
-                for route in file_data.get("routes", []):
-                    route_body = route.get("body", "") or ""
-                    route_summary = (
-                        f"Route: {route.get('path', '')} "
-                        f"Method: {route.get('method', '')} "
-                        f"Handler: {route.get('handler_method', route.get('name', ''))}"
-                    )
-                    artifacts.append({
-                        "type": "route",
-                        "name": route.get("handler_method", route.get("name", "")),
-                        "language": "java",
-                        "repository": repo_url,
-                        "repository_hash": repo_hash,
-                        "file": file_path,
-                        "code": route_body[:3000] if route_body else route_summary,
-                        "text": route_summary,
-                        "metadata": {
-                            "path": route.get("path"),
-                            "method": route.get("method"),
-                            "handler": route.get("handler_method", route.get("name", "")),
-                            "error_handling": route.get("error_handling", []),
-                        },
-                        "repository_name": repo_name,
-                        "file_name": file_name,
-                        "relative_path": file_path,
-                        "entry_file": entry_file or "",
-                        "repo_type": repo_type or "",
-                    })
-                
-                # EventBus
-                for eb in file_data.get("eventbus", []):
-                    artifacts.append({
-                        "type": "eventbus",
-                        "name": eb.get("address", ""),
-                        "language": "java",
-                        "repository": repo_url,
-                        "repository_hash": repo_hash,
-                        "file": file_path,
-                        "code": f"EventBus address: {eb.get('address', '')} type: {eb.get('type', '')} handler: {eb.get('handler_method', '')}",
-                        "text": f"EventBus: {eb.get('address', '')} "
-                               f"Type: {eb.get('type', '')} "
-                               f"Handler: {eb.get('handler_method', '')}",
-                        "metadata": {
-                            "address": eb.get("address"),
-                            "type": eb.get("type"),
-                            "handler": eb.get("handler_method")
-                        },
-                        # REQUIRED fields
-                        "repository_name": repo_name,
-                        "file_name": file_name,
-                        "relative_path": file_path,
-                        "entry_file": entry_file or "",
-                        "repo_type": repo_type or "",
-                    })
-                
-                # DTOs
-                for dto in file_data.get("dtos", []):
-                    artifacts.append({
-                        "type": "dto",
-                        "name": dto.get("name", ""),
-                        "language": "java",
-                        "repository": repo_url,
-                        "repository_hash": repo_hash,
-                        "file": file_path,
-                        "code": f"DTO class {dto.get('name', '')} with fields: {', '.join([f.get('name', '') for f in dto.get('fields', [])])}",
-                        "text": f"DTO: {dto.get('name', '')} "
-                               f"Fields: {', '.join([f.get('name', '') for f in dto.get('fields', [])])}",
-                        "metadata": {
-                            "name": dto.get("name"),
-                            "fields": dto.get("fields", []),
-                            "is_data_object": dto.get("is_data_object", False)
-                        },
-                        # REQUIRED fields
-                        "repository_name": repo_name,
-                        "file_name": file_name,
-                        "relative_path": file_path,
-                        "entry_file": entry_file or "",
-                        "repo_type": repo_type or "",
-                    })
-                
-                # Services (FIX 1: embed actual class body)
-                for svc in file_data.get("services", []):
-                    svc_name = svc.get("name", "") if isinstance(svc, dict) else str(svc)
-                    svc_body = svc.get("body", "") if isinstance(svc, dict) else ""
-                    artifacts.append({
-                        "type": "service",
-                        "name": svc_name,
-                        "language": "java",
-                        "repository": repo_url,
-                        "repository_hash": repo_hash,
-                        "file": file_path,
-                        "code": svc_body[:3000] if svc_body else f"Service class {svc_name} in {file_name}",
-                        "text": f"Service: {svc_name} File: {file_name}",
-                        "metadata": svc if isinstance(svc, dict) else {"name": svc_name},
-                        "repository_name": repo_name,
-                        "file_name": file_name,
-                        "relative_path": file_path,
-                        "entry_file": entry_file or "",
-                        "repo_type": repo_type or "",
-                    })
-                
-                # Classes (FIX 1: embed actual class body)
-                for cls in file_data.get("classes", []):
-                    cls_name = cls.get("name", "") if isinstance(cls, dict) else str(cls)
-                    cls_body = cls.get("body", "") if isinstance(cls, dict) else ""
-                    methods_list = cls.get("methods", []) if isinstance(cls, dict) else []
-                    method_names = ", ".join([m.get("name", "") if isinstance(m, dict) else str(m) for m in methods_list[:10]])
-                    artifacts.append({
-                        "type": "class",
-                        "name": cls_name,
-                        "language": "java",
-                        "repository": repo_url,
-                        "repository_hash": repo_hash,
-                        "file": file_path,
-                        "code": cls_body[:3000] if cls_body else (f"Class {cls_name} with methods: {method_names}" if method_names else f"Class {cls_name}"),
-                        "text": f"Class: {cls_name} Methods: {method_names}" if method_names else f"Class: {cls_name}",
-                        "metadata": cls if isinstance(cls, dict) else {"name": cls_name},
-                        "repository_name": repo_name,
-                        "file_name": file_name,
-                        "relative_path": file_path,
-                        "entry_file": entry_file or "",
-                        "repo_type": repo_type or "",
-                    })
-                
-                # Java Functions/Methods (NEW: previously not embedded individually)
-                for func in file_data.get("functions", []):
-                    if not isinstance(func, dict):
-                        continue
-                    func_name = func.get("name", "")
-                    func_body = func.get("body", "")
-                    if not func_name:
-                        continue
-                    artifacts.append({
-                        "type": "function",
-                        "name": func_name,
-                        "language": "java",
-                        "repository": repo_url,
-                        "repository_hash": repo_hash,
-                        "file": file_path,
-                        "code": func_body[:3000] if func_body else f"Java method {func_name}",
-                        "text": f"Java Method: {func_name} Returns: {func.get('return_type', 'void')}",
-                        "metadata": {
-                            "return_type": func.get("return_type"),
-                            "parameters": func.get("parameters", []),
-                            "calls": func.get("calls", []),
-                            "error_handling": func.get("error_handling", []),
-                        },
-                        "repository_name": repo_name,
-                        "file_name": file_name,
-                        "relative_path": file_path,
-                        "entry_file": entry_file or "",
-                        "repo_type": repo_type or "",
-                    })
-            
-            # FIX 2: Extract artifacts from Python files (previously missing entirely)
-            for py_file in parsed_data.get("python", []):
-                file_data = py_file.get("data", {})
-                file_path = py_file.get("file", "")
-                file_name = file_path.split('/')[-1] if file_path else ""
-                
-                # Python classes (FIX 1: embed actual class body)
-                for cls in file_data.get("classes", []):
-                    cls_name = cls.get("name", "") if isinstance(cls, dict) else str(cls)
-                    cls_body = cls.get("body", "") if isinstance(cls, dict) else ""
-                    methods_list = cls.get("methods", []) if isinstance(cls, dict) else []
-                    method_names = ", ".join([m.get("name", "") if isinstance(m, dict) else str(m) for m in methods_list[:10]])
-                    artifacts.append({
-                        "type": "class",
-                        "name": cls_name,
-                        "language": "python",
-                        "repository": repo_url,
-                        "repository_hash": repo_hash,
-                        "file": file_path,
-                        "code": cls_body[:3000] if cls_body else (f"Python class {cls_name} with methods: {method_names}" if method_names else f"Python class {cls_name}"),
-                        "text": f"Python Class: {cls_name} Methods: {method_names}" if method_names else f"Python Class: {cls_name}",
-                        "metadata": cls if isinstance(cls, dict) else {"name": cls_name},
-                        "repository_name": repo_name,
-                        "file_name": file_name,
-                        "relative_path": file_path,
-                        "entry_file": entry_file or "",
-                        "repo_type": repo_type or "",
-                    })
-                
-                # Python functions (FIX 1: embed actual function body)
-                for func in file_data.get("functions", []):
-                    if not isinstance(func, dict):
-                        continue
-                    func_name = func.get("name", "")
-                    func_body = func.get("body", "")
-                    func_desc = func.get("docstring", "") or func.get("description", "")
-                    params = func.get("parameters", func.get("params", []))
-                    if isinstance(params, list):
-                        param_parts = []
-                        for p in params:
-                            if isinstance(p, dict):
-                                pname = p.get("name", "")
-                                ptype = p.get("type", "")
-                                param_parts.append(f"{pname}: {ptype}" if ptype else pname)
-                            else:
-                                param_parts.append(str(p))
-                        param_str = ", ".join(param_parts)
-                    else:
-                        param_str = str(params)
-                    artifacts.append({
-                        "type": "function",
-                        "name": func_name,
-                        "language": "python",
-                        "repository": repo_url,
-                        "repository_hash": repo_hash,
-                        "file": file_path,
-                        "code": func_body[:3000] if func_body else f"def {func_name}({param_str})",
-                        "text": f"Python Function: {func_name}({param_str}) {func_desc[:200]}",
-                        "metadata": {
-                            "parameters": params,
-                            "return_type": func.get("return_type"),
-                            "calls": func.get("calls", []),
-                            "error_handling": func.get("error_handling", []),
-                            "is_async": func.get("is_async", False),
-                        },
-                        "repository_name": repo_name,
-                        "file_name": file_name,
-                        "relative_path": file_path,
-                        "entry_file": entry_file or "",
-                        "repo_type": repo_type or "",
-                    })
-                
-                # Python routes (FastAPI / Flask / Django)
-                for route in file_data.get("routes", []):
-                    route_path = route.get("path", "") if isinstance(route, dict) else str(route)
-                    method = route.get("method", "GET") if isinstance(route, dict) else "GET"
-                    handler = route.get("handler", "") if isinstance(route, dict) else ""
-                    artifacts.append({
-                        "type": "route",
-                        "name": handler or route_path,
-                        "language": "python",
-                        "repository": repo_url,
-                        "repository_hash": repo_hash,
-                        "file": file_path,
-                        "code": f"Python Route: {method} {route_path} Handler: {handler}",
-                        "text": f"Python Route: {method} {route_path} Handler: {handler}",
-                        "metadata": route if isinstance(route, dict) else {"path": route_path},
-                        "repository_name": repo_name,
-                        "file_name": file_name,
-                        "relative_path": file_path,
-                        "entry_file": entry_file or "",
-                        "repo_type": repo_type or "",
-                    })
 
-            # Extract artifacts from TypeScript files
-            for ts_file in parsed_data.get("typescript", []):
-                file_data = ts_file.get("data", {})
-                file_metadata = ts_file.get("metadata", {})
-                file_path = ts_file.get("file", "")
-                file_name = file_path.split('/')[-1] if file_path else ""
-                
-                # Components (FIX 1: embed actual component body)
-                components = file_data.get("components", []) or file_metadata.get("components", [])
-                for comp in components:
-                    comp_body = comp.get("body", "") or ""
-                    artifacts.append({
-                        "type": "react_component",
-                        "name": comp.get("name", ""),
-                        "language": "typescript",
-                        "repository": repo_url,
-                        "repository_hash": repo_hash,
-                        "file": file_path,
-                        "code": comp_body[:3000] if comp_body else f"React component {comp.get('name', '')}",
-                        "text": f"React Component: {comp.get('name', '')} "
-                               f"Props: {', '.join([p.get('name', '') for p in comp.get('props', [])])} "
-                               f"Hooks: {', '.join(comp.get('hooks', []))}",
-                        "metadata": {
-                            "name": comp.get("name"),
-                            "props": comp.get("props", []),
-                            "hooks": comp.get("hooks", [])
-                        },
-                        "repository_name": repo_name,
-                        "file_name": file_name,
-                        "relative_path": file_path,
-                        "entry_file": entry_file or "",
-                        "repo_type": repo_type or "",
-                    })
-                
-                # Functions/Methods from TypeScript (FIX 1: embed actual function body)
-                functions = file_data.get("functions", [])
-                for func in functions:
-                    func_body = func.get("body", "") or ""
-                    artifacts.append({
-                        "type": "function",
-                        "name": func.get("name", ""),
-                        "language": "typescript",
-                        "repository": repo_url,
-                        "repository_hash": repo_hash,
-                        "file": file_path,
-                        "code": func_body[:3000] if func_body else f"Function {func.get('name', '')}",
-                        "text": f"TS Function: {func.get('name', '')} calls: {', '.join(func.get('calls', [])[:5])}",
-                        "metadata": {
-                            "name": func.get("name"),
-                            "calls": func.get("calls", []),
-                            "is_async": func.get("is_async", False),
-                        },
-                        "repository_name": repo_name,
-                        "file_name": file_name,
-                        "relative_path": file_path,
-                        "entry_file": entry_file or "",
-                        "repo_type": repo_type or "",
-                    })
-                
-                # API Calls
-                for api in file_data.get("api_calls", []):
-                    artifacts.append({
-                        "type": "api_call",
-                        "name": api.get("url", ""),
-                        "language": "typescript",
-                        "repository": repo_url,
-                        "repository_hash": repo_hash,
-                        "file": file_path,
-                        "code": f"API call to {api.get('url', '')} using {api.get('method', '')} in hook {api.get('hook', '')}",
-                        "text": f"API Call: {api.get('url', '')} "
-                               f"Method: {api.get('method', '')} "
-                               f"Hook: {api.get('hook', '')}",
-                        "metadata": {
-                            "url": api.get("url"),
-                            "method": api.get("method"),
-                            "hook": api.get("hook"),
-                            "component": api.get("component")
-                        },
-                        # REQUIRED fields
-                        "repository_name": repo_name,
-                        "file_name": file_name,
-                        "relative_path": file_path,
-                        "entry_file": entry_file or "",
-                        "repo_type": repo_type or "",
-                    })
-            
-            # Extract artifacts from JavaScript files (same as TypeScript)
-            for js_file in parsed_data.get("javascript", []):
-                file_data = js_file.get("data", {})
-                file_metadata = js_file.get("metadata", {})
-                file_path = js_file.get("file", "")
-                file_name = file_path.split('/')[-1] if file_path else ""
-                
-                # Components (FIX 1: embed actual component body)
-                components = file_data.get("components", []) or file_metadata.get("components", [])
-                for comp in components:
-                    comp_body = comp.get("body", "") or ""
-                    artifacts.append({
-                        "type": "react_component",
-                        "name": comp.get("name", ""),
-                        "language": "javascript",
-                        "repository": repo_url,
-                        "repository_hash": repo_hash,
-                        "file": file_path,
-                        "code": comp_body[:3000] if comp_body else f"React component {comp.get('name', '')}",
-                        "text": f"React Component: {comp.get('name', '')} Props: {', '.join([p.get('name', '') for p in comp.get('props', [])])}",
-                        "metadata": {
-                            "name": comp.get("name"),
-                            "props": comp.get("props", [])
-                        },
-                        "repository_name": repo_name,
-                        "file_name": file_name,
-                        "relative_path": file_path,
-                        "entry_file": entry_file or "",
-                        "repo_type": repo_type or "",
-                    })
-                
-                # Functions (FIX 1: embed actual function body)
-                functions = file_data.get("functions", [])
-                for func in functions:
-                    func_body = func.get("body", "") or ""
-                    artifacts.append({
-                        "type": "function",
-                        "name": func.get("name", ""),
-                        "language": "javascript",
-                        "repository": repo_url,
-                        "repository_hash": repo_hash,
-                        "file": file_path,
-                        "code": func_body[:3000] if func_body else f"Function {func.get('name', '')}",
-                        "text": f"JS Function: {func.get('name', '')} calls: {', '.join(func.get('calls', [])[:5])}",
-                        "metadata": {
-                            "name": func.get("name"),
-                            "calls": func.get("calls", []),
-                            "is_async": func.get("is_async", False),
-                        },
-                        "repository_name": repo_name,
-                        "file_name": file_name,
-                        "relative_path": file_path,
-                        "entry_file": entry_file or "",
-                        "repo_type": repo_type or "",
-                    })
-                
-                # API Calls
-                for api in file_data.get("api_calls", []):
-                    artifacts.append({
-                        "type": "api_call",
-                        "name": api.get("url", ""),
-                        "language": "javascript",
-                        "repository": repo_url,
-                        "repository_hash": repo_hash,
-                        "file": file_path,
-                        "code": f"API call to {api.get('url', '')} using {api.get('method', '')}",
-                        "text": f"API Call: {api.get('url', '')} Method: {api.get('method', '')}",
-                        "metadata": {
-                            "url": api.get("url"),
-                            "method": api.get("method")
-                        },
-                        # REQUIRED fields
-                        "repository_name": repo_name,
-                        "file_name": file_name,
-                        "relative_path": file_path,
-                        "entry_file": entry_file or "",
-                        "repo_type": repo_type or "",
-                    })
-            
-            # Generate embeddings from actual code snippets
+        try:
+            artifacts = self.vector_ingestion_builder.build_artifacts(
+                parsed_data=parsed_data,
+                repo_url=repo_url,
+                repo_hash=repo_hash,
+                repo_type=repo_type,
+                entry_file=entry_file,
+            )
+
+            artifact_type_counts = self.vector_ingestion_builder.summarize_artifact_types(artifacts)
+            statistics["by_artifact_type"].update(artifact_type_counts)
+
             if artifacts:
                 logger.info(
                     "Starting embedding generation",
@@ -1303,19 +945,17 @@ class DataIngestionService:
                     artifact_count=len(artifacts),
                     artifact_types=dict(statistics["by_artifact_type"])
                 )
-                
+
                 try:
-                    result = await self.vector_service.index_code_artifacts(artifacts)
+                    result = await self.vector_ingestion_builder.index_code_artifacts(artifacts)
                     statistics["embeddings_created"] = result.get("indexed", 0)
                     statistics["errors"] = result.get("errors", [])
-                    
-                    # Validate: ensure we actually indexed something
+
                     if statistics["embeddings_created"] == 0 and len(artifacts) > 0:
                         error_msg = "No artifacts were indexed despite having code to embed"
                         logger.warning(error_msg, artifact_count=len(artifacts))
                         statistics["errors"].append(error_msg)
-                    
-                    # Log success
+
                     logger.info(
                         "Embeddings generated successfully",
                         repository=repo_url,
@@ -1334,9 +974,9 @@ class DataIngestionService:
                     repository=repo_url,
                     parsed_data_keys=list(parsed_data.keys())
                 )
-            
+
             return {"statistics": statistics, "status": "success" if not statistics["errors"] else "partial"}
-            
+
         except Exception as e:
             logger.error(
                 "Failed to generate embeddings",
@@ -1346,7 +986,7 @@ class DataIngestionService:
             )
             statistics["errors"].append(str(e))
             return {"statistics": statistics, "status": "failed"}
-    
+
     async def _link_cross_repository_dependencies(self, repo_url: str, 
                                                  repo_hash: str) -> Dict[str, Any]:
         """Link dependencies across repositories"""
@@ -1485,6 +1125,10 @@ class DataIngestionService:
         Covers all languages: java, typescript, javascript, python.
         """
         nodes: List[Dict[str, Any]] = []
+        repo_hash = generate_repository_hash(repo_name) if repo_name else ""
+
+        def _node_id(node_type: str, *identifiers: Any) -> str:
+            return generate_node_id(node_type, *identifiers)
 
         # Mapping of (language_key, artifact_key, type_label, name_key)
         _ARTIFACT_MAP = [
@@ -1518,10 +1162,49 @@ class DataIngestionService:
                 for item in file_data.get(artifact_key, []):
                     if not isinstance(item, dict):
                         continue
+                    name_val = item.get(name_key, "")
+                    node_id = ""
+                    if type_label == "route":
+                        node_id = _node_id(
+                            "Route",
+                            repo_hash,
+                            item.get("path", ""),
+                            item.get("method", "GET"),
+                            file_path,
+                        )
+                    elif type_label == "eventbus":
+                        node_id = _node_id(
+                            "EventBus",
+                            repo_hash,
+                            item.get("address", name_val),
+                            item.get("type", "unknown"),
+                            file_path,
+                        )
+                    elif type_label == "dto":
+                        node_id = _node_id("DTO", repo_hash, name_val, file_path)
+                    elif type_label == "service":
+                        node_id = _node_id("Service", repo_hash, name_val, file_path)
+                    elif type_label == "class":
+                        node_id = _node_id("Class", repo_hash, name_val, file_path)
+                    elif type_label == "function":
+                        node_id = _node_id("Function", repo_hash, file_path, name_val)
+                    elif type_label == "component":
+                        node_id = _node_id("Component", repo_hash, name_val, file_path)
+                    elif type_label == "api_call":
+                        node_id = _node_id(
+                            "ApiCall",
+                            repo_hash,
+                            item.get("url", name_val),
+                            item.get("method", "GET"),
+                            file_path,
+                        )
+
                     nodes.append({
+                        "id": node_id,
                         "type": type_label,
-                        "name": item.get(name_key, ""),
+                        "name": name_val,
                         "repository": repo_name,
+                        "repository_hash": repo_hash,
                         "file": file_path,
                         "language": lang_key,
                         "data": item,
@@ -1558,7 +1241,7 @@ class DataIngestionService:
                 continue
             
             try:
-                repo_hash = hashlib.md5(repo_name.encode()).hexdigest()[:12]
+                repo_hash = generate_repository_hash(repo_name)
                 graph_results = await self._build_knowledge_graph(
                     repo_parsed,
                     repo_name,
@@ -1602,20 +1285,24 @@ class DataIngestionService:
         artifacts = []
         
         for node in nodes:
+            repo_ref = node.get("repository", "")
+            derived_repo_hash = generate_repository_hash(repo_ref) if repo_ref else ""
             artifact = {
                 "type": node.get("type", "unknown"),
                 "name": node.get("name", ""),
-                "repository": node.get("repository", ""),
+                "repository": repo_ref,
+                "repository_hash": node.get("repository_hash", derived_repo_hash),
                 "file": node.get("file", ""),
                 "language": node.get("language")
                 or ("java" if node.get("type") in ["route", "eventbus", "dto", "entity"] else "typescript"),
                 "metadata": node.get("data", {}),
-                "description": self._generate_node_description(node)
+                "description": self._generate_node_description(node),
+                "graph_node_id": node.get("id", ""),
             }
             artifacts.append(artifact)
         
         try:
-            results = await self.vector_service.index_code_artifacts(artifacts)
+            results = await self.vector_ingestion_builder.index_code_artifacts(artifacts)
             
             return {
                 "embeddings_generated": results.get("indexed", 0),
@@ -1656,23 +1343,43 @@ class DataIngestionService:
         """Store ingestion metadata in Supabase"""
         try:
             duration = (datetime.utcnow() - start_time).total_seconds()
+            summary_block = structure.get("summary", {}) if isinstance(structure, dict) else {}
+            by_extension = structure.get("by_extension") if isinstance(structure, dict) else None
+
+            # Handle both contracts:
+            # - structure from repository shape analyzer (has by_extension/build_files/etc.)
+            # - parse_result.to_dict() (has parsed_files/languages/frameworks)
+            if by_extension is None:
+                by_extension = structure.get("languages", {}) if isinstance(structure, dict) else {}
+            if hasattr(by_extension, "items"):
+                by_extension = dict(by_extension)
+            else:
+                by_extension = {}
+
+            file_statistics = {
+                "total_files": structure.get("total_files", structure.get("parsed_files", 0)) if isinstance(structure, dict) else 0,
+                "parsed_files": structure.get("parsed_files", summary_block.get("parsed_files", 0)) if isinstance(structure, dict) else 0,
+                "failed_files": structure.get("failed_files", summary_block.get("failed_files", 0)) if isinstance(structure, dict) else 0,
+                "skipped_files": structure.get("skipped_files", summary_block.get("skipped_files", 0)) if isinstance(structure, dict) else 0,
+                "by_extension": by_extension,
+                "build_files": structure.get("build_files", []) if isinstance(structure, dict) else [],
+                "config_files": structure.get("config_files", []) if isinstance(structure, dict) else [],
+                "test_files": structure.get("test_files", []) if isinstance(structure, dict) else [],
+                "primary_language": structure.get("primary_language", "") if isinstance(structure, dict) else "",
+                "primary_framework": structure.get("primary_framework", "") if isinstance(structure, dict) else "",
+                "frameworks": structure.get("frameworks", {}) if isinstance(structure, dict) else {},
+            }
             
             metadata = {
                 "repository_url": repo_url,
                 "repository_hash": repo_hash,
                 "ingestion_timestamp": datetime.utcnow().isoformat(),
                 "duration_seconds": round(duration, 2),
-                "file_statistics": json.dumps({
-                    "total_files": structure["total_files"],
-                    "by_extension": dict(structure["by_extension"]),
-                    "build_files": structure["build_files"],
-                    "config_files": structure["config_files"],
-                    "test_files": structure["test_files"]
-                }),
-                "graph_statistics": json.dumps(graph_results["statistics"]),
-                "vector_statistics": json.dumps(vector_results["statistics"]),
-                "status": "completed" if graph_results["status"] == "success" else "failed",
-                "errors": json.dumps(vector_results["statistics"].get("errors", []))
+                "file_statistics": json.dumps(file_statistics),
+                "graph_statistics": json.dumps(graph_results.get("statistics", {})),
+                "vector_statistics": json.dumps(vector_results.get("statistics", {})),
+                "status": "completed" if graph_results.get("status") == "success" else "failed",
+                "errors": json.dumps(vector_results.get("statistics", {}).get("errors", []))
             }
             
             await supabase_client.store_analysis_result({
@@ -1687,6 +1394,125 @@ class DataIngestionService:
             
         except Exception as e:
             logger.error("Failed to store ingestion metadata", error=str(e))
+
+    async def _run_ingestion_quality_kpis(
+        self,
+        repo_hash: str,
+        artifact_count: int,
+        embeddings_created: int,
+    ) -> Dict[str, Any]:
+        """
+        Compute ingestion quality KPIs to verify graph/vector health for a repository.
+        """
+        kpis: Dict[str, Any] = {
+            "graph_nodes": 0,
+            "graph_edges": 0,
+            "file_nodes": 0,
+            "orphan_artifact_nodes": 0,
+            "isolated_files": 0,
+            "cross_repo_edges": 0,
+            "embedding_coverage_pct": 0.0,
+            "warnings": [],
+        }
+
+        try:
+            async with neo4j_client.session() as session:
+                node_record = await (await session.run(
+                    """
+                    MATCH (n)
+                    WHERE n.repository_hash = $repo_hash
+                    RETURN count(n) AS c
+                    """,
+                    {"repo_hash": repo_hash},
+                )).single()
+                kpis["graph_nodes"] = int(node_record["c"] if node_record and node_record.get("c") is not None else 0)
+
+                file_record = await (await session.run(
+                    """
+                    MATCH (f:File {repository_hash: $repo_hash})
+                    RETURN count(f) AS c
+                    """,
+                    {"repo_hash": repo_hash},
+                )).single()
+                kpis["file_nodes"] = int(file_record["c"] if file_record and file_record.get("c") is not None else 0)
+
+                edge_record = await (await session.run(
+                    """
+                    MATCH (a)-[r]->(b)
+                    WHERE coalesce(a.repository_hash, '') = $repo_hash
+                      AND coalesce(b.repository_hash, '') = $repo_hash
+                    RETURN count(r) AS c
+                    """,
+                    {"repo_hash": repo_hash},
+                )).single()
+                kpis["graph_edges"] = int(edge_record["c"] if edge_record and edge_record.get("c") is not None else 0)
+
+                orphan_record = await (await session.run(
+                    """
+                    MATCH (n)
+                    WHERE n.repository_hash = $repo_hash
+                      AND NOT n:Repository
+                      AND NOT n:File
+                      AND NOT n:Module
+                      AND NOT ()-[:CONTAINS]->(n)
+                    RETURN count(n) AS c
+                    """,
+                    {"repo_hash": repo_hash},
+                )).single()
+                kpis["orphan_artifact_nodes"] = int(orphan_record["c"] if orphan_record and orphan_record.get("c") is not None else 0)
+
+                isolated_file_record = await (await session.run(
+                    """
+                    MATCH (f:File {repository_hash: $repo_hash})
+                    WHERE NOT (f)-[:CONTAINS]->()
+                    RETURN count(f) AS c
+                    """,
+                    {"repo_hash": repo_hash},
+                )).single()
+                kpis["isolated_files"] = int(isolated_file_record["c"] if isolated_file_record and isolated_file_record.get("c") is not None else 0)
+
+                cross_repo_record = await (await session.run(
+                    """
+                    MATCH (a)-[r]->(b)
+                    WHERE coalesce(a.repository_hash, '') = $repo_hash
+                      AND coalesce(b.repository_hash, '') <> ''
+                      AND coalesce(b.repository_hash, '') <> $repo_hash
+                    RETURN count(r) AS c
+                    """,
+                    {"repo_hash": repo_hash},
+                )).single()
+                kpis["cross_repo_edges"] = int(cross_repo_record["c"] if cross_repo_record and cross_repo_record.get("c") is not None else 0)
+
+            if artifact_count > 0:
+                coverage = (float(embeddings_created) / float(artifact_count)) * 100.0
+                kpis["embedding_coverage_pct"] = round(coverage, 2)
+            else:
+                kpis["embedding_coverage_pct"] = 100.0 if embeddings_created == 0 else 0.0
+
+            if kpis["embedding_coverage_pct"] < 95.0:
+                kpis["warnings"].append(
+                    f"Low embedding coverage: {kpis['embedding_coverage_pct']}% ({embeddings_created}/{artifact_count})"
+                )
+            if kpis["orphan_artifact_nodes"] > 0:
+                kpis["warnings"].append(f"Found orphan artifact nodes: {kpis['orphan_artifact_nodes']}")
+            if kpis["isolated_files"] > 0:
+                kpis["warnings"].append(f"Found files with no CONTAINS edges: {kpis['isolated_files']}")
+            if kpis["cross_repo_edges"] > 0:
+                kpis["warnings"].append(f"Found unexpected cross-repo edges: {kpis['cross_repo_edges']}")
+
+            logger.info(
+                "Ingestion quality KPIs computed",
+                repo_hash=repo_hash,
+                graph_nodes=kpis["graph_nodes"],
+                graph_edges=kpis["graph_edges"],
+                embedding_coverage_pct=kpis["embedding_coverage_pct"],
+                warning_count=len(kpis["warnings"]),
+            )
+            return kpis
+        except Exception as e:
+            logger.warning("Failed to compute ingestion quality KPIs", repo_hash=repo_hash, error=str(e))
+            kpis["warnings"].append(f"KPI check failed: {str(e)}")
+            return kpis
     
     async def get_ingestion_status(self, repo_url: Optional[str] = None) -> Dict[str, Any]:
         """Get ingestion status for repositories"""
@@ -1715,7 +1541,7 @@ class DataIngestionService:
     async def cleanup_temporary_data(self):
         """Cleanup temporary data and connections"""
         await self.search_service.close()
-        await self.vector_service.close()
+        await self.vector_ingestion_builder.close()
         await neo4j_client.close()
         await supabase_client.close()
         
